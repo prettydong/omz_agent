@@ -1,0 +1,387 @@
+#include "zed/core/agent_loop.hpp"
+
+#include "zed/core/tool_registry.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <string_view>
+#include <unordered_set>
+
+namespace zed::core {
+
+namespace {
+
+constexpr std::string_view kDefaultSystemPrompt =
+    "You are zeda, a coding agent operating in the user's workspace. When a "
+    "request requires inspecting files, changing files, or running commands, "
+    "use the available tools in the current turn and continue until the work "
+    "is complete and proportionately verified. Never stop at a progress update "
+    "or promise to perform work later. Return a final response without tool "
+    "calls only when the request is complete or when you are blocked; when "
+    "blocked, state the concrete blocker. Every tool call must include a "
+    "concise, non-empty purpose.";
+
+constexpr std::string_view kDeferredActionCorrection =
+    "The previous attempt stopped at a progress update without taking the "
+    "promised action. Do not provide another progress update. Use the tools "
+    "now "
+    "to complete and verify the current request. If action is impossible, give "
+    "the exact blocker instead of promising future work.";
+
+constexpr std::size_t kMaxDeferredActionRetries = 1;
+
+std::string next_id(const char *prefix) {
+  static std::atomic_uint64_t sequence{0};
+  return std::string(prefix) + "-" + std::to_string(++sequence);
+}
+
+Error cancelled_error() {
+  return {ErrorCode::cancelled, "agent operation cancelled"};
+}
+
+Error invalid_tool_call_error(const ToolCall &call) {
+  return {
+      ErrorCode::model_error,
+      "model returned an incomplete tool call" +
+          (call.name.empty() ? std::string{} : ": " + call.name),
+  };
+}
+
+Result<void> validate_tool_calls(const std::vector<ToolCall> &calls) {
+  std::unordered_set<ToolCallId> ids;
+  for (const auto &call : calls) {
+    if (call.id.empty() || call.name.empty() || call.arguments_json.empty()) {
+      return Result<void>::failure(invalid_tool_call_error(call));
+    }
+    const auto purpose = tool_call_purpose(call);
+    if (!purpose) {
+      return Result<void>::failure({
+          ErrorCode::model_error,
+          "model returned a tool call without a valid purpose: " + call.name +
+              ": " + purpose.error().message,
+      });
+    }
+    if (!ids.insert(call.id).second) {
+      return Result<void>::failure({
+          ErrorCode::model_error,
+          "model returned duplicate tool call id: " + call.id,
+      });
+    }
+  }
+  return Result<void>::success();
+}
+
+std::string trim_ascii(std::string value) {
+  const auto is_space = [](unsigned char character) {
+    return std::isspace(character) != 0;
+  };
+  const auto begin = std::find_if_not(value.begin(), value.end(), is_space);
+  const auto end =
+      std::find_if_not(value.rbegin(), value.rend(), is_space).base();
+  if (begin >= end)
+    return {};
+  return std::string(begin, end);
+}
+
+std::string lowercase_ascii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::tolower(character));
+                 });
+  return value;
+}
+
+bool looks_like_deferred_action(std::string_view content) {
+  constexpr std::size_t kMaxProgressUpdateBytes = 512;
+  const auto trimmed = trim_ascii(std::string(content));
+  if (trimmed.empty() || trimmed.size() > kMaxProgressUpdateBytes)
+    return false;
+
+  static constexpr std::string_view kMarkers[] = {
+      "正在构建",      "正在生成",      "正在创建",     "正在处理",
+      "正在修改",      "马上就好",      "请稍等",       "稍等一下",
+      "马上开始",      "现在开始",      "接下来我会",   "我现在就",
+      "继续完成",      "working on it", "i'm working",  "i am working",
+      "i'll start",    "i will start",  "let me start", "i'll now",
+      "i will now",    "starting now",  "i'm building", "i am building",
+      "be right back",
+  };
+  const auto normalized = lowercase_ascii(trimmed);
+  return std::any_of(std::begin(kMarkers), std::end(kMarkers),
+                     [&](std::string_view marker) {
+                       return normalized.find(marker) != std::string::npos;
+                     });
+}
+
+std::optional<Error>
+terminal_response_error(const AssistantResponse &response) {
+  switch (response.finish_reason) {
+  case FinishReason::length:
+    return Error{ErrorCode::model_error,
+                 "model response was incomplete because it reached the output "
+                 "token limit"};
+  case FinishReason::content_filter:
+    return Error{ErrorCode::model_error,
+                 "model response was blocked by the provider content filter"};
+  case FinishReason::cancelled:
+    return cancelled_error();
+  case FinishReason::unknown:
+    if (response.tool_calls.empty()) {
+      return Error{ErrorCode::model_error,
+                   "model response ended without a recognized terminal status"};
+    }
+    return std::nullopt;
+  case FinishReason::tool_calls:
+    if (response.tool_calls.empty()) {
+      return Error{ErrorCode::model_error,
+                   "model reported tool calls but returned no tool call"};
+    }
+    return std::nullopt;
+  case FinishReason::stop:
+    return std::nullopt;
+  }
+  return Error{ErrorCode::model_error,
+               "model response used an unsupported terminal status"};
+}
+
+} // namespace
+
+AgentLoop::AgentLoop(Model &model, ToolRegistry &tools, SessionStore &session,
+                     ContextManager &context, AgentLoopConfig config)
+    : model_(model), tools_(tools), session_(session), context_(context),
+      config_(std::move(config)) {
+  if (config_.system_prompt.empty())
+    config_.system_prompt = kDefaultSystemPrompt;
+}
+
+void AgentLoop::set_reasoning_effort(ReasoningEffort effort) {
+  config_.model_request.reasoning_effort = effort;
+}
+
+ReasoningEffort AgentLoop::reasoning_effort() const {
+  return config_.model_request.reasoning_effort;
+}
+
+Result<std::string> AgentLoop::run(std::string user_input,
+                                   CancellationToken cancellation,
+                                   AgentEventCallback on_event) {
+  if (user_input.empty()) {
+    return Result<std::string>::failure({
+        ErrorCode::invalid_argument,
+        "user input cannot be empty",
+    });
+  }
+  if (config_.max_turns == 0) {
+    return Result<std::string>::failure({
+        ErrorCode::invalid_argument,
+        "max_turns must be greater than zero",
+    });
+  }
+  if (cancellation.is_cancelled()) {
+    const auto error = cancelled_error();
+    emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+         on_event);
+    return Result<std::string>::failure(error);
+  }
+
+  emit({AgentEventType::agent_start, {}, std::nullopt, std::nullopt}, on_event);
+
+  Message user_message{
+      next_id("user"), Role::user, std::move(user_input), {}, std::nullopt,
+  };
+  const auto append_user = session_.append(user_message);
+  if (!append_user) {
+    emit({AgentEventType::error, append_user.error().message, std::nullopt,
+          std::nullopt},
+         on_event);
+    return Result<std::string>::failure(append_user.error());
+  }
+  emit({AgentEventType::user_message, user_message.content, std::nullopt,
+        std::nullopt},
+       on_event);
+
+  std::size_t deferred_action_retries = 0;
+  for (std::size_t turn = 0; turn < config_.max_turns; ++turn) {
+    if (cancellation.is_cancelled()) {
+      const auto error = cancelled_error();
+      emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(error);
+    }
+
+    const auto history = session_.load();
+    if (!history) {
+      emit({AgentEventType::error, history.error().message, std::nullopt,
+            std::nullopt},
+           on_event);
+      return Result<std::string>::failure(history.error());
+    }
+
+    std::vector<Message> context_messages;
+    context_messages.reserve(history.value().size() + 1);
+    std::string system_prompt = config_.system_prompt;
+    if (deferred_action_retries > 0) {
+      system_prompt += "\n\n";
+      system_prompt += kDeferredActionCorrection;
+    }
+    context_messages.push_back({"zeda-agent-system",
+                                Role::system,
+                                std::move(system_prompt),
+                                {},
+                                std::nullopt});
+    context_messages.insert(context_messages.end(), history.value().begin(),
+                            history.value().end());
+
+    const auto window =
+        context_.build(context_messages, config_.context_limits, cancellation);
+    if (!window) {
+      emit({AgentEventType::error, window.error().message, std::nullopt,
+            std::nullopt},
+           on_event);
+      return Result<std::string>::failure(window.error());
+    }
+
+    ModelRequest request = config_.model_request;
+    request.messages = window.value().messages;
+    request.tools = tools_.definitions();
+
+    const auto response = model_.complete(
+        request,
+        [&](const ModelDelta &delta) {
+          emit({AgentEventType::assistant_delta, delta.text, std::nullopt,
+                std::nullopt},
+               on_event);
+        },
+        cancellation);
+    if (!response) {
+      emit({AgentEventType::error, response.error().message, std::nullopt,
+            std::nullopt},
+           on_event);
+      return Result<std::string>::failure(response.error());
+    }
+
+    if (cancellation.is_cancelled()) {
+      const auto error = cancelled_error();
+      emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(error);
+    }
+    if (const auto error = terminal_response_error(response.value());
+        error.has_value()) {
+      emit({AgentEventType::assistant_message, response.value().content,
+            std::nullopt, std::nullopt, response.value().usage},
+           on_event);
+      emit({AgentEventType::error, error->message, std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(*error);
+    }
+    const auto valid_tool_calls =
+        validate_tool_calls(response.value().tool_calls);
+    if (!valid_tool_calls) {
+      emit({AgentEventType::error, valid_tool_calls.error().message,
+            std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(valid_tool_calls.error());
+    }
+
+    if (response.value().tool_calls.empty() &&
+        looks_like_deferred_action(response.value().content)) {
+      emit({AgentEventType::assistant_message, response.value().content,
+            std::nullopt, std::nullopt, response.value().usage},
+           on_event);
+      if (deferred_action_retries >= kMaxDeferredActionRetries) {
+        const Error error{
+            ErrorCode::model_error,
+            "model repeatedly stopped after a progress update without taking "
+            "the promised action",
+        };
+        emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+             on_event);
+        return Result<std::string>::failure(error);
+      }
+      ++deferred_action_retries;
+      continue;
+    }
+
+    Message assistant_message{
+        next_id("assistant"),        Role::assistant, response.value().content,
+        response.value().tool_calls, std::nullopt,
+    };
+    const auto append_assistant = session_.append(assistant_message);
+    if (!append_assistant) {
+      emit({AgentEventType::error, append_assistant.error().message,
+            std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(append_assistant.error());
+    }
+    emit({AgentEventType::assistant_message, assistant_message.content,
+          std::nullopt, std::nullopt, response.value().usage},
+         on_event);
+
+    if (response.value().tool_calls.empty()) {
+      emit({AgentEventType::agent_end, response.value().content, std::nullopt,
+            std::nullopt},
+           on_event);
+      return Result<std::string>::success(response.value().content);
+    }
+
+    for (const auto &call : response.value().tool_calls) {
+      if (cancellation.is_cancelled()) {
+        const auto error = cancelled_error();
+        emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+             on_event);
+        return Result<std::string>::failure(error);
+      }
+      const auto purpose = tool_call_purpose(call);
+      emit({AgentEventType::tool_start, purpose.value(), call, std::nullopt},
+           on_event);
+
+      ToolResult tool_result;
+      const auto execution = tools_.execute(call, cancellation);
+      if (execution) {
+        tool_result = execution.value();
+      } else if (execution.error().code == ErrorCode::cancelled) {
+        return Result<std::string>::failure(execution.error());
+      } else {
+        tool_result = {
+            call.id,
+            "tool execution failed: " + execution.error().message,
+            true,
+        };
+      }
+
+      Message tool_message{
+          next_id("tool"),          Role::tool, tool_result.content, {},
+          tool_result.tool_call_id,
+      };
+      const auto append_tool = session_.append(tool_message);
+      if (!append_tool) {
+        emit({AgentEventType::error, append_tool.error().message, std::nullopt,
+              std::nullopt},
+             on_event);
+        return Result<std::string>::failure(append_tool.error());
+      }
+      emit({AgentEventType::tool_result, tool_result.content, std::nullopt,
+            tool_result},
+           on_event);
+    }
+  }
+
+  const Error error{
+      ErrorCode::internal,
+      "agent exceeded the maximum number of turns",
+  };
+  emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+       on_event);
+  return Result<std::string>::failure(error);
+}
+
+void AgentLoop::emit(const AgentEvent &event,
+                     const AgentEventCallback &callback) const {
+  if (callback) {
+    callback(event);
+  }
+}
+
+} // namespace zed::core

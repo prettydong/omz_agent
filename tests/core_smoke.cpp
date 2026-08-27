@@ -1,0 +1,311 @@
+#include <cassert>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "zed/core/agent_loop.hpp"
+
+namespace {
+
+using namespace zed::core;
+
+class EchoTool final : public Tool {
+public:
+  EchoTool()
+      : definition_{
+            "echo",
+            "Returns the text argument.",
+            R"({"type":"object","properties":{"text":{"type":"string"}}})",
+        } {}
+
+  [[nodiscard]] const ToolDefinition &definition() const override {
+    return definition_;
+  }
+
+  Result<ToolResult> execute(const ToolCall &call,
+                             CancellationToken cancellation) override {
+    if (cancellation.is_cancelled()) {
+      return Result<ToolResult>::failure({
+          ErrorCode::cancelled,
+          "echo cancelled",
+      });
+    }
+    return Result<ToolResult>::success({call.id, "echo-result", false});
+  }
+
+private:
+  ToolDefinition definition_;
+};
+
+class FakeModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &request,
+                                     const StreamCallback &on_delta,
+                                     CancellationToken cancellation) override {
+    assert(!request.messages.empty());
+    assert(request.messages.front().role == Role::system);
+    assert(request.messages.front().content.find("Never stop at a progress") !=
+           std::string::npos);
+    assert(request.model.provider == "test");
+    assert(request.model.model == "fake");
+    assert(!request.tools.empty());
+    observed_efforts_.push_back(request.reasoning_effort);
+    if (cancellation.is_cancelled()) {
+      return Result<AssistantResponse>::failure({
+          ErrorCode::cancelled,
+          "fake model cancelled",
+      });
+    }
+
+    ++calls_;
+    if (calls_ == 1) {
+      const ToolCall call{
+          "call-1", "echo",
+          R"({"purpose":"Verify the echo workflow","text":"hello"})"};
+      return Result<AssistantResponse>::success({
+          {},
+          {call},
+          FinishReason::tool_calls,
+          {10, 0, 2},
+      });
+    }
+
+    if (on_delta) {
+      on_delta({"done"});
+    }
+    return Result<AssistantResponse>::success({
+        "done",
+        {},
+        FinishReason::stop,
+        {20, 0, 4},
+    });
+  }
+
+  [[nodiscard]] int calls() const { return calls_; }
+  [[nodiscard]] const std::vector<ReasoningEffort> &observed_efforts() const {
+    return observed_efforts_;
+  }
+
+private:
+  int calls_{0};
+  std::vector<ReasoningEffort> observed_efforts_;
+};
+
+class MissingPurposeModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    return Result<AssistantResponse>::success({
+        {},
+        {{"missing-purpose", "echo", R"({"text":"hello"})"}},
+        FinishReason::tool_calls,
+        {},
+    });
+  }
+};
+
+class DeferredActionModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &request,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    assert(!request.messages.empty());
+    assert(request.messages.front().role == Role::system);
+    ++calls_;
+    if (calls_ == 1) {
+      return Result<AssistantResponse>::success({
+          "正在构建……马上就好",
+          {},
+          FinishReason::stop,
+          {10, 0, 2},
+      });
+    }
+    if (calls_ == 2) {
+      saw_correction_ = request.messages.front().content.find(
+                            "previous attempt stopped") != std::string::npos;
+      return Result<AssistantResponse>::success({
+          {},
+          {{"deferred-call", "echo",
+            R"({"purpose":"Complete the deferred task","text":"done"})"}},
+          FinishReason::tool_calls,
+          {12, 0, 3},
+      });
+    }
+    return Result<AssistantResponse>::success({
+        "implemented and verified",
+        {},
+        FinishReason::stop,
+        {14, 0, 4},
+    });
+  }
+
+  [[nodiscard]] int calls() const { return calls_; }
+  [[nodiscard]] bool saw_correction() const { return saw_correction_; }
+
+private:
+  int calls_{0};
+  bool saw_correction_{false};
+};
+
+class RepeatedDeferredActionModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    ++calls_;
+    return Result<AssistantResponse>::success({
+        "正在生成，请稍等",
+        {},
+        FinishReason::stop,
+        {},
+    });
+  }
+
+  [[nodiscard]] int calls() const { return calls_; }
+
+private:
+  int calls_{0};
+};
+
+class IncompleteModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    return Result<AssistantResponse>::success({
+        "partial",
+        {},
+        FinishReason::length,
+        {},
+    });
+  }
+};
+
+} // namespace
+
+int main() {
+  FakeModel model;
+  ToolRegistry tools;
+  assert(tools.register_tool(std::make_unique<EchoTool>()));
+
+  InMemorySessionStore session;
+  ApproximateTokenEstimator estimator;
+  BasicContextManager context(estimator);
+
+  AgentLoopConfig config;
+  config.model_request.model = {"test", "fake"};
+  config.model_request.max_output_tokens = 128;
+  config.context_limits = {4096, 512, 3000};
+
+  AgentLoop loop(model, tools, session, context, config);
+  loop.set_reasoning_effort(ReasoningEffort::high);
+  assert(loop.reasoning_effort() == ReasoningEffort::high);
+  std::vector<ModelUsage> observed_usage;
+  std::vector<std::string> observed_tool_purposes;
+  const auto result = loop.run("run echo", {}, [&](const AgentEvent &event) {
+    if (event.type == AgentEventType::assistant_message &&
+        event.model_usage.has_value()) {
+      observed_usage.push_back(*event.model_usage);
+    }
+    if (event.type == AgentEventType::tool_start) {
+      observed_tool_purposes.push_back(event.text);
+    }
+  });
+  assert(result);
+  assert(result.value() == "done");
+  assert(model.calls() == 2);
+  assert(model.observed_efforts().size() == 2);
+  assert(model.observed_efforts()[0] == ReasoningEffort::high);
+  assert(model.observed_efforts()[1] == ReasoningEffort::high);
+  assert(observed_usage.size() == 2);
+  assert(observed_usage[0].input_tokens == 10);
+  assert(observed_usage[1].output_tokens == 4);
+  assert(observed_tool_purposes.size() == 1);
+  assert(observed_tool_purposes[0] == "Verify the echo workflow");
+
+  const auto history = session.load();
+  assert(history);
+  assert(history.value().size() == 4);
+  assert(history.value()[1].role == Role::assistant);
+  assert(history.value()[2].role == Role::tool);
+  assert(history.value()[3].role == Role::assistant);
+
+  MissingPurposeModel missing_purpose_model;
+  ToolRegistry guarded_tools;
+  assert(guarded_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore guarded_session;
+  BasicContextManager guarded_context(estimator);
+  AgentLoop guarded_loop(missing_purpose_model, guarded_tools, guarded_session,
+                         guarded_context, config);
+  const auto rejected = guarded_loop.run("run invalid echo");
+  assert(!rejected);
+  assert(rejected.error().code == ErrorCode::model_error);
+  const auto guarded_history = guarded_session.load();
+  assert(guarded_history);
+  assert(guarded_history.value().size() == 1);
+  assert(guarded_history.value()[0].role == Role::user);
+
+  DeferredActionModel deferred_model;
+  ToolRegistry deferred_tools;
+  assert(deferred_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore deferred_session;
+  BasicContextManager deferred_context(estimator);
+  AgentLoop deferred_loop(deferred_model, deferred_tools, deferred_session,
+                          deferred_context, config);
+  const auto deferred_result = deferred_loop.run("build the project");
+  assert(deferred_result);
+  assert(deferred_result.value() == "implemented and verified");
+  assert(deferred_model.calls() == 3);
+  assert(deferred_model.saw_correction());
+  const auto deferred_history = deferred_session.load();
+  assert(deferred_history);
+  assert(deferred_history.value().size() == 4);
+  assert(deferred_history.value()[0].role == Role::user);
+  assert(deferred_history.value()[1].role == Role::assistant);
+  assert(deferred_history.value()[1].tool_calls.size() == 1);
+  assert(deferred_history.value()[2].role == Role::tool);
+  assert(deferred_history.value()[3].content == "implemented and verified");
+
+  RepeatedDeferredActionModel repeated_deferred_model;
+  ToolRegistry repeated_deferred_tools;
+  InMemorySessionStore repeated_deferred_session;
+  BasicContextManager repeated_deferred_context(estimator);
+  AgentLoop repeated_deferred_loop(
+      repeated_deferred_model, repeated_deferred_tools,
+      repeated_deferred_session, repeated_deferred_context, config);
+  const auto repeated_deferred_result =
+      repeated_deferred_loop.run("build the project");
+  assert(!repeated_deferred_result);
+  assert(repeated_deferred_result.error().code == ErrorCode::model_error);
+  assert(repeated_deferred_result.error().message.find("repeatedly stopped") !=
+         std::string::npos);
+  assert(repeated_deferred_model.calls() == 2);
+  const auto repeated_deferred_history = repeated_deferred_session.load();
+  assert(repeated_deferred_history);
+  assert(repeated_deferred_history.value().size() == 1);
+
+  IncompleteModel incomplete_model;
+  ToolRegistry incomplete_tools;
+  InMemorySessionStore incomplete_session;
+  BasicContextManager incomplete_context(estimator);
+  AgentLoop incomplete_loop(incomplete_model, incomplete_tools,
+                            incomplete_session, incomplete_context, config);
+  std::size_t incomplete_usage_events = 0;
+  const auto incomplete_result = incomplete_loop.run(
+      "write a large file", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::assistant_message &&
+            event.model_usage.has_value()) {
+          ++incomplete_usage_events;
+        }
+      });
+  assert(!incomplete_result);
+  assert(incomplete_result.error().code == ErrorCode::model_error);
+  assert(incomplete_result.error().message.find("output token limit") !=
+         std::string::npos);
+  assert(incomplete_usage_events == 1);
+  const auto incomplete_history = incomplete_session.load();
+  assert(incomplete_history);
+  assert(incomplete_history.value().size() == 1);
+  return 0;
+}

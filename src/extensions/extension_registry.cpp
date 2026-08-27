@@ -1,0 +1,66 @@
+#include "zed/extensions/extension_registry.hpp"
+
+#include <algorithm>
+#include <cstddef>
+
+namespace zed::extensions {
+
+core::Result<void> ExtensionRegistry::register_command(Command command) {
+  if (command.name.empty() || !command.execute) {
+    return core::Result<void>::failure({
+        core::ErrorCode::invalid_argument,
+        "extension command needs a name and handler",
+    });
+  }
+  for (std::size_t index = 0; index < command.options.size(); ++index) {
+    const auto &option = command.options[index];
+    if (option.value.empty()) {
+      return core::Result<void>::failure({
+          core::ErrorCode::invalid_argument,
+          "extension command option needs a value: " + command.name,
+      });
+    }
+    const auto duplicate_option = std::find_if(
+        command.options.begin(),
+        command.options.begin() + static_cast<std::ptrdiff_t>(index),
+        [&](const CommandOption &existing) {
+          return existing.value == option.value;
+        });
+    if (duplicate_option !=
+        command.options.begin() + static_cast<std::ptrdiff_t>(index)) {
+      return core::Result<void>::failure({
+          core::ErrorCode::conflict,
+          "extension command option already registered: " + command.name + " " +
+              option.value,
+      });
+    }
+  }
+  const auto duplicate = std::find_if(
+      commands_.begin(), commands_.end(),
+      [&](const Command &existing) { return existing.name == command.name; });
+  if (duplicate != commands_.end()) {
+    return core::Result<void>::failure({
+        core::ErrorCode::conflict,
+        "extension command already registered: " + command.name,
+    });
+  }
+  commands_.push_back(std::move(command));
+  return core::Result<void>::success();
+}
+
+core::Result<std::string>
+ExtensionRegistry::execute(std::string_view name,
+                           std::string_view arguments) const {
+  const auto iterator = std::find_if(
+      commands_.begin(), commands_.end(),
+      [&](const Command &command) { return command.name == name; });
+  if (iterator == commands_.end()) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::not_found,
+        "extension command not found: " + std::string(name),
+    });
+  }
+  return iterator->execute(arguments);
+}
+
+} // namespace zed::extensions

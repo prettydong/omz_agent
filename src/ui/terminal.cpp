@@ -1,5 +1,7 @@
 #include "zed/ui/terminal.hpp"
 
+#include "zed/core/utf8.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -18,6 +20,8 @@
 
 #include "zed/ui/markdown.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <ftxui/component/animation.hpp>
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
@@ -29,6 +33,12 @@
 namespace zed::ui {
 
 namespace {
+
+using Json = nlohmann::json;
+
+constexpr std::size_t kMaximumDocumentViewBytes = 16 * 1024 * 1024;
+constexpr std::size_t kMaximumDocumentPages = 128;
+constexpr std::size_t kMaximumDocumentPageBytes = 2 * 1024 * 1024;
 
 class LayoutBoxCapture final : public ftxui::Node {
 public:
@@ -110,6 +120,35 @@ std::string render_element(ftxui::Element element) {
 bool is_command_whitespace(char character) {
   return character == ' ' || character == '\t' || character == '\r' ||
          character == '\n';
+}
+
+bool valid_document_label(std::string_view value, std::size_t maximum,
+                          bool allow_empty = false) {
+  if ((!allow_empty && value.empty()) || value.size() > maximum ||
+      !core::is_valid_utf8(value)) {
+    return false;
+  }
+  return std::none_of(value.begin(), value.end(), [](unsigned char character) {
+    return character < 0x20 || character == 0x7f;
+  });
+}
+
+std::string_view
+page_markdown_without_repeated_title(const TerminalDocumentPage &page) {
+  if (!page.markdown.starts_with("# "))
+    return page.markdown;
+  const auto newline = page.markdown.find('\n');
+  const auto heading = page.markdown.substr(
+      2, newline == std::string::npos ? std::string::npos : newline - 2);
+  if (heading != page.title || newline == std::string::npos)
+    return page.markdown;
+  std::string_view remaining(page.markdown);
+  remaining.remove_prefix(newline + 1);
+  while (!remaining.empty() &&
+         (remaining.front() == '\r' || remaining.front() == '\n')) {
+    remaining.remove_prefix(1);
+  }
+  return remaining;
 }
 
 std::string encode_base64(std::string_view input) {
@@ -569,9 +608,10 @@ ftxui::Element render_terminal_command_guide(
   }
   if (visible > 0) {
     rows.push_back(
-        ftxui::text(suggestions.front().option
-                        ? "options · ↑/↓ select · enter/tab complete"
-                        : "commands · ↑/↓ select · enter/tab complete") |
+        ftxui::text(
+            suggestions.front().option
+                ? "options · ↑/↓ select · enter run/complete · tab complete"
+                : "commands · ↑/↓ select · enter run/complete · tab complete") |
         ftxui::color(theme.text_muted));
   }
   for (std::size_t offset = 0; offset < visible; ++offset) {
@@ -594,6 +634,132 @@ ftxui::Element render_terminal_command_guide(
 
 bool is_terminal_command_completion_event(const ftxui::Event &event) {
   return event == ftxui::Event::Return || event == ftxui::Event::Tab;
+}
+
+bool terminal_command_opens_document_view(
+    std::string_view name, std::string_view arguments,
+    const std::vector<TerminalCommandHint> &available_commands) {
+  const auto command =
+      std::find_if(available_commands.begin(), available_commands.end(),
+                   [&](const TerminalCommandHint &candidate) {
+                     return candidate.name == name;
+                   });
+  if (command == available_commands.end())
+    return false;
+  const auto option =
+      std::find_if(command->options.begin(), command->options.end(),
+                   [&](const TerminalCommandOption &candidate) {
+                     return candidate.value == arguments;
+                   });
+  return option != command->options.end() && option->opens_document_view;
+}
+
+core::Result<TerminalDocumentView>
+parse_terminal_document_view(std::string_view json) {
+  if (json.empty() || json.size() > kMaximumDocumentViewBytes) {
+    return core::Result<TerminalDocumentView>::failure({
+        core::ErrorCode::invalid_argument,
+        "terminal document view must contain at most 16 MiB of JSON",
+    });
+  }
+  const auto document = Json::parse(json, nullptr, false);
+  if (!document.is_object() || !document.contains("schema_version") ||
+      !document.at("schema_version").is_number_unsigned() ||
+      document.at("schema_version").get<std::uint64_t>() != 1 ||
+      !document.contains("title") || !document.at("title").is_string() ||
+      !document.contains("pages") || !document.at("pages").is_array()) {
+    return core::Result<TerminalDocumentView>::failure({
+        core::ErrorCode::invalid_argument,
+        "terminal document view has an invalid schema",
+    });
+  }
+
+  TerminalDocumentView result;
+  result.title = document.at("title").get<std::string>();
+  if (document.contains("subtitle")) {
+    if (!document.at("subtitle").is_string()) {
+      return core::Result<TerminalDocumentView>::failure({
+          core::ErrorCode::invalid_argument,
+          "terminal document view subtitle must be text",
+      });
+    }
+    result.subtitle = document.at("subtitle").get<std::string>();
+  }
+  if (!valid_document_label(result.title, 256) ||
+      !valid_document_label(result.subtitle, 2'048, true)) {
+    return core::Result<TerminalDocumentView>::failure({
+        core::ErrorCode::invalid_argument,
+        "terminal document view contains invalid metadata",
+    });
+  }
+
+  const auto &pages = document.at("pages");
+  if (pages.empty() || pages.size() > kMaximumDocumentPages) {
+    return core::Result<TerminalDocumentView>::failure({
+        core::ErrorCode::invalid_argument,
+        "terminal document view requires between 1 and 128 pages",
+    });
+  }
+  result.pages.reserve(pages.size());
+  for (const auto &page : pages) {
+    if (!page.is_object() || !page.contains("id") ||
+        !page.at("id").is_string() || !page.contains("title") ||
+        !page.at("title").is_string() || !page.contains("markdown") ||
+        !page.at("markdown").is_string()) {
+      return core::Result<TerminalDocumentView>::failure({
+          core::ErrorCode::invalid_argument,
+          "terminal document view contains an invalid page",
+      });
+    }
+    TerminalDocumentPage parsed;
+    parsed.id = page.at("id").get<std::string>();
+    parsed.title = page.at("title").get<std::string>();
+    parsed.markdown = page.at("markdown").get<std::string>();
+    if (page.contains("description")) {
+      if (!page.at("description").is_string()) {
+        return core::Result<TerminalDocumentView>::failure({
+            core::ErrorCode::invalid_argument,
+            "terminal document page description must be text",
+        });
+      }
+      parsed.description = page.at("description").get<std::string>();
+    }
+    if (page.contains("badge")) {
+      if (!page.at("badge").is_string()) {
+        return core::Result<TerminalDocumentView>::failure({
+            core::ErrorCode::invalid_argument,
+            "terminal document page badge must be text",
+        });
+      }
+      parsed.badge = page.at("badge").get<std::string>();
+    }
+    if (!valid_document_label(parsed.id, 128) ||
+        !valid_document_label(parsed.title, 256) ||
+        !valid_document_label(parsed.description, 2'048, true) ||
+        !valid_document_label(parsed.badge, 64, true) ||
+        parsed.markdown.empty() ||
+        parsed.markdown.size() > kMaximumDocumentPageBytes ||
+        parsed.markdown.find('\0') != std::string::npos ||
+        !core::is_valid_utf8(parsed.markdown)) {
+      return core::Result<TerminalDocumentView>::failure({
+          core::ErrorCode::invalid_argument,
+          "terminal document view page exceeds its content limits",
+      });
+    }
+    const auto duplicate =
+        std::find_if(result.pages.begin(), result.pages.end(),
+                     [&](const TerminalDocumentPage &existing) {
+                       return existing.id == parsed.id;
+                     });
+    if (duplicate != result.pages.end()) {
+      return core::Result<TerminalDocumentView>::failure({
+          core::ErrorCode::conflict,
+          "terminal document view contains duplicate page ids",
+      });
+    }
+    result.pages.push_back(std::move(parsed));
+  }
+  return core::Result<TerminalDocumentView>::success(std::move(result));
 }
 
 std::string terminal_activity_label(TerminalActivity activity,
@@ -767,6 +933,11 @@ void TerminalScrollState::scroll_down(std::size_t content_rows,
 void TerminalScrollState::follow_latest() {
   offset_rows_ = 0;
   follows_latest_ = true;
+}
+
+void TerminalScrollState::reset_to_top() {
+  offset_rows_ = 0;
+  follows_latest_ = false;
 }
 
 std::size_t TerminalScrollState::offset_rows(std::size_t content_rows,
@@ -1292,10 +1463,14 @@ TerminalApplication::TerminalApplication(
     SessionLoader session_loader, InitialActivity initial_activity,
     std::vector<TerminalCommandHint> command_hints, SubmitHandler submit,
     CommandHandler command)
-    : workspace_(std::move(workspace)), model_(model),
+    : workspace_(std::move(workspace)), model_state_(model),
       version_(std::move(version)), startup_(startup),
-      max_context_tokens_(max_context_tokens),
-      reasoning_effort_(reasoning_effort), theme_kind_(theme_kind),
+      max_context_tokens_state_(max_context_tokens),
+      reasoning_effort_state_(reasoning_effort), theme_kind_state_(theme_kind),
+      displayed_model_(model),
+      displayed_max_context_tokens_(max_context_tokens),
+      displayed_reasoning_effort_(reasoning_effort),
+      displayed_theme_kind_(theme_kind),
       quick_bash_enabled_(std::move(quick_bash_enabled)),
       session_name_(std::move(session_name)),
       session_loader_(std::move(session_loader)),
@@ -1361,13 +1536,16 @@ void TerminalApplication::configure_app() {
   };
   input_options.on_enter = [this] { submit_line(); };
   input_options.transform = [this](ftxui::InputState state) {
-    return render_terminal_input(std::move(state), terminal_theme(theme_kind_));
+    return render_terminal_input(std::move(state),
+                                 terminal_theme(displayed_theme_kind_));
   };
   input_component_ = ftxui::Input(&input_, input_options);
 }
 
 ftxui::Element TerminalApplication::render_page() {
-  const auto &theme = terminal_theme(theme_kind_);
+  if (document_view_.has_value())
+    return render_document_view();
+  const auto &theme = terminal_theme(displayed_theme_kind_);
   const auto activity = transcript_.activity();
   const auto now = std::chrono::steady_clock::now();
   const bool copy_status_visible = !copy_status_.empty();
@@ -1377,8 +1555,9 @@ ftxui::Element TerminalApplication::render_page() {
       now.time_since_epoch());
   const auto spinner_frame = static_cast<std::size_t>(elapsed.count() / 80);
   auto content = ftxui::vbox({
-      render_terminal_welcome(workspace_, model_, version_, startup_,
-                              reasoning_effort_, theme_kind_),
+      render_terminal_welcome(workspace_, displayed_model_, version_, startup_,
+                              displayed_reasoning_effort_,
+                              displayed_theme_kind_),
       ftxui::separatorEmpty(),
       render_messages(transcript_.messages(), theme, &message_boxes_),
   });
@@ -1408,7 +1587,8 @@ ftxui::Element TerminalApplication::render_page() {
   const bool command_guide_visible =
       command_help != nullptr || !command_suggestions.empty();
   ftxui::Elements footer_elements{
-      render_activity(activity, reasoning_effort_, spinner_frame, theme),
+      render_activity(activity, displayed_reasoning_effort_, spinner_frame,
+                      theme),
       ftxui::filler(),
   };
   if (copy_status_visible) {
@@ -1420,9 +1600,9 @@ ftxui::Element TerminalApplication::render_page() {
   }
   const auto token_metrics = transcript_.token_metrics();
   const auto context_summary =
-      terminal_context_summary(token_metrics, max_context_tokens_);
+      terminal_context_summary(token_metrics, displayed_max_context_tokens_);
   auto token_summary =
-      terminal_token_summary(token_metrics, max_context_tokens_);
+      terminal_token_summary(token_metrics, displayed_max_context_tokens_);
   token_summary.erase(0, context_summary.size());
   footer_elements.push_back(ftxui::text(context_summary) | ftxui::bold |
                             ftxui::color(theme.secondary) |
@@ -1447,7 +1627,244 @@ ftxui::Element TerminalApplication::render_page() {
   if (!context_analysis_visible_)
     return page;
   return render_terminal_context_overlay(std::move(page), token_metrics,
-                                         max_context_tokens_, theme);
+                                         displayed_max_context_tokens_, theme);
+}
+
+ftxui::Element TerminalApplication::render_document_view() {
+  const auto &theme = terminal_theme(displayed_theme_kind_);
+  const auto &document = *document_view_;
+  if (selected_document_page_ >= document.pages.size())
+    selected_document_page_ = 0;
+  document_page_boxes_.assign(document.pages.size(), {});
+
+  ftxui::Elements page_rows;
+  page_rows.reserve(document.pages.size() + 1);
+  page_rows.push_back(ftxui::text(" PAGES") | ftxui::bold |
+                      ftxui::color(theme.text_muted));
+  for (std::size_t index = 0; index < document.pages.size(); ++index) {
+    const auto &page = document.pages[index];
+    const bool selected = index == selected_document_page_;
+    auto title = ftxui::hbox({
+        ftxui::text(selected ? " › " : "   ") |
+            ftxui::color(selected ? theme.secondary : theme.text_muted),
+        ftxui::text(page.title) | ftxui::bold |
+            ftxui::color(selected ? theme.primary : theme.text),
+        ftxui::filler(),
+    });
+    if (!page.badge.empty()) {
+      title = ftxui::hbox({
+          std::move(title) | ftxui::flex,
+          ftxui::text(" " + page.badge + " ") | ftxui::bold |
+              ftxui::color(theme.warning),
+      });
+    }
+    ftxui::Elements row_elements{std::move(title)};
+    if (!page.description.empty()) {
+      row_elements.push_back(ftxui::hbox({
+          ftxui::text("   "),
+          ftxui::paragraph(page.description) | ftxui::color(theme.text_muted) |
+              ftxui::xflex,
+      }));
+    }
+    auto row = ftxui::vbox(std::move(row_elements)) |
+               ftxui::reflect(document_page_boxes_[index]);
+    if (selected)
+      row |= ftxui::bgcolor(theme.background_element);
+    page_rows.push_back(std::move(row));
+  }
+  auto sidebar_content = ftxui::vbox(std::move(page_rows));
+  const auto relative_selection =
+      document.pages.size() <= 1
+          ? 0.0F
+          : static_cast<float>(selected_document_page_) /
+                static_cast<float>(document.pages.size() - 1);
+  sidebar_content |= ftxui::focusPositionRelative(0.0F, relative_selection);
+  auto sidebar = std::move(sidebar_content) | ftxui::vscroll_indicator |
+                 ftxui::yframe | ftxui::flex |
+                 ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 34) |
+                 ftxui::bgcolor(theme.background_panel) |
+                 ftxui::borderStyled(ftxui::ROUNDED, document_sidebar_focused_
+                                                         ? theme.border_active
+                                                         : theme.border);
+
+  const auto &page = document.pages[selected_document_page_];
+  ftxui::Elements article_rows{
+      ftxui::hbox({
+          ftxui::text(page.title) | ftxui::bold |
+              ftxui::color(theme.markdown_heading),
+          ftxui::filler(),
+          page.badge.empty() ? ftxui::text("")
+                             : ftxui::text(" " + page.badge + " ") |
+                                   ftxui::bold | ftxui::color(theme.warning),
+      }),
+  };
+  if (!page.description.empty()) {
+    article_rows.push_back(ftxui::paragraph(page.description) |
+                           ftxui::color(theme.text_muted));
+  }
+  article_rows.push_back(ftxui::separatorEmpty());
+  article_rows.push_back(
+      render_markdown(page_markdown_without_repeated_title(page), theme));
+  auto article = ftxui::vbox(std::move(article_rows)) |
+                 capture_layout_box(document_content_box_);
+  if (document_scroll_state_.follows_latest()) {
+    article |= ftxui::focusPositionRelative(0.0F, 1.0F);
+  } else {
+    article |= ftxui::focusPosition(
+        0,
+        document_scroll_state_.focus_row(layout_box_rows(document_content_box_),
+                                         box_rows(document_viewport_box_)));
+  }
+  auto body = std::move(article) | ftxui::vscroll_indicator | ftxui::yframe |
+              ftxui::flex | ftxui::reflect(document_viewport_box_) |
+              ftxui::borderStyled(ftxui::ROUNDED, document_sidebar_focused_
+                                                      ? theme.border
+                                                      : theme.border_active);
+
+  auto header = ftxui::hbox({
+      ftxui::text(" ◫ " + document.title + " ") | ftxui::bold |
+          ftxui::color(theme.primary),
+      ftxui::text(document.subtitle.empty() ? "" : "  " + document.subtitle) |
+          ftxui::color(theme.text_muted),
+      ftxui::filler(),
+      ftxui::text("Esc/q back ") | ftxui::color(theme.text_muted),
+  });
+  auto footer = ftxui::hbox({
+      ftxui::text(document_sidebar_focused_ ? "TOC" : "PAGE") | ftxui::bold |
+          ftxui::color(theme.secondary),
+      ftxui::text(
+          "  Tab/←/→ focus · ↑/↓ or j/k navigate · mouse wheel scroll") |
+          ftxui::color(theme.text_muted),
+      ftxui::filler(),
+      ftxui::text(std::to_string(selected_document_page_ + 1) + "/" +
+                  std::to_string(document.pages.size()) + " ") |
+          ftxui::bold | ftxui::color(theme.primary),
+  });
+  return ftxui::vbox({
+             std::move(header),
+             ftxui::separator(),
+             ftxui::hbox({std::move(sidebar), ftxui::separator(),
+                          std::move(body) | ftxui::flex}) |
+                 ftxui::flex,
+             ftxui::separator(),
+             std::move(footer),
+         }) |
+         ftxui::color(theme.text) | ftxui::bgcolor(theme.background) |
+         ftxui::selectionForegroundColor(theme.text) |
+         ftxui::selectionBackgroundColor(theme.background_element);
+}
+
+void TerminalApplication::select_document_page(std::size_t index) {
+  if (!document_view_.has_value() || document_view_->pages.empty())
+    return;
+  selected_document_page_ = std::min(index, document_view_->pages.size() - 1);
+  document_scroll_state_.reset_to_top();
+}
+
+bool TerminalApplication::handle_document_view_event(ftxui::Event event) {
+  if (event == ftxui::Event::Escape || event == ftxui::Event::CtrlC ||
+      event == ftxui::Event::Character('q')) {
+    document_view_.reset();
+    document_page_boxes_.clear();
+    selected_document_page_ = 0;
+    document_sidebar_focused_ = true;
+    document_scroll_state_.reset_to_top();
+    return true;
+  }
+  if (event == ftxui::Event::Tab || event == ftxui::Event::ArrowLeft ||
+      event == ftxui::Event::ArrowRight) {
+    document_sidebar_focused_ = !document_sidebar_focused_;
+    return true;
+  }
+  if (!document_view_.has_value() || document_view_->pages.empty())
+    return event != ftxui::Event::Custom;
+
+  if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left &&
+      event.mouse().motion == ftxui::Mouse::Pressed) {
+    for (std::size_t index = 0; index < document_page_boxes_.size(); ++index) {
+      if (document_page_boxes_[index].Contain(event.mouse().x,
+                                              event.mouse().y)) {
+        document_sidebar_focused_ = true;
+        select_document_page(index);
+        return true;
+      }
+    }
+    if (document_viewport_box_.Contain(event.mouse().x, event.mouse().y)) {
+      document_sidebar_focused_ = false;
+      return true;
+    }
+  }
+
+  const bool previous =
+      event == ftxui::Event::ArrowUp || event == ftxui::Event::Character('k');
+  const bool next =
+      event == ftxui::Event::ArrowDown || event == ftxui::Event::Character('j');
+  if (document_sidebar_focused_) {
+    if (previous) {
+      if (selected_document_page_ > 0)
+        select_document_page(selected_document_page_ - 1);
+      return true;
+    }
+    if (next) {
+      select_document_page(selected_document_page_ + 1);
+      return true;
+    }
+    if (event == ftxui::Event::Home) {
+      select_document_page(0);
+      return true;
+    }
+    if (event == ftxui::Event::End) {
+      select_document_page(document_view_->pages.size() - 1);
+      return true;
+    }
+  } else {
+    if (previous || event == ftxui::Event::PageUp) {
+      const int repetitions = event == ftxui::Event::PageUp ? 5 : 1;
+      for (int index = 0; index < repetitions; ++index) {
+        document_scroll_state_.scroll_up(layout_box_rows(document_content_box_),
+                                         box_rows(document_viewport_box_));
+      }
+      return true;
+    }
+    if (next || event == ftxui::Event::PageDown) {
+      const int repetitions = event == ftxui::Event::PageDown ? 5 : 1;
+      for (int index = 0; index < repetitions; ++index) {
+        document_scroll_state_.scroll_down(
+            layout_box_rows(document_content_box_),
+            box_rows(document_viewport_box_));
+      }
+      return true;
+    }
+    if (event == ftxui::Event::Home) {
+      document_scroll_state_.reset_to_top();
+      return true;
+    }
+    if (event == ftxui::Event::End) {
+      document_scroll_state_.follow_latest();
+      return true;
+    }
+  }
+
+  if (event.is_mouse() && event.mouse().motion == ftxui::Mouse::Pressed &&
+      (event.mouse().button == ftxui::Mouse::WheelUp ||
+       event.mouse().button == ftxui::Mouse::WheelDown)) {
+    if (document_sidebar_focused_) {
+      if (event.mouse().button == ftxui::Mouse::WheelUp &&
+          selected_document_page_ > 0) {
+        select_document_page(selected_document_page_ - 1);
+      } else if (event.mouse().button == ftxui::Mouse::WheelDown) {
+        select_document_page(selected_document_page_ + 1);
+      }
+    } else if (event.mouse().button == ftxui::Mouse::WheelUp) {
+      document_scroll_state_.scroll_up(layout_box_rows(document_content_box_),
+                                       box_rows(document_viewport_box_));
+    } else {
+      document_scroll_state_.scroll_down(layout_box_rows(document_content_box_),
+                                         box_rows(document_viewport_box_));
+    }
+    return true;
+  }
+  return event != ftxui::Event::Custom;
 }
 
 bool TerminalApplication::handle_event(ftxui::Event event) {
@@ -1455,6 +1872,8 @@ bool TerminalApplication::handle_event(ftxui::Event event) {
     copy_status_.clear();
     copy_status_error_ = false;
   }
+  if (document_view_.has_value())
+    return handle_document_view_event(std::move(event));
   if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left) {
     const auto &mouse = event.mouse();
     if (mouse.motion == ftxui::Mouse::Pressed &&
@@ -1489,8 +1908,11 @@ bool TerminalApplication::handle_event(ftxui::Event event) {
       return true;
     }
     if (is_terminal_command_completion_event(event)) {
-      input_ = complete_terminal_command(input_, command_hints_,
-                                         selected_command_suggestion_);
+      auto completed = complete_terminal_command(input_, command_hints_,
+                                                 selected_command_suggestion_);
+      if (event == ftxui::Event::Return && completed == input_)
+        return false;
+      input_ = std::move(completed);
       input_cursor_position_ = static_cast<int>(input_.size());
       selected_command_suggestion_ = 0;
       return true;
@@ -1615,36 +2037,70 @@ void TerminalApplication::submit_line() {
     const std::string display =
         "/" + command.name +
         (command.arguments.empty() ? std::string{} : " " + command.arguments);
+    const bool opens_document_view = terminal_command_opens_document_view(
+        command.name, command.arguments, command_hints_);
     transcript_.begin_request(display, TerminalActivity::action);
     active_cancellation_ = std::make_shared<core::CancellationSource>();
     const auto cancellation = active_cancellation_;
-    worker_ = std::thread([this, command, cancellation, display] {
-      const auto post_event = [this](core::AgentEvent event) {
-        app_->Post([this, event = std::move(event)] {
-          transcript_.append_event(event);
-        });
-      };
-      auto result = command_(command.name, command.arguments,
-                             cancellation->token(), post_event);
-      app_->Post([this, command, display,
-                  result = std::move(result)]() mutable {
-        bool appended_after_restore = false;
-        if (result &&
-            terminal_command_reloads_session(command.name, command.arguments)) {
-          const auto restored = reload_session();
-          if (!restored) {
-            result = core::Result<std::string>::failure(restored.error());
-          } else {
-            transcript_.append_command(display, result);
-            appended_after_restore = true;
+    worker_ = std::thread(
+        [this, command, cancellation, display, opens_document_view] {
+          const auto post_event = [this](core::AgentEvent event) {
+            app_->Post([this, event = std::move(event)] {
+              transcript_.append_event(event);
+            });
+          };
+          auto result = command_(command.name, command.arguments,
+                                 cancellation->token(), post_event);
+          std::optional<TerminalDocumentView> document_view;
+          if (opens_document_view && result) {
+            auto parsed = parse_terminal_document_view(result.value());
+            if (!parsed) {
+              result = core::Result<std::string>::failure(parsed.error());
+            } else {
+              document_view = std::move(parsed.value());
+            }
           }
-        }
-        if (!appended_after_restore)
-          transcript_.complete_request(result);
-        busy_ = false;
-        active_cancellation_.reset();
-      });
-    });
+          // Command handlers own the mutable runtime state. Snapshot it on the
+          // worker after the handler returns, then publish only value copies to
+          // the UI thread so rendering never races with command-side mutations.
+          auto displayed_model = model_state_;
+          const auto displayed_max_context_tokens = max_context_tokens_state_;
+          const auto displayed_reasoning_effort = reasoning_effort_state_;
+          const auto displayed_theme_kind = theme_kind_state_;
+          app_->Post([this, command, display, result = std::move(result),
+                      document_view = std::move(document_view),
+                      displayed_model = std::move(displayed_model),
+                      displayed_max_context_tokens, displayed_reasoning_effort,
+                      displayed_theme_kind]() mutable {
+            displayed_model_ = std::move(displayed_model);
+            displayed_max_context_tokens_ = displayed_max_context_tokens;
+            displayed_reasoning_effort_ = displayed_reasoning_effort;
+            displayed_theme_kind_ = displayed_theme_kind;
+            bool appended_after_restore = false;
+            if (document_view.has_value()) {
+              auto opened = core::Result<std::string>::success(
+                  "Opened " + document_view->title + " interactive view.");
+              transcript_.complete_request(opened);
+              document_view_ = std::move(document_view);
+              selected_document_page_ = 0;
+              document_sidebar_focused_ = true;
+              document_scroll_state_.reset_to_top();
+            } else if (result && terminal_command_reloads_session(
+                                     command.name, command.arguments)) {
+              const auto restored = reload_session();
+              if (!restored) {
+                result = core::Result<std::string>::failure(restored.error());
+              } else {
+                transcript_.append_command(display, result);
+                appended_after_restore = true;
+              }
+            }
+            if (!document_view_.has_value() && !appended_after_restore)
+              transcript_.complete_request(result);
+            busy_ = false;
+            active_cancellation_.reset();
+          });
+        });
     return;
   }
 

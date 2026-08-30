@@ -43,6 +43,9 @@ constexpr std::size_t kMaximumSourceBytes = 1024 * 1024;
 constexpr std::size_t kChunkLines = 100;
 constexpr std::size_t kChunkOverlapLines = 10;
 constexpr std::size_t kMaximumEvidenceBytes = 72 * 1024;
+constexpr std::size_t kMaximumTuiPages = 64;
+constexpr std::size_t kMaximumTuiMarkdownBytes = 12 * 1024 * 1024;
+constexpr std::size_t kMaximumTuiDocumentBytes = 16 * 1024 * 1024;
 
 std::string text(ZedaStringView value) {
   if (value.data == nullptr || value.size == 0)
@@ -400,10 +403,10 @@ public:
     cache_ = workspace_ / ".zed" / "deepwiki";
 
     const std::string options =
-        R"([{"value":"generate","description":"建立索引并生成 Wiki。"},{"value":"update","description":"增量更新索引和过期页面。"},{"value":"status","description":"查看索引和 clangd 状态。"},{"value":"open","description":"启动并打开本地网页。"}])";
+        R"([{"value":"generate","description":"建立索引并生成 Wiki。"},{"value":"update","description":"增量更新索引和过期页面。"},{"value":"status","description":"查看索引和 clangd 状态。"},{"value":"tui","description":"在终端内浏览 Wiki。","view":"document"},{"value":"open","description":"启动并打开本地网页。"}])";
     const ZedaCommandV1 command{
         view("deepwiki"),
-        view("Generate, update, inspect, or open the local C/C++ DeepWiki."),
+        view("Generate, update, inspect, or browse the local C/C++ DeepWiki."),
         view(options),
         this,
         execute_command,
@@ -472,10 +475,12 @@ private:
               ZedaTextSinkV1 output, ZedaTextSinkV1 error) {
     if (action.empty() || action == "status")
       return status(output, error);
+    if (action == "tui")
+      return tui_document(cancellation, output, error);
     if (action == "open")
       return open_web(output, error);
     if (action != "generate" && action != "update") {
-      write_sink(error, "usage: /deepwiki <generate|update|status|open>");
+      write_sink(error, "usage: /deepwiki <generate|update|status|tui|open>");
       return 1;
     }
 
@@ -546,7 +551,8 @@ private:
             << "缓存：" << cache_.string() << "\n";
     if (refreshed->degraded)
       summary << "状态：degraded（未发现 compile_commands.json）。\n";
-    summary << "使用 /deepwiki open 浏览。\n";
+    summary
+        << "使用 /deepwiki tui 在终端浏览，或用 /deepwiki open 打开网页。\n";
     write_sink(output, summary.str());
     return 0;
   }
@@ -1402,6 +1408,117 @@ private:
     return host_->complete(host_->context, view(system), view(prompt),
                            max_tokens, 1, cancellation, on_event, event_context,
                            output_sink, error_sink) == 0;
+  }
+
+  int tui_document(ZedaCancellationV1 cancellation, ZedaTextSinkV1 output,
+                   ZedaTextSinkV1 error) {
+    if (cancelled(cancellation)) {
+      write_sink(error, "DeepWiki TUI loading cancelled");
+      return 1;
+    }
+    const auto toc_text = read_file(cache_ / "toc.json", 1024 * 1024);
+    const auto toc = Json::parse(toc_text, nullptr, false);
+    if (!toc.is_array() || toc.empty()) {
+      write_sink(error,
+                 "DeepWiki has not been generated; run /deepwiki generate");
+      return 1;
+    }
+    if (toc.size() > kMaximumTuiPages) {
+      write_sink(error, "DeepWiki TUI supports at most 64 pages");
+      return 1;
+    }
+
+    std::string database_error;
+    if (!ensure_database(database_error)) {
+      write_sink(error, database_error);
+      return 1;
+    }
+    std::unordered_map<std::string, bool> stale_pages;
+    Statement stale_query(database_, "SELECT id,stale FROM pages");
+    while (stale_query && sqlite3_step(stale_query.get()) == SQLITE_ROW) {
+      stale_pages.emplace(column_text(stale_query.get(), 0),
+                          sqlite3_column_int(stale_query.get(), 1) != 0);
+    }
+
+    Json pages = Json::array();
+    std::size_t markdown_bytes = 0;
+    std::size_t stale_count = 0;
+    std::set<std::string> ids;
+    for (const auto &item : toc) {
+      if (cancelled(cancellation)) {
+        write_sink(error, "DeepWiki TUI loading cancelled");
+        return 1;
+      }
+      if (!item.is_object() || !item.contains("id") ||
+          !item.at("id").is_string() || !item.contains("title") ||
+          !item.at("title").is_string()) {
+        continue;
+      }
+      const auto raw_id = item.at("id").get<std::string>();
+      const auto title = item.at("title").get<std::string>();
+      if (raw_id.empty() || title.empty())
+        continue;
+      const auto id = safe_id(raw_id);
+      if (!ids.insert(id).second) {
+        write_sink(error, "DeepWiki table of contents has duplicate page ids");
+        return 1;
+      }
+      auto markdown =
+          read_file(cache_ / "pages" / (id + ".md"), 2 * 1024 * 1024);
+      if (markdown.empty()) {
+        write_sink(error, "DeepWiki page not found: " + id);
+        return 1;
+      }
+      if (markdown.size() > kMaximumTuiMarkdownBytes - markdown_bytes) {
+        write_sink(error, "DeepWiki pages exceed the 12 MiB TUI limit");
+        return 1;
+      }
+      markdown_bytes += markdown.size();
+      const auto stale = stale_pages.find(id);
+      const bool page_is_stale = stale != stale_pages.end() && stale->second;
+      if (page_is_stale)
+        ++stale_count;
+      const auto description =
+          item.contains("description") && item.at("description").is_string()
+              ? item.at("description").get<std::string>()
+              : std::string{};
+      pages.push_back({
+          {"id", id},
+          {"title", title},
+          {"description", description},
+          {"markdown", std::move(markdown)},
+          {"badge", page_is_stale ? "stale" : ""},
+      });
+    }
+    if (pages.empty()) {
+      write_sink(error, "DeepWiki table of contents contains no valid pages");
+      return 1;
+    }
+
+    std::string subtitle = workspace_.filename().string() + " · " +
+                           std::to_string(pages.size()) + " pages";
+    if (stale_count != 0)
+      subtitle += " · " + std::to_string(stale_count) + " stale";
+    if (!has_compile_commands())
+      subtitle += " · degraded";
+    Json document{
+        {"schema_version", 1},
+        {"title", "DeepWiki"},
+        {"subtitle", std::move(subtitle)},
+        {"pages", std::move(pages)},
+    };
+    if (cancelled(cancellation)) {
+      write_sink(error, "DeepWiki TUI loading cancelled");
+      return 1;
+    }
+    const auto serialized =
+        document.dump(-1, ' ', false, Json::error_handler_t::replace);
+    if (serialized.size() > kMaximumTuiDocumentBytes) {
+      write_sink(error, "DeepWiki TUI document exceeds the 16 MiB limit");
+      return 1;
+    }
+    write_sink(output, serialized);
+    return 0;
   }
 
   int status(ZedaTextSinkV1 output, ZedaTextSinkV1 error) {

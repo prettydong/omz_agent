@@ -20,11 +20,14 @@
 - 增强 UTF-8、工具输出、Session 序列化和配置错误处理，异常状态会明确展示，不再静默丢弃。
 - Skill 支持启用、停用、编辑、移除和归档；主 Agent 与 Worker 的工具权限均采用运行时白名单。
 - 统一配置与 Skill 的原子写入、模型上下文上限策略和子进程终止流程；取消与超时会先发送 `SIGTERM`，宽限期后再升级为 `SIGKILL`。
+- 外部进程统一改用 `posix_spawn` 和最小环境白名单；Sub Agent 只显式继承模型运行所需配置，且始终禁止 Shell 工具。
+- DeepWiki 新增 `/deepwiki tui` 双栏终端浏览器；插件命令选项可以声明受限的结构化文档视图，由主 TUI 统一渲染和导航。
 
 ### Fixed
 
 - 修复 TUI 中 `/session list`、`rename` 以及切换 Session 后的命令结果不显示。
 - 修复 `write`/`edit` 临时文件跟随符号链接，并在原子替换时保留普通权限位和取消语义。
 - 修复并发 `multi_bash`、clangd、模型进程和 Sub Agent 之间继承管道描述符导致的挂起。
+- 修复后台后代持有管道导致 Shell 超时失效、Provider 流和 tool index 无界增长、Edit 替换结果绕过大小限制、TUI 命令状态数据竞争，以及 Skill 通过符号链接或超大文件越过读取边界。
 - 修复插件部分注册失败后残留已卸载动态库回调；加载前执行完整校验，失败时回滚注册项。
 - 修复上下文压缩拆分 assistant tool call 与对应 tool result，controller 和确定性回退均按完整工具交换选择。

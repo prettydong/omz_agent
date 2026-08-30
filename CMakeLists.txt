@@ -427,4 +427,15 @@ if (BUILD_TESTING)
             "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/model-refresh-smoke"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/model_refresh_smoke.cmake
     )
+
+    if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
+        add_test(
+            NAME zeda_deepwiki_tui_command_smoke
+            COMMAND ${CMAKE_COMMAND}
+                "-DZEDA_EXECUTABLE=$<TARGET_FILE:zeda>"
+                "-DPLUGIN_ROOT=${CMAKE_BINARY_DIR}/plugins/deepwiki"
+                "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/deepwiki-tui-command-smoke"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/deepwiki_tui_command_smoke.cmake
+        )
+    endif()
 endif()

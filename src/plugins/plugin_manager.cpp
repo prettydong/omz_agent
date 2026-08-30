@@ -454,8 +454,9 @@ public:
         const auto document = Json::parse(command.options_json, nullptr, false);
         if (document.is_array()) {
           for (const auto &option : document) {
-            options.push_back(
-                {option.value("value", ""), option.value("description", "")});
+            options.push_back({option.value("value", ""),
+                               option.value("description", ""),
+                               option.value("view", "") == "document"});
           }
         }
       }
@@ -560,13 +561,17 @@ public:
           if (!option.is_object() || !option.contains("value") ||
               !option.at("value").is_string() ||
               (option.contains("description") &&
-               !option.at("description").is_string())) {
+               !option.at("description").is_string()) ||
+              (option.contains("view") &&
+               (!option.at("view").is_string() ||
+                option.at("view").get<std::string>() != "document"))) {
             return core::Result<void>::failure(
                 {ErrorCode::invalid_argument,
                  "plugin command option is invalid: " + command.name});
           }
           options.push_back({option.at("value").get<std::string>(),
-                             option.value("description", "")});
+                             option.value("description", ""),
+                             option.value("view", "") == "document"});
         }
         const auto exact_validation = extensions_.validate_command(
             {command.name,

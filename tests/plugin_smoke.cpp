@@ -8,6 +8,7 @@
 #include <string>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include "zed/core/model.hpp"
 #include "zed/core/tool_registry.hpp"
@@ -93,6 +94,19 @@ int main() {
     assert(manager.discover_and_load());
     assert(manager.statuses().size() == 1);
     assert(manager.statuses().front().loaded);
+    const auto deepwiki_command = std::find_if(
+        extensions.commands().begin(), extensions.commands().end(),
+        [](const auto &command) { return command.name == "deepwiki"; });
+    assert(deepwiki_command != extensions.commands().end());
+    const auto tui_option = std::find_if(
+        deepwiki_command->options.begin(), deepwiki_command->options.end(),
+        [](const auto &option) { return option.value == "tui"; });
+    assert(tui_option != deepwiki_command->options.end());
+    assert(tui_option->opens_document_view);
+    const auto missing_tui = extensions.execute("deepwiki", "tui");
+    assert(!missing_tui);
+    assert(missing_tui.error().message.find("has not been generated") !=
+           std::string::npos);
 
     const auto generated = extensions.execute("deepwiki", "generate");
     assert(generated);
@@ -101,6 +115,21 @@ int main() {
                                             "index.sqlite"));
     assert(std::filesystem::is_regular_file(workspace / ".zed" / "deepwiki" /
                                             "toc.json"));
+    const auto tui = extensions.execute("deepwiki", "tui");
+    assert(tui);
+    const auto tui_document =
+        nlohmann::json::parse(tui.value(), nullptr, false);
+    assert(tui_document.is_object());
+    assert(tui_document.value("schema_version", 0) == 1);
+    assert(tui_document.value("title", std::string{}) == "DeepWiki");
+    assert(tui_document.at("pages").is_array());
+    assert(tui_document.at("pages").size() == 4);
+    assert(tui_document.at("pages")
+               .front()
+               .at("markdown")
+               .get<std::string>()
+               .find("测试页面") != std::string::npos);
+    assert(model.calls == 5);
 
     const auto unchanged = extensions.execute("deepwiki", "update");
     assert(unchanged);

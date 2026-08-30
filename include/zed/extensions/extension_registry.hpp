@@ -14,6 +14,7 @@ namespace zed::extensions {
 struct CommandOption {
   std::string value;
   std::string description;
+  bool opens_document_view{false};
 };
 
 struct Command {

@@ -118,6 +118,7 @@ struct TerminalCommand {
 struct TerminalCommandOption {
   std::string value;
   std::string description;
+  bool opens_document_view{false};
 };
 
 struct TerminalCommandHint {
@@ -155,6 +156,27 @@ ftxui::Element render_terminal_command_guide(
 
 [[nodiscard]] bool
 is_terminal_command_completion_event(const ftxui::Event &event);
+
+[[nodiscard]] bool terminal_command_opens_document_view(
+    std::string_view name, std::string_view arguments,
+    const std::vector<TerminalCommandHint> &available_commands);
+
+struct TerminalDocumentPage {
+  std::string id;
+  std::string title;
+  std::string description;
+  std::string markdown;
+  std::string badge;
+};
+
+struct TerminalDocumentView {
+  std::string title;
+  std::string subtitle;
+  std::vector<TerminalDocumentPage> pages;
+};
+
+[[nodiscard]] core::Result<TerminalDocumentView>
+parse_terminal_document_view(std::string_view json);
 
 class TerminalTranscript {
 public:
@@ -209,6 +231,7 @@ public:
   void scroll_up(std::size_t content_rows, std::size_t viewport_rows);
   void scroll_down(std::size_t content_rows, std::size_t viewport_rows);
   void follow_latest();
+  void reset_to_top();
 
   [[nodiscard]] std::size_t offset_rows(std::size_t content_rows,
                                         std::size_t viewport_rows) const;
@@ -306,18 +329,26 @@ public:
 private:
   void configure_app();
   [[nodiscard]] ftxui::Element render_page();
+  [[nodiscard]] ftxui::Element render_document_view();
   bool handle_event(ftxui::Event event);
+  bool handle_document_view_event(ftxui::Event event);
+  void select_document_page(std::size_t index);
   core::Result<void> reload_session();
   void copy_selection(std::string_view selection);
   void submit_line();
 
   std::string workspace_;
-  std::string &model_;
+  std::string &model_state_;
   std::string version_;
   TerminalStartupTiming startup_;
-  core::TokenCount &max_context_tokens_;
-  core::ReasoningEffort &reasoning_effort_;
-  ThemeKind &theme_kind_;
+  core::TokenCount &max_context_tokens_state_;
+  core::ReasoningEffort &reasoning_effort_state_;
+  ThemeKind &theme_kind_state_;
+  std::string displayed_model_;
+  core::TokenCount displayed_max_context_tokens_{};
+  core::ReasoningEffort displayed_reasoning_effort_{
+      core::ReasoningEffort::automatic};
+  ThemeKind displayed_theme_kind_{ThemeKind::light};
   QuickBashState quick_bash_enabled_;
   SessionNameState session_name_;
   SessionLoader session_loader_;
@@ -343,6 +374,13 @@ private:
   bool selection_copy_pending_{false};
   bool context_footer_pressed_{false};
   bool context_analysis_visible_{false};
+  std::optional<TerminalDocumentView> document_view_;
+  std::size_t selected_document_page_{0};
+  bool document_sidebar_focused_{true};
+  std::vector<ftxui::Box> document_page_boxes_;
+  ftxui::Box document_content_box_;
+  ftxui::Box document_viewport_box_;
+  TerminalScrollState document_scroll_state_;
   std::string selected_text_;
   std::string copy_status_;
   bool copy_status_error_{false};

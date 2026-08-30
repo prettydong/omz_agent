@@ -125,6 +125,8 @@ ZED_PLUGIN_PATH                追加外部插件发现目录，多个目录使�
 文件；其他 Agent 档案和自定义 Sub Agent 的提示词以该管理文件为准。Skill 启用时位于
 `.zed/skills/`，停用时移动到 `.zed/skills-disabled/`；从管理
 页移除时会将完整目录移动到 `.zed/skill-archive/`，不会直接删除其中的附加资源。
+Skill 根目录、Skill 目录和 `SKILL.md` 都不得是符号链接；指令必须是 UTF-8，单个
+文件最多容纳 1 MiB 指令，启动时违反边界会明确报告并拒绝加载。
 
 每个主 Agent 的 Tool 权限是运行时白名单，既控制发送给模型的 Tool schema，也阻止对
 未授权 Tool 的执行；`*` 表示允许全部已注册 Tool，并用于兼容旧配置。自动上下文压缩
@@ -242,6 +244,11 @@ Session v2 不兼容早期 beta 的 message-only JSONL。旧文件不会被删�
 `*` 和 `?` glob 搜索文件或目录，不扫描 `.git` 且不跟随符号链接；`ls` 只列出
 指定目录的一层内容，并用 `/` 和 `@` 标记目录与符号链接。
 
+外部命令、`clangd`、模型 HTTP 客户端和模型目录发现统一通过 `posix_spawn` 启动。
+子进程默认只继承 `PATH`、locale、临时目录和编译工具链等明确允许的环境变量，不会
+自动获得任意 Token、数据库连接串或云凭证；确有需要的可信 Worker 必须逐项声明。
+Shell 超时或取消会终止整个进程组，即使主 Shell 已退出也不会继续等待后台进程管道。
+
 ## Sub Agent
 
 Active Agent 可以通过内置 `subagent` 工具把读密集、彼此独立的调查任务委派给
@@ -290,6 +297,10 @@ zeda 启动时从安装前缀的 `lib/zeda/plugins/` 发现版本化 C ABI 插�
 检查可执行文件旁的 `plugins/`，并可用冒号分隔的 `ZED_PLUGIN_PATH` 追加目录。
 `/plugins` 会列出成功加载和加载失败的插件；ABI 不匹配、manifest 错误和命令或工具
 冲突都会显示为可见错误。插件是受信任的本机动态库，首版不提供进程隔离或热卸载。
+命令的 `options_json` 项可以用 `"view":"document"` 声明交互式文档选项；该选项的
+执行结果必须是 `schema_version: 1` 的 JSON，包含标题和非空页面数组。宿主会在工作
+线程中解析并限制快照为 16 MiB、单页为 2 MiB、最多 128 页，普通非 TTY 输出不会
+泄露该内部协议。
 
 构建默认包含首个外部插件 DeepWiki。它只分析本地 C/C++ 仓库，使用 SQLite FTS5、
 本机 clangd 和当前 OpenCode 模型生成中文 Wiki，不使用 embedding 服务。索引同时记录
@@ -298,12 +309,18 @@ clangd 符号、`#include` 关系和 CMake target/link 关系。首次使用：
 ```text
 /deepwiki generate
 /deepwiki status
+/deepwiki tui
 /deepwiki open
 ```
 
 代码变化后执行 `/deepwiki update`。无变化时不会调用模型；普通变化只重新索引文件并
 生成引用了这些文件的页面。Wiki、索引和状态保存在当前仓库的 `.zed/deepwiki/`，插件
 不会修改源码或 `.gitignore`，因此未忽略 `.zed/` 的仓库会把它显示为未跟踪目录。
+
+在全屏终端中执行 `/deepwiki tui` 会进入内置双栏浏览器：左侧是页面目录，右侧渲染
+Markdown。用 `↑/↓` 或 `j/k` 选页，`Tab` 或 `←/→` 在目录和正文之间切换焦点，正文
+支持方向键、翻页键和鼠标滚轮滚动，按 `Esc` 或 `q` 返回 Agent 对话。过期页面会显示
+`stale` 标记；重定向输入输出时该命令会明确提示需要交互式 TTY，而不会输出内部 JSON。
 
 `/deepwiki open` 只在 `127.0.0.1` 随机端口启动网页，并自动打开浏览器。网页提供目录、
 Markdown、Mermaid 图、源码引用预览和流式问答；进程退出时服务停止。普通 Agent 也可

@@ -158,6 +158,10 @@ int main() {
       {"theme",
        "Change theme.",
        {{"light", "Light theme."}, {"monaka", "Dark theme."}}},
+      {"deepwiki",
+       "Browse documentation.",
+       {{"tui", "Open terminal browser.", true},
+        {"open", "Open web browser."}}},
       {"exit", "Quit."},
   };
   assert(zed::ui::terminal_command_suggestions("hello", command_hints).empty());
@@ -210,6 +214,30 @@ int main() {
   assert(zed::ui::is_terminal_command_completion_event(ftxui::Event::Tab));
   assert(!zed::ui::is_terminal_command_completion_event(
       ftxui::Event::Character('x')));
+  assert(zed::ui::terminal_command_opens_document_view("deepwiki", "tui",
+                                                       command_hints));
+  assert(!zed::ui::terminal_command_opens_document_view("deepwiki", "open",
+                                                        command_hints));
+  assert(!zed::ui::terminal_command_opens_document_view("deepwiki", "tui extra",
+                                                        command_hints));
+
+  const auto document_view = zed::ui::parse_terminal_document_view(R"({
+    "schema_version":1,
+    "title":"DeepWiki",
+    "subtitle":"fixture · 2 pages",
+    "pages":[
+      {"id":"overview","title":"总览","description":"架构", "markdown":"# 总览\n\n正文"},
+      {"id":"flow","title":"流程","description":"执行流", "markdown":"# 流程\n", "badge":"stale"}
+    ]
+  })");
+  assert(document_view);
+  assert(document_view.value().title == "DeepWiki");
+  assert(document_view.value().pages.size() == 2);
+  assert(document_view.value().pages[1].badge == "stale");
+  assert(!zed::ui::parse_terminal_document_view(
+      R"({"schema_version":"1","title":"bad","pages":[]})"));
+  assert(!zed::ui::parse_terminal_document_view(
+      R"({"schema_version":1,"title":"bad","pages":[{"id":"same","title":"a","markdown":"a"},{"id":"same","title":"b","markdown":"b"}]})"));
 
   const auto command_guide = render(zed::ui::render_terminal_command_guide(
       "/theme", command_hints, 0,
@@ -238,6 +266,10 @@ int main() {
   zed::ui::TerminalScrollState scroll_state;
   assert(scroll_state.follows_latest());
   assert(scroll_state.offset_rows(100, 20) == 80);
+  scroll_state.reset_to_top();
+  assert(!scroll_state.follows_latest());
+  assert(scroll_state.offset_rows(100, 20) == 0);
+  scroll_state.follow_latest();
   assert(scroll_state.focus_row(100, 20) == 89);
   scroll_state.scroll_up(100, 20);
   assert(!scroll_state.follows_latest());

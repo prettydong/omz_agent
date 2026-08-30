@@ -132,6 +132,11 @@ int run_user_interface(
 
     if (line.value().starts_with('/')) {
       const auto parsed = zed::ui::parse_terminal_command(line.value());
+      if (zed::ui::terminal_command_opens_document_view(
+              parsed.name, parsed.arguments, command_hints)) {
+        renderer.error("interactive document views require a TTY");
+        continue;
+      }
       const auto result = command(parsed.name, parsed.arguments, {}, {});
       renderer.set_theme(theme);
       if (!result)
@@ -172,11 +177,12 @@ int run_application(std::string_view executable, std::string_view version) {
       subagent_worker_executable(executable),
       runtime_config.workspace,
   });
-  zed::lsp::ClangdClient clangd({
-      runtime_config.workspace,
-      runtime_config.clangd_path,
-      zed::lsp::discover_compile_commands_directory(runtime_config.workspace),
-  });
+  zed::lsp::ClangdConfig clangd_config;
+  clangd_config.workspace_root = runtime_config.workspace;
+  clangd_config.executable = runtime_config.clangd_path;
+  clangd_config.compile_commands_directory =
+      zed::lsp::discover_compile_commands_directory(runtime_config.workspace);
+  zed::lsp::ClangdClient clangd(std::move(clangd_config));
   zed::providers::OpenCodeGoModel model({
       runtime_config.opencode_go_api_key,
       runtime_config.opencode_endpoint,
@@ -344,7 +350,8 @@ int run_application(std::string_view executable, std::string_view version) {
     std::vector<zed::ui::TerminalCommandOption> options;
     options.reserve(command.options.size());
     for (const auto &option : command.options) {
-      options.push_back({option.value, option.description});
+      options.push_back(
+          {option.value, option.description, option.opens_document_view});
     }
     command_hints.push_back(
         {command.name, command.description, std::move(options)});

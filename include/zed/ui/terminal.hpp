@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <iosfwd>
 #include <memory>
@@ -29,6 +30,18 @@ struct TerminalOptions {
   bool color{true};
   ThemeKind theme{ThemeKind::light};
 };
+
+struct TerminalStartupTiming {
+  std::chrono::microseconds config{};
+  std::chrono::microseconds core{};
+  std::chrono::microseconds session{};
+  std::chrono::microseconds setup{};
+  std::chrono::microseconds plugins{};
+  std::chrono::microseconds ui{};
+};
+
+[[nodiscard]] std::string
+terminal_startup_summary(const TerminalStartupTiming &timing);
 
 enum class TerminalActivity {
   idle,
@@ -131,6 +144,12 @@ terminal_command_suggestions(
     const std::vector<TerminalCommandHint> &available_commands,
     std::size_t selected_suggestion = 0);
 
+ftxui::Element render_terminal_command_guide(
+    std::string_view input,
+    const std::vector<TerminalCommandHint> &available_commands,
+    std::size_t selected_suggestion, const TerminalTheme &theme,
+    std::size_t max_visible_suggestions = 6);
+
 [[nodiscard]] bool
 is_terminal_command_completion_event(const ftxui::Event &event);
 
@@ -176,6 +195,7 @@ ftxui::Element render_terminal_input(ftxui::InputState state,
 ftxui::Element render_terminal_welcome(std::string_view workspace,
                                        std::string_view model,
                                        std::string_view version,
+                                       const TerminalStartupTiming &startup,
                                        core::ReasoningEffort reasoning_effort,
                                        ThemeKind theme_kind);
 
@@ -218,7 +238,8 @@ public:
   explicit TerminalRenderer(std::ostream &output, TerminalOptions options = {});
 
   void banner(std::string_view workspace, std::string_view model,
-              std::string_view version, core::ReasoningEffort reasoning_effort);
+              std::string_view version, const TerminalStartupTiming &startup,
+              core::ReasoningEffort reasoning_effort);
   void prompt();
   void render(const core::AgentEvent &event);
   void error(std::string_view message);
@@ -239,6 +260,7 @@ private:
   std::ostream &output_;
   TerminalOptions options_;
   bool assistant_stream_open_{false};
+  std::string last_tool_update_;
 };
 
 class TerminalInput {
@@ -264,8 +286,9 @@ public:
       std::function<core::Result<std::vector<core::Message>>()>;
   using InitialActivity = std::function<TerminalActivity(std::string_view)>;
 
-  TerminalApplication(std::string workspace, std::string model,
-                      std::string version, core::TokenCount max_context_tokens,
+  TerminalApplication(std::string workspace, std::string &model,
+                      std::string version, TerminalStartupTiming startup,
+                      core::TokenCount &max_context_tokens,
                       core::ReasoningEffort &reasoning_effort,
                       ThemeKind &theme_kind, QuickBashState quick_bash_enabled,
                       SessionNameState session_name,
@@ -283,9 +306,10 @@ private:
   void submit_line();
 
   std::string workspace_;
-  std::string model_;
+  std::string &model_;
   std::string version_;
-  core::TokenCount max_context_tokens_{};
+  TerminalStartupTiming startup_;
+  core::TokenCount &max_context_tokens_;
   core::ReasoningEffort &reasoning_effort_;
   ThemeKind &theme_kind_;
   QuickBashState quick_bash_enabled_;

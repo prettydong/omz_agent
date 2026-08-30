@@ -1,5 +1,6 @@
 #include "zed/core/agent_loop.hpp"
 
+#include "zed/core/default_system_prompt.hpp"
 #include "zed/core/tool_registry.hpp"
 
 #include <algorithm>
@@ -14,16 +15,6 @@
 namespace zed::core {
 
 namespace {
-
-constexpr std::string_view kDefaultSystemPrompt =
-    "You are zeda, a coding agent operating in the user's workspace. When a "
-    "request requires inspecting files, changing files, or running commands, "
-    "use the available tools in the current turn and continue until the work "
-    "is complete and proportionately verified. Never stop at a progress update "
-    "or promise to perform work later. Return a final response without tool "
-    "calls only when the request is complete or when you are blocked; when "
-    "blocked, state the concrete blocker. Every tool call must include a "
-    "concise, non-empty purpose.";
 
 constexpr std::string_view kDeferredActionCorrection =
     "The previous attempt stopped at a progress update without taking the "
@@ -234,6 +225,20 @@ void AgentLoop::set_reasoning_effort(ReasoningEffort effort) {
 
 ReasoningEffort AgentLoop::reasoning_effort() const {
   return config_.model_request.reasoning_effort;
+}
+
+void AgentLoop::set_model(ModelRef model) {
+  config_.model_request.model = std::move(model);
+}
+
+const ModelRef &AgentLoop::model() const { return config_.model_request.model; }
+
+void AgentLoop::set_context_limits(ContextLimits limits) {
+  config_.context_limits = limits;
+}
+
+const ContextLimits &AgentLoop::context_limits() const {
+  return config_.context_limits;
 }
 
 Result<std::string> AgentLoop::run(std::string user_input,
@@ -454,7 +459,12 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
            on_event);
 
       ToolResult tool_result;
-      const auto execution = tools_.execute(call, cancellation);
+      const auto execution =
+          tools_.execute(call, cancellation, [&](const ToolProgress &progress) {
+            emit({AgentEventType::tool_update, progress.text, call,
+                  std::nullopt},
+                 on_event);
+          });
       if (execution) {
         tool_result = execution.value();
       } else if (execution.error().code == ErrorCode::cancelled) {
@@ -480,7 +490,7 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
         return Result<std::string>::failure(append_tool.error());
       }
       emit({AgentEventType::tool_result, tool_result.content, std::nullopt,
-            tool_result},
+            tool_result, tool_result.model_usage},
            on_event);
     }
   }

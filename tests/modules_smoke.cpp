@@ -34,6 +34,11 @@
 
 namespace {
 
+zed::ui::TerminalStartupTiming startup_timing() {
+  using namespace std::chrono_literals;
+  return {2ms, 1ms, 3ms, 5ms, 10ms, 2ms};
+}
+
 using namespace zed::core;
 
 ToolCall call(std::string id, std::string name, std::string arguments) {
@@ -718,18 +723,32 @@ int main() {
   std::stringstream terminal_output;
   zed::ui::TerminalRenderer renderer(terminal_output, {false});
   renderer.banner("/tmp/workspace", "muse-spark-1.2-contributor", "0.1.0",
-                  zed::core::ReasoningEffort::low);
+                  startup_timing(), zed::core::ReasoningEffort::low);
   renderer.render({zed::core::AgentEventType::assistant_delta, "hello", {}});
   renderer.render({zed::core::AgentEventType::agent_end, "", {}});
-  assert(terminal_output.str().find(
-             "zeda 0.1.0\nmodel: muse-spark-1.2-contributor · "
-             "reasoning: low\nworkspace: /tmp/workspace\n") !=
+  renderer.render(
+      {zed::core::AgentEventType::tool_start, "delegate exploration", {}});
+  renderer.render(
+      {zed::core::AgentEventType::tool_update, "explorer running", {}});
+  renderer.render(
+      {zed::core::AgentEventType::tool_update, "explorer running", {}});
+  const auto startup_summary =
+      zed::ui::terminal_startup_summary(startup_timing());
+  assert(startup_summary.find('\n') == std::string::npos);
+  assert(terminal_output.str().find("workspace: /tmp/workspace\n" +
+                                    startup_summary + "\n") !=
          std::string::npos);
   assert(terminal_output.str().find("zeda 0.1.0") != std::string::npos);
-  assert(terminal_output.str().find("session") == std::string::npos);
+  assert(terminal_output.str().find("session 3.000") != std::string::npos);
+  assert(terminal_output.str().find("core") == std::string::npos);
+  assert(terminal_output.str().find("other 1.000") != std::string::npos);
   assert(terminal_output.str().find("quick bash") == std::string::npos);
   assert(terminal_output.str().find("theme") == std::string::npos);
   assert(terminal_output.str().find("hello") != std::string::npos);
+  const auto first_update = terminal_output.str().find("explorer running");
+  assert(first_update != std::string::npos);
+  assert(terminal_output.str().find("explorer running", first_update + 1) ==
+         std::string::npos);
 
   std::stringstream terminal_input("first line\n");
   zed::ui::TerminalInput input(terminal_input);
@@ -795,8 +814,8 @@ int main() {
           request_text.substr(length_start, length_end - length_start));
       expected_size = header_end + 4 + static_cast<std::size_t>(content_length);
     }
-    require(request_text.find(R"("reasoning":{"effort":"low"})") !=
-            std::string::npos);
+    require(request_text.find(R"("effort":"low")") != std::string::npos);
+    require(request_text.find(R"("summary":"auto")") != std::string::npos);
     require(request_text.find(R"("purpose")") != std::string::npos);
     require(request_text.find(R"("max_output_tokens")") == std::string::npos);
     const std::string first_event =

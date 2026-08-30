@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace zed::core {
+
+inline constexpr std::string_view kDefaultSystemPrompt =
+    R"ZEDA_PROMPT(@ZEDA_DEFAULT_SYSTEM_PROMPT@)ZEDA_PROMPT";
+
+} // namespace zed::core

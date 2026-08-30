@@ -33,7 +33,8 @@ sudo cmake --install build --prefix /usr/local
 
 ## 运行
 
-当前 CLI 使用 OpenCode Go 的 Responses API：
+当前 CLI 使用 OpenCode Go，并按模型元数据自动选择 Responses、Chat Completions
+或 Anthropic Messages 协议：
 
 ```bash
 opencode auth login
@@ -56,8 +57,10 @@ OpenCode 登录后，后续启动无需再输入。`OPENCODE_GO_API_KEY` 仍可�
 export ZED_MODEL="gpt-5.6-luna"
 ```
 
-当前 Provider 只实现 OpenCode Go 的 Responses 协议，因此只能使用该端点列出的
-模型；使用 Chat Completions 或 Messages 协议的模型仍需后续 Provider 路由支持。
+zeda 启动时直接使用内置模型目录，不执行外部模型发现，以避免阻塞欢迎页。运行中使用
+`/model list` 查看当前目录；只有显式执行 `/model refresh` 时，才会通过本机
+`opencode models opencode-go --verbose` 刷新模型、协议、上下文容量和思考档位。
+使用 `/model <id>` 切换主模型，也可在启动前通过 `ZED_MODEL` 指定模型。
 
 请确认 OpenCode Go 对所选模型的地区、配额和数据政策。`Contributor` 模型可能允许使用 prompts 和 completions 改进后续模型；不要在未接受该政策前发送凭证或敏感代码。
 
@@ -65,7 +68,7 @@ export ZED_MODEL="gpt-5.6-luna"
 
 ```text
 ZED_CONTEXT_MODEL              上下文控制模型，默认与 ZED_MODEL 相同
-ZED_REASONING_EFFORT           思考强度：none、low、medium、high，默认 low
+ZED_REASONING_EFFORT           思考档位：auto/none/minimal/low/medium/high/xhigh/max/thinking，默认 low
 ZED_QUICK_BASH                 Quick Bash 启动状态：on/off、true/false、1/0，默认 on
 ZED_THEME                      终端主题：light 或 monaka，默认 light
 ZED_WORKSPACE                  workspace 路径
@@ -75,18 +78,36 @@ ZED_RESERVED_OUTPUT_TOKENS     为模型输出预留的 Token
 ZED_CONTEXT_TRIGGER_TOKENS     触发上下文模型的 Token 阈值
 ZED_MAX_TURNS                  单次请求最大 Agent 回合数
 ZED_OPENCODE_AUTH_PATH         OpenCode auth.json 路径
-ZED_OPENCODE_ENDPOINT          OpenCode Responses API 地址
+ZED_OPENCODE_ENDPOINT          OpenCode Go API 基础地址，默认 https://opencode.ai/zen/go/v1
+ZED_OPENCODE_PATH              /model refresh 使用的本机 opencode，默认从 PATH 查找
 ZED_REQUEST_TIMEOUT_MS         Provider 请求超时时间，默认 120000
 ZED_CLANGD_PATH                本机 clangd 可执行文件，默认从 PATH 查找 clangd
 ZED_PLUGIN_PATH                追加外部插件发现目录，多个目录使用冒号分隔
 ```
 
-运行中可用 `/reasoning` 查看当前思考强度，或使用
-`/reasoning none|low|medium|high` 调整后续模型请求。例如：
+运行中可用 `/reasoning` 查看当前模型支持的思考强度，或使用 `/reasoning <effort>`
+调整后续模型请求。完整档位包括 `auto`、`none`、`minimal`、`low`、`medium`、
+`high`、`xhigh`、`max` 和 `thinking`，命令会拒绝当前模型不支持的档位。例如：
 
 ```text
 /reasoning high
 ```
+
+切换模型时，如果原思考档位不受新模型支持，会自动回到 `auto`，由模型使用默认行为。
+
+## 系统提示词
+
+项目级系统提示词文件固定为：
+
+```text
+.zed/zed_system_propmt.md
+```
+
+安装 `zeda` 时会同时安装中文提示词模板。项目中缺少该文件时，`zeda` 首次启动会
+自动创建 `.zed/zed_system_propmt.md`；已有文件不会被覆盖。文件的完整内容会替换
+程序内置提示词，当前启用的 Skill 指令仍会附加在其后。修改文件后需要重新启动
+`zeda`。该文件必须是非空的 UTF-8 普通文件，不能是符号链接，大小不得超过 1 MiB；
+创建、读取或校验失败都会在启动时明确报错。
 
 终端只提供两个内置主题，不支持自定义主题。`light` 使用 OpenCode
 默认亮色风格，`monaka` 使用 Monokai 风格的暗色配色。运行中可以切换：
@@ -174,6 +195,38 @@ Session v2 不兼容早期 beta 的 message-only JSONL。旧文件不会被删�
 `*` 和 `?` glob 搜索文件或目录，不扫描 `.git` 且不跟随符号链接；`ls` 只列出
 指定目录的一层内容，并用 `/` 和 `@` 标记目录与符号链接。
 
+## Sub Agent
+
+主 Agent 可以通过内置 `subagent` 工具把读密集、彼此独立的调查任务委派给
+Explorer。使用 `/agents` 查看角色、固定模型、reasoning、工具白名单和当前可用
+状态；第一版不提供用户直接运行 Agent 的斜杠命令。
+
+Explorer 固定使用 `opencode-go/muse-spark-1.2-contributor` 和 `low` reasoning，
+不会跟随 `/model` 切换，也不会静默回退到主模型。该模型不在有效 OpenCode Go
+目录中时，`/agents` 会显示 `unavailable`，工具调用会明确失败。使用 Explorer
+同样意味着接受前文所述 Contributor 数据政策。
+
+每个 Explorer 任务在独立的 `zeda --subagent-worker` 子进程和新上下文中运行，
+只注册 `read`、`grep`、`find`、`ls` 和只读 `lsp`。Worker 不加载 Shell、写入工具、
+Quick Bash、Skill、插件或 `subagent` 本身，也不创建 Session 文件。主 Session 仅
+保存一次 `subagent` 调用及其最终结果；运行中的 queued、running、completed 和
+failed 状态只显示在当前工具卡片中。
+
+模型可使用三种互斥调用形式：
+
+```json
+{"agent":"explorer","task":"调查一个问题"}
+{"tasks":[{"agent":"explorer","task":"调查 A"},{"agent":"explorer","task":"调查 B"}]}
+{"chain":[{"agent":"explorer","task":"先调查 A"},{"agent":"explorer","task":"根据 {previous} 调查 B"}]}
+```
+
+Parallel 和 Chain 都接受 2–8 个任务；Parallel 最多同时运行 4 个并按输入顺序返回，
+单个失败不会丢弃其他结果。Chain 用上一步结果替换 `{previous}`，首个失败后停止。
+一次调用总超时为 10 分钟，每个 Worker 最多执行 12 个 Agent Loop 回合；每个任务的
+输入和最终输出上限都是 32 KiB，聚合工具结果上限是 256 KiB。取消会终止所有活动
+及排队任务。子任务的模型 token 会计入终端累计用量，但不会覆盖主 Agent 的当前
+上下文占用。
+
 zeda 只集成本机 `clangd`，不下载或启动其他语言服务器。C/C++ 文件可通过 `lsp`
 工具查询 diagnostics、hover、definition、references 和 document symbols；成功的
 `write` 与 `edit` 会等待当前文件的新诊断并附加到工具结果。启动时依次查找 workspace
@@ -228,6 +281,7 @@ include/zed/ui/         FTXUI 终端 UI
 include/zed/skills/     Skill 发现和加载
 include/zed/extensions/ Extension 命令注册
 include/zed/plugins/    外部插件 C ABI 和宿主加载器
+include/zed/subagents/  内置 Agent、Worker 协议与进程编排
 plugins/deepwiki/       C/C++ DeepWiki 插件与本地网页资源
 ```
 
@@ -237,11 +291,23 @@ plugins/deepwiki/       C/C++ DeepWiki 插件与本地网页资源
 请求终端将所选文本写入剪贴板，并在底栏显示复制状态。普通单击
 仍用于展开或收起可折叠记录。该能力需要终端支持 OSC 52。
 
-终端采用类似 Codex CLI 的布局：欢迎页显示版本、模型、思考强度、Quick Bash 状态、工作目录、Session、工具和快捷键，并与消息记录位于同一个可滚动区域，因此向下浏览后不会固定占用屏幕。鼠标滚轮每次固定滚动 3 行；默认自动跟随最新消息，向上滚动后暂停跟随，滚回底部、执行命令或提交新请求时恢复。输入框在没有命令补全列表时支持使用上下方向键切换本进程中已发送的模型 prompt，回到最新位置时恢复未发送草稿。底部固定输入框、运行状态和 token 指标。底栏左侧根据 Agent 事件显示紧凑状态；思考时会显示当前强度（例如 `low think`），活动状态带旋转动画，空闲时显示静态 `idle`。用户、助手、工具和错误消息分别渲染，只有助手内容会进入 Markdown 解析，避免输入或工具输出意外破坏对话布局。
+终端采用类似 Codex CLI 的布局：欢迎页显示版本、模型、思考强度、工作目录和从进入
+`main` 到界面就绪的启动耗时。耗时精确到 0.001 ms；仅单独显示严格大于 1 ms 的
+阶段，其余阶段合并为 `other`，分项之和仍等于总耗时。例如：
+
+```text
+startup: 23.000 ms = config 2.000 + session 3.000 + setup 5.000 + plugins 10.000 + ui 2.000 + other 1.000
+```
+
+欢迎页与消息记录位于同一个可滚动区域，因此向下浏览后不会固定占用屏幕。鼠标滚轮每次固定滚动 3 行；默认自动跟随最新消息，向上滚动后暂停跟随，滚回底部、执行命令或提交新请求时恢复。输入框在没有命令补全列表时支持使用上下方向键切换本进程中已发送的模型 prompt，回到最新位置时恢复未发送草稿。底部固定输入框、运行状态和 token 指标。底栏左侧根据 Agent 事件显示紧凑状态；思考时会显示当前强度（例如 `low think`），活动状态带旋转动画，空闲时显示静态 `idle`。用户、助手、工具和错误消息分别渲染，只有助手内容会进入 Markdown 解析，避免输入或工具输出意外破坏对话布局。
 
 底栏右侧显示 token 指标：`ctx` 是最近一次模型请求的 input tokens，`↑` 和 `↓` 分别是本次进程内所有模型调用的累计 input 与 output，`Σ` 后的值是两者之和。数值达到千级或百万级时使用 `k` 或 `m` 紧凑显示。一次 Agent 请求包含多轮工具调用时，每轮模型 usage 都会计入。`ctx` 可以点击，打开 Context analysis 面板；面板外的聊天页面会变暗，面板自身保持不透明。总量采用供应商返回的精确 usage，页面会显示容量、剩余空间、缓存命中，以及系统指令、用户消息、助手消息、工具往返、工具定义和协议开销的估算分布。再次点击 `ctx` 或按 Esc 关闭。
 
-Provider 使用 Responses API 的 SSE 模式增量读取模型输出。全屏终端会将密集的 `assistant_delta` 按约 30 FPS 合并刷新，避免事件队列直到响应结束才统一重绘；输入或输出被重定向时，普通 CLI 会立即写出并刷新每个文本增量。Session 仍只在一次模型响应成功并通过工具调用校验后追加完整 assistant 消息。
+Provider 按模型选择 Responses、Chat Completions 或 Anthropic Messages 的 SSE
+协议并增量读取模型输出。全屏终端会将密集的 `assistant_delta` 按约 30 FPS
+合并刷新，避免事件队列直到响应结束才统一重绘；输入或输出被重定向时，普通 CLI
+会立即写出并刷新每个文本增量。Session 仍只在一次模型响应成功并通过工具调用校验后
+追加完整 assistant 消息。
 
 主 Agent 请求不发送 `max_output_tokens`，因此 zeda 不设置单次响应输出上限，由模型供应商和模型自身的上下文窗口决定实际最大值。内部上下文摘要请求仍使用独立的 1024-token 上限。`ZED_RESERVED_OUTPUT_TOKENS` 只控制构建上下文时为输出预留的空间，不会截断模型输出。
 

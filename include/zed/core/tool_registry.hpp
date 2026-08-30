@@ -18,7 +18,8 @@ public:
   [[nodiscard]] std::vector<ToolDefinition> definitions() const;
 
   Result<ToolResult> execute(const ToolCall &call,
-                             CancellationToken cancellation);
+                             CancellationToken cancellation,
+                             const ToolProgressCallback &on_progress = {});
 
 private:
   mutable std::mutex mutex_;

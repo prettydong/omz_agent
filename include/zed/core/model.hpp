@@ -34,33 +34,58 @@ enum class ReasoningEffort {
   low,
   medium,
   high,
+  automatic,
+  minimal,
+  xhigh,
+  max,
+  thinking,
 };
 
 [[nodiscard]] constexpr std::string_view
 reasoning_effort_name(ReasoningEffort effort) {
   switch (effort) {
+  case ReasoningEffort::automatic:
+    return "auto";
   case ReasoningEffort::none:
     return "none";
+  case ReasoningEffort::minimal:
+    return "minimal";
   case ReasoningEffort::low:
     return "low";
   case ReasoningEffort::medium:
     return "medium";
   case ReasoningEffort::high:
     return "high";
+  case ReasoningEffort::xhigh:
+    return "xhigh";
+  case ReasoningEffort::max:
+    return "max";
+  case ReasoningEffort::thinking:
+    return "thinking";
   }
   return "low";
 }
 
 [[nodiscard]] constexpr std::optional<ReasoningEffort>
 reasoning_effort_from_name(std::string_view name) {
+  if (name == "auto")
+    return ReasoningEffort::automatic;
   if (name == "none")
     return ReasoningEffort::none;
+  if (name == "minimal")
+    return ReasoningEffort::minimal;
   if (name == "low")
     return ReasoningEffort::low;
   if (name == "medium")
     return ReasoningEffort::medium;
   if (name == "high")
     return ReasoningEffort::high;
+  if (name == "xhigh")
+    return ReasoningEffort::xhigh;
+  if (name == "max")
+    return ReasoningEffort::max;
+  if (name == "thinking")
+    return ReasoningEffort::thinking;
   return std::nullopt;
 }
 

@@ -1,5 +1,6 @@
 #include <cassert>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,7 +31,16 @@ public:
           "echo cancelled",
       });
     }
-    return Result<ToolResult>::success({call.id, "echo-result", false});
+    return Result<ToolResult>::success(
+        {call.id, "echo-result", false, ModelUsage{3, 1, 2}});
+  }
+
+  Result<ToolResult>
+  execute_with_progress(const ToolCall &call, CancellationToken cancellation,
+                        const ToolProgressCallback &on_progress) override {
+    if (on_progress)
+      on_progress({"echo is running"});
+    return execute(call, cancellation);
   }
 
 private:
@@ -44,7 +54,7 @@ public:
                                      CancellationToken cancellation) override {
     assert(!request.messages.empty());
     assert(request.messages.front().role == Role::system);
-    assert(request.messages.front().content.find("Never stop at a progress") !=
+    assert(request.messages.front().content.find("不要只回复进度") !=
            std::string::npos);
     assert(request.model.provider == "test");
     assert(request.model.model == "fake");
@@ -189,6 +199,8 @@ public:
                                      CancellationToken) override {
     assert(request.messages.size() == 2);
     assert(request.messages[0].role == Role::system);
+    assert(request.messages[0].content.find("custom base prompt") !=
+           std::string::npos);
     assert(request.messages[0].content.find("active skill instructions") !=
            std::string::npos);
     assert(request.messages[1].role == Role::user);
@@ -219,10 +231,19 @@ int main() {
   config.context_limits = {4096, 512, 3000};
 
   AgentLoop loop(model, tools, session, context, config);
+  loop.set_model({"test", "switched"});
+  assert(loop.model().provider == "test");
+  assert(loop.model().model == "switched");
+  loop.set_model({"test", "fake"});
+  loop.set_context_limits({512, 64, 400});
+  assert(loop.context_limits().max_context_tokens == 512);
+  loop.set_context_limits(config.context_limits);
   loop.set_reasoning_effort(ReasoningEffort::high);
   assert(loop.reasoning_effort() == ReasoningEffort::high);
   std::vector<ModelUsage> observed_usage;
   std::vector<std::string> observed_tool_purposes;
+  std::vector<std::string> observed_tool_updates;
+  std::optional<ModelUsage> observed_tool_usage;
   const auto result = loop.run("run echo", {}, [&](const AgentEvent &event) {
     if (event.type == AgentEventType::assistant_message &&
         event.model_usage.has_value()) {
@@ -230,6 +251,12 @@ int main() {
     }
     if (event.type == AgentEventType::tool_start) {
       observed_tool_purposes.push_back(event.text);
+    }
+    if (event.type == AgentEventType::tool_update)
+      observed_tool_updates.push_back(event.text);
+    if (event.type == AgentEventType::tool_result &&
+        event.model_usage.has_value()) {
+      observed_tool_usage = event.model_usage;
     }
   });
   assert(result);
@@ -254,6 +281,10 @@ int main() {
   assert(observed_usage[1].context_breakdown->tool_tokens > 0);
   assert(observed_tool_purposes.size() == 1);
   assert(observed_tool_purposes[0] == "Verify the echo workflow");
+  assert(observed_tool_updates.size() == 1);
+  assert(observed_tool_updates[0] == "echo is running");
+  assert(observed_tool_usage.has_value());
+  assert(observed_tool_usage->input_tokens == 3);
 
   const auto history = session.load();
   assert(history);
@@ -343,9 +374,12 @@ int main() {
   ToolRegistry additional_context_tools;
   InMemorySessionStore additional_context_session;
   BasicContextManager additional_context_manager(estimator);
+  auto additional_context_config = config;
+  additional_context_config.system_prompt = "custom base prompt";
   AgentLoop additional_context_loop(
       additional_context_model, additional_context_tools,
-      additional_context_session, additional_context_manager, config);
+      additional_context_session, additional_context_manager,
+      additional_context_config);
   const auto additional_context_result = additional_context_loop.run(
       "exact user input", {}, {}, "active skill instructions");
   assert(additional_context_result);

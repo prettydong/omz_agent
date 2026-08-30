@@ -31,6 +31,10 @@ public:
 
   void set_reasoning_effort(ReasoningEffort effort);
   [[nodiscard]] ReasoningEffort reasoning_effort() const;
+  void set_model(ModelRef model);
+  [[nodiscard]] const ModelRef &model() const;
+  void set_context_limits(ContextLimits limits);
+  [[nodiscard]] const ContextLimits &context_limits() const;
 
 private:
   Result<std::string>

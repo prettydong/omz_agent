@@ -20,6 +20,7 @@ struct ClangdConfig {
   std::size_t request_timeout_ms{5'000};
   std::size_t max_message_bytes{16 * 1024 * 1024};
   std::size_t max_diagnostics{50};
+  bool background_index{true};
 };
 
 struct Diagnostic {

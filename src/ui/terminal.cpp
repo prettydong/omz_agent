@@ -523,6 +523,61 @@ std::string complete_terminal_command(
   return suggestions[index].completion;
 }
 
+ftxui::Element render_terminal_command_guide(
+    std::string_view input,
+    const std::vector<TerminalCommandHint> &available_commands,
+    std::size_t selected_suggestion, const TerminalTheme &theme,
+    std::size_t max_visible_suggestions) {
+  const auto suggestions =
+      terminal_command_suggestions(input, available_commands);
+  const auto *command_help = terminal_command_help(input, available_commands);
+  if (selected_suggestion >= suggestions.size())
+    selected_suggestion = 0;
+  const auto first_visible =
+      max_visible_suggestions == 0 ||
+              selected_suggestion < max_visible_suggestions
+          ? 0
+          : selected_suggestion - max_visible_suggestions + 1;
+  const auto visible = max_visible_suggestions == 0
+                           ? std::size_t{}
+                           : std::min(suggestions.size() - first_visible,
+                                      max_visible_suggestions);
+
+  ftxui::Elements rows;
+  rows.reserve(visible + 2);
+  if (command_help != nullptr) {
+    rows.push_back(ftxui::hbox({
+        ftxui::text("/" + command_help->name) | ftxui::bold |
+            ftxui::color(theme.primary),
+        ftxui::text("  " + command_help->description) |
+            ftxui::color(theme.text_muted),
+    }));
+  }
+  if (visible > 0) {
+    rows.push_back(
+        ftxui::text(suggestions.front().option
+                        ? "options · ↑/↓ select · enter/tab complete"
+                        : "commands · ↑/↓ select · enter/tab complete") |
+        ftxui::color(theme.text_muted));
+  }
+  for (std::size_t offset = 0; offset < visible; ++offset) {
+    const auto index = first_visible + offset;
+    const auto &suggestion = suggestions[index];
+    const bool selected = index == selected_suggestion;
+    auto row = ftxui::hbox({
+        ftxui::text(selected ? "› " : "  ") | ftxui::color(theme.secondary),
+        ftxui::text(suggestion.value) | ftxui::bold |
+            ftxui::color(selected ? theme.secondary : theme.primary),
+        ftxui::text("  " + suggestion.description) |
+            ftxui::color(theme.text_muted),
+    });
+    if (selected)
+      row |= ftxui::bgcolor(theme.input_background);
+    rows.push_back(std::move(row));
+  }
+  return ftxui::vbox(std::move(rows));
+}
+
 bool is_terminal_command_completion_event(const ftxui::Event &event) {
   return event == ftxui::Event::Return || event == ftxui::Event::Tab;
 }
@@ -825,8 +880,19 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
                                      "running…", true, false, false});
     }
     break;
+  case AgentEventType::tool_update:
+    activity_ = TerminalActivity::action;
+    if (active_tool_.has_value())
+      messages_[*active_tool_].content = event.text;
+    break;
   case AgentEventType::tool_result:
     activity_ = TerminalActivity::thinking;
+    if (event.model_usage.has_value()) {
+      token_metrics_.input_tokens += event.model_usage->input_tokens;
+      token_metrics_.output_tokens += event.model_usage->output_tokens;
+      token_metrics_.cached_context_tokens +=
+          event.model_usage->cached_input_tokens;
+    }
     if (active_direct_command_.has_value()) {
       auto &message = messages_[*active_direct_command_];
       message.content = event.text;
@@ -969,6 +1035,51 @@ bool TerminalTranscript::toggle_message_expansion(std::size_t index) {
   return true;
 }
 
+std::string terminal_startup_summary(const TerminalStartupTiming &timing) {
+  constexpr auto kVisibleThreshold = std::chrono::milliseconds(1);
+  const auto total = timing.config + timing.core + timing.session +
+                     timing.setup + timing.plugins + timing.ui;
+  const auto milliseconds = [](std::chrono::microseconds duration) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(3)
+           << static_cast<double>(duration.count()) / 1000.0;
+    return output.str();
+  };
+  const std::array phases{
+      std::pair<std::string_view, std::chrono::microseconds>{"config",
+                                                             timing.config},
+      std::pair<std::string_view, std::chrono::microseconds>{"core",
+                                                             timing.core},
+      std::pair<std::string_view, std::chrono::microseconds>{"session",
+                                                             timing.session},
+      std::pair<std::string_view, std::chrono::microseconds>{"setup",
+                                                             timing.setup},
+      std::pair<std::string_view, std::chrono::microseconds>{"plugins",
+                                                             timing.plugins},
+      std::pair<std::string_view, std::chrono::microseconds>{"ui", timing.ui},
+  };
+
+  std::vector<std::string> components;
+  std::chrono::microseconds other{};
+  for (const auto &[name, duration] : phases) {
+    if (duration > kVisibleThreshold) {
+      components.push_back(std::string(name) + " " + milliseconds(duration));
+    } else {
+      other += duration;
+    }
+  }
+  if (other.count() > 0 || components.empty())
+    components.push_back("other " + milliseconds(other));
+
+  std::string result = "startup: " + milliseconds(total) + " ms = ";
+  for (std::size_t index = 0; index < components.size(); ++index) {
+    if (index > 0)
+      result += " + ";
+    result += components[index];
+  }
+  return result;
+}
+
 std::size_t TerminalTranscript::append_message(TerminalMessage message) {
   messages_.push_back(std::move(message));
   return messages_.size() - 1;
@@ -1000,28 +1111,32 @@ ftxui::Element render_terminal_input(ftxui::InputState state,
 ftxui::Element render_terminal_welcome(std::string_view workspace,
                                        std::string_view model,
                                        std::string_view version,
+                                       const TerminalStartupTiming &startup,
                                        core::ReasoningEffort reasoning_effort,
                                        ThemeKind theme_kind) {
   const auto &theme = terminal_theme(theme_kind);
-  return ftxui::vbox({
-             ftxui::hbox({
-                 ftxui::text(">_ ") | ftxui::color(theme.text_muted),
-                 ftxui::text("zeda " + std::string(version)) | ftxui::bold |
-                     ftxui::color(theme.primary),
-             }),
-             ftxui::hbox({
-                 ftxui::text("model: ") | ftxui::color(theme.text_muted),
-                 ftxui::text(std::string(model)) | ftxui::color(theme.text),
-                 ftxui::text(" · reasoning: ") | ftxui::color(theme.text_muted),
-                 ftxui::text(std::string(
-                     core::reasoning_effort_name(reasoning_effort))) |
-                     ftxui::color(theme.text),
-             }),
-             ftxui::hbox({
-                 ftxui::text("workspace: ") | ftxui::color(theme.text_muted),
-                 ftxui::text(std::string(workspace)) | ftxui::color(theme.text),
-             }),
-         }) |
+  const auto startup_summary = terminal_startup_summary(startup);
+  ftxui::Elements elements{
+      ftxui::hbox({
+          ftxui::text(">_ ") | ftxui::color(theme.text_muted),
+          ftxui::text("zeda " + std::string(version)) | ftxui::bold |
+              ftxui::color(theme.primary),
+      }),
+      ftxui::hbox({
+          ftxui::text("model: ") | ftxui::color(theme.text_muted),
+          ftxui::text(std::string(model)) | ftxui::color(theme.text),
+          ftxui::text(" · reasoning: ") | ftxui::color(theme.text_muted),
+          ftxui::text(
+              std::string(core::reasoning_effort_name(reasoning_effort))) |
+              ftxui::color(theme.text),
+      }),
+      ftxui::hbox({
+          ftxui::text("workspace: ") | ftxui::color(theme.text_muted),
+          ftxui::text(std::string(workspace)) | ftxui::color(theme.text),
+      }),
+      ftxui::text(startup_summary) | ftxui::color(theme.text_muted),
+  };
+  return ftxui::vbox(std::move(elements)) |
          ftxui::bgcolor(theme.background_panel) |
          ftxui::borderStyled(ftxui::ROUNDED, theme.border);
 }
@@ -1032,13 +1147,16 @@ TerminalRenderer::TerminalRenderer(std::ostream &output,
 
 void TerminalRenderer::banner(std::string_view workspace,
                               std::string_view model, std::string_view version,
+                              const TerminalStartupTiming &startup,
                               core::ReasoningEffort reasoning_effort) {
+  const auto startup_summary = terminal_startup_summary(startup);
   output_ << render_text("zeda " + std::string(version), Tone::title) << "\n"
           << render_text(
                  "model: " + std::string(model) + " · reasoning: " +
                  std::string(core::reasoning_effort_name(reasoning_effort)))
           << "\n"
-          << render_text("workspace: " + std::string(workspace)) << "\n";
+          << render_text("workspace: " + std::string(workspace)) << "\n"
+          << startup_summary << "\n";
 }
 
 void TerminalRenderer::prompt() {
@@ -1073,12 +1191,22 @@ void TerminalRenderer::render(const core::AgentEvent &event) {
     output_ << "\n"
             << render_text("[tool: " + event.text + "]", Tone::tool) << "\n"
             << std::flush;
+    last_tool_update_.clear();
+    break;
+  case AgentEventType::tool_update:
+    if (!event.text.empty() && event.text != last_tool_update_) {
+      output_ << render_text("[tool update: " + event.text + "]", Tone::tool)
+              << "\n"
+              << std::flush;
+      last_tool_update_ = event.text;
+    }
     break;
   case AgentEventType::tool_result:
     output_ << render_element(ftxui::paragraph(event.text) |
                               ftxui::color(terminal_theme(options_.theme).text))
             << "\n"
             << std::flush;
+    last_tool_update_.clear();
     break;
   case AgentEventType::agent_end:
     if (assistant_stream_open_) {
@@ -1143,15 +1271,16 @@ core::Result<std::string> TerminalInput::read_line() {
 }
 
 TerminalApplication::TerminalApplication(
-    std::string workspace, std::string model, std::string version,
-    core::TokenCount max_context_tokens,
+    std::string workspace, std::string &model, std::string version,
+    TerminalStartupTiming startup, core::TokenCount &max_context_tokens,
     core::ReasoningEffort &reasoning_effort, ThemeKind &theme_kind,
     QuickBashState quick_bash_enabled, SessionNameState session_name,
     SessionLoader session_loader, InitialActivity initial_activity,
     std::vector<TerminalCommandHint> command_hints, SubmitHandler submit,
     CommandHandler command)
-    : workspace_(std::move(workspace)), model_(std::move(model)),
-      version_(std::move(version)), max_context_tokens_(max_context_tokens),
+    : workspace_(std::move(workspace)), model_(model),
+      version_(std::move(version)), startup_(startup),
+      max_context_tokens_(max_context_tokens),
       reasoning_effort_(reasoning_effort), theme_kind_(theme_kind),
       quick_bash_enabled_(std::move(quick_bash_enabled)),
       session_name_(std::move(session_name)),
@@ -1217,8 +1346,8 @@ core::Result<void> TerminalApplication::run() {
         now.time_since_epoch());
     const auto spinner_frame = static_cast<std::size_t>(elapsed.count() / 80);
     auto content = ftxui::vbox({
-        render_terminal_welcome(workspace_, model_, version_, reasoning_effort_,
-                                theme_kind_),
+        render_terminal_welcome(workspace_, model_, version_, startup_,
+                                reasoning_effort_, theme_kind_),
         ftxui::separatorEmpty(),
         render_messages(transcript_.messages(), theme, &message_boxes_),
     });
@@ -1244,60 +1373,8 @@ core::Result<void> TerminalApplication::run() {
     if (selected_command_suggestion_ >= command_suggestions.size()) {
       selected_command_suggestion_ = 0;
     }
-    ftxui::Elements suggestion_rows;
-    constexpr std::size_t kMaxVisibleSuggestions = 6;
-    const auto first_visible_suggestion =
-        selected_command_suggestion_ < kMaxVisibleSuggestions
-            ? 0
-            : selected_command_suggestion_ - kMaxVisibleSuggestions + 1;
-    const auto visible_suggestions =
-        std::min(command_suggestions.size() - first_visible_suggestion,
-                 kMaxVisibleSuggestions);
-    suggestion_rows.reserve(visible_suggestions + 3);
-    if (command_help != nullptr) {
-      suggestion_rows.push_back(ftxui::hbox({
-          ftxui::text("/" + command_help->name) | ftxui::bold |
-              ftxui::color(theme.primary),
-          ftxui::text("  " + command_help->description) |
-              ftxui::color(theme.text_muted),
-      }));
-      std::string options = "secondary options: ";
-      if (command_help->options.empty()) {
-        options += "none";
-      } else {
-        for (std::size_t index = 0; index < command_help->options.size();
-             ++index) {
-          if (index > 0)
-            options += " · ";
-          options += command_help->options[index].value;
-        }
-      }
-      suggestion_rows.push_back(ftxui::paragraph(std::move(options)) |
-                                ftxui::color(theme.text_muted));
-    }
-    if (visible_suggestions > 0) {
-      suggestion_rows.push_back(
-          ftxui::text(command_suggestions.front().option
-                          ? "options · ↑/↓ select · enter/tab complete"
-                          : "commands · ↑/↓ select · enter/tab complete") |
-          ftxui::color(theme.text_muted));
-    }
-    for (std::size_t offset = 0; offset < visible_suggestions; ++offset) {
-      const auto index = first_visible_suggestion + offset;
-      const auto &suggestion = command_suggestions[index];
-      const bool selected = index == selected_command_suggestion_;
-      auto row = ftxui::hbox({
-          ftxui::text(selected ? "› " : "  ") | ftxui::color(theme.secondary),
-          ftxui::text(suggestion.value) | ftxui::bold |
-              ftxui::color(selected ? theme.secondary : theme.primary),
-          ftxui::text("  " + suggestion.description) |
-              ftxui::color(theme.text_muted),
-      });
-      if (selected)
-        row |= ftxui::bgcolor(theme.input_background);
-      suggestion_rows.push_back(std::move(row));
-    }
-    auto suggestions = ftxui::vbox(std::move(suggestion_rows));
+    auto suggestions = render_terminal_command_guide(
+        input_, command_hints_, selected_command_suggestion_, theme);
     const bool command_guide_visible =
         command_help != nullptr || !command_suggestions.empty();
     ftxui::Elements footer_elements{

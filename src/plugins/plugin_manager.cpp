@@ -592,7 +592,8 @@ public:
     request.model = manager.config_.model;
     request.temperature = 0.0;
     request.reasoning_effort =
-        reasoning_effort <= 3
+        reasoning_effort <=
+                static_cast<uint32_t>(core::ReasoningEffort::thinking)
             ? static_cast<core::ReasoningEffort>(reasoning_effort)
             : manager.config_.reasoning_effort;
     if (max_output_tokens != 0)

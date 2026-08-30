@@ -151,8 +151,9 @@ std::vector<ToolDefinition> ToolRegistry::definitions() const {
   return result;
 }
 
-Result<ToolResult> ToolRegistry::execute(const ToolCall &call,
-                                         CancellationToken cancellation) {
+Result<ToolResult>
+ToolRegistry::execute(const ToolCall &call, CancellationToken cancellation,
+                      const ToolProgressCallback &on_progress) {
   if (cancellation.is_cancelled()) {
     return Result<ToolResult>::failure({
         ErrorCode::cancelled,
@@ -179,7 +180,8 @@ Result<ToolResult> ToolRegistry::execute(const ToolCall &call,
     target = iterator->get();
   }
 
-  auto execution = target->execute(call, cancellation);
+  auto execution =
+      target->execute_with_progress(call, cancellation, on_progress);
   if (!execution)
     return execution;
 

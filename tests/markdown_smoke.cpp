@@ -1,4 +1,5 @@
 #include <cassert>
+#include <chrono>
 #include <sstream>
 #include <string>
 
@@ -11,6 +12,11 @@
 #include "zed/ui/terminal.hpp"
 
 namespace {
+
+zed::ui::TerminalStartupTiming startup_timing() {
+  using namespace std::chrono_literals;
+  return {2ms, 1ms, 3ms, 5ms, 10ms, 2ms};
+}
 
 std::string render(ftxui::Element element) {
   const auto width = ftxui::Dimension::Fit(element);
@@ -205,6 +211,20 @@ int main() {
   assert(!zed::ui::is_terminal_command_completion_event(
       ftxui::Event::Character('x')));
 
+  const auto command_guide = render(zed::ui::render_terminal_command_guide(
+      "/theme", command_hints, 0,
+      zed::ui::terminal_theme(zed::ui::ThemeKind::light)));
+  assert(command_guide.find("/theme") != std::string::npos);
+  assert(command_guide.find("Change theme.") != std::string::npos);
+  assert(command_guide.find("options ·") != std::string::npos);
+  assert(command_guide.find("light") != std::string::npos);
+  assert(command_guide.find("Light theme.") != std::string::npos);
+  assert(command_guide.find("monaka") != std::string::npos);
+  assert(command_guide.find("Dark theme.") != std::string::npos);
+  assert(command_guide.find("secondary options") == std::string::npos);
+  assert(count_occurrences(command_guide, "light") == 1);
+  assert(count_occurrences(command_guide, "monaka") == 1);
+
   assert(zed::ui::terminal_activity_label(zed::ui::TerminalActivity::thinking,
                                           zed::core::ReasoningEffort::low) ==
          "low think");
@@ -280,18 +300,31 @@ int main() {
   assert(three_rows_up_view.starts_with("row 17"));
 
   const auto welcome = render(zed::ui::render_terminal_welcome(
-      "/tmp/workspace", "fixture-model", "0.1.0",
+      "/tmp/workspace", "fixture-model", "0.1.0", startup_timing(),
       zed::core::ReasoningEffort::low, zed::ui::ThemeKind::light));
+  const auto startup_summary =
+      zed::ui::terminal_startup_summary(startup_timing());
+  assert(startup_summary ==
+         "startup: 23.000 ms = config 2.000 + session 3.000 + setup 5.000 + "
+         "plugins 10.000 + ui 2.000 + other 1.000");
+  assert(startup_summary.find('\n') == std::string::npos);
+  assert(startup_summary.find("core") == std::string::npos);
+  assert(startup_summary.find("other 1.000") != std::string::npos);
   assert(welcome.find("fixture-model") != std::string::npos);
   assert(welcome.find("low") != std::string::npos);
   assert(welcome.find("/tmp/workspace") != std::string::npos);
   assert(welcome.find("zeda 0.1.0") != std::string::npos);
-  assert(welcome.find("session") == std::string::npos);
+  assert(welcome.find("startup:") != std::string::npos);
+  assert(welcome.find("23.000 ms") != std::string::npos);
+  assert(welcome.find("session") != std::string::npos);
+  assert(welcome.find("plugins") != std::string::npos);
+  assert(welcome.find("10.000") != std::string::npos);
+  assert(welcome.find("other") != std::string::npos);
   assert(welcome.find("quick bash") == std::string::npos);
   assert(welcome.find("theme") == std::string::npos);
   assert(rendered_rows(zed::ui::render_terminal_welcome(
-             "/tmp/workspace", "fixture-model", "0.1.0",
-             zed::core::ReasoningEffort::low, zed::ui::ThemeKind::light)) == 5);
+             "/tmp/workspace", "fixture-model", "0.1.0", startup_timing(),
+             zed::core::ReasoningEffort::low, zed::ui::ThemeKind::light)) == 6);
 
   assert(zed::ui::theme_kind_from_name("light") == zed::ui::ThemeKind::light);
   assert(zed::ui::theme_kind_from_name("monaka") == zed::ui::ThemeKind::monaka);
@@ -424,9 +457,9 @@ int main() {
              zed::ui::render_terminal_messages(wrapped_messages, light_theme),
              20, 10) >= 3);
   auto viewport_content = ftxui::vbox({
-      zed::ui::render_terminal_welcome("/tmp/workspace", "fixture-model",
-                                       "0.1.0", zed::core::ReasoningEffort::low,
-                                       zed::ui::ThemeKind::light),
+      zed::ui::render_terminal_welcome(
+          "/tmp/workspace", "fixture-model", "0.1.0", startup_timing(),
+          zed::core::ReasoningEffort::low, zed::ui::ThemeKind::light),
       ftxui::separatorEmpty(),
       zed::ui::render_terminal_messages(wrapped_messages, light_theme),
   });
@@ -480,13 +513,27 @@ int main() {
       {},
   });
   assert(activity_transcript.activity() == zed::ui::TerminalActivity::action);
+  const auto activity_message_count = activity_transcript.messages().size();
+  activity_transcript.append_event({
+      zed::core::AgentEventType::tool_update,
+      "[explorer 1/1] running — read: inspect fixture",
+      {},
+      {},
+  });
+  assert(activity_transcript.messages().size() == activity_message_count);
+  assert(activity_transcript.messages().back().content.find("explorer") !=
+         std::string::npos);
   activity_transcript.append_event({
       zed::core::AgentEventType::tool_result,
       "done",
       {},
-      {},
+      zed::core::ToolResult{"subagent-fixture", "done", false,
+                            zed::core::ModelUsage{7, 2, 3}},
+      zed::core::ModelUsage{7, 2, 3},
   });
   assert(activity_transcript.activity() == zed::ui::TerminalActivity::thinking);
+  assert(activity_transcript.token_metrics().input_tokens == 7);
+  assert(activity_transcript.token_metrics().output_tokens == 3);
   activity_transcript.cancel_request();
   assert(activity_transcript.activity() ==
          zed::ui::TerminalActivity::cancelling);

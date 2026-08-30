@@ -31,6 +31,16 @@ using core::ErrorCode;
 constexpr std::size_t kMaximumHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaximumStderrBytes = 64 * 1024;
 
+void clear_sensitive_environment() {
+  static constexpr std::array<const char *, 9> kSensitiveVariables{
+      "OPENAI_API_KEY",       "OPENCODE_GO_API_KEY",   "ANTHROPIC_API_KEY",
+      "AZURE_OPENAI_API_KEY", "GOOGLE_API_KEY",        "GITHUB_TOKEN",
+      "AWS_ACCESS_KEY_ID",    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+  };
+  for (const auto *name : kSensitiveVariables)
+    unsetenv(name);
+}
+
 std::filesystem::path canonical_path(const std::filesystem::path &path) {
   std::error_code error;
   const auto canonical = std::filesystem::weakly_canonical(path, error);
@@ -322,11 +332,9 @@ private:
           process_error("cannot create clangd pipes", std::strerror(errno)));
     }
 
-    std::vector<std::string> arguments{
-        config_.executable,
-        "--background-index",
-        "--clang-tidy",
-    };
+    std::vector<std::string> arguments{config_.executable, "--clang-tidy"};
+    if (config_.background_index)
+      arguments.push_back("--background-index");
     if (!config_.compile_commands_directory.empty()) {
       arguments.push_back("--compile-commands-dir=" +
                           config_.compile_commands_directory.string());
@@ -360,9 +368,7 @@ private:
       close(input_pipe[0]);
       close(output_pipe[1]);
       close(error_pipe[1]);
-      unsetenv("OPENAI_API_KEY");
-      unsetenv("OPENCODE_GO_API_KEY");
-      unsetenv("ANTHROPIC_API_KEY");
+      clear_sensitive_environment();
       execvp(argv[0], argv.data());
       _exit(127);
     }

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -21,9 +22,13 @@
 #include "zed/session/jsonl_session_store.hpp"
 #include "zed/session/session_catalog.hpp"
 #include "zed/skills/skill_registry.hpp"
+#include "zed/subagents/agent_registry.hpp"
+#include "zed/subagents/subagent_runner.hpp"
+#include "zed/subagents/worker.hpp"
 #include "zed/tools/basic_tools.hpp"
 #include "zed/tools/clangd_tool.hpp"
 #include "zed/tools/multi_bash_tool.hpp"
+#include "zed/tools/subagent_tool.hpp"
 #include "zed/ui/terminal.hpp"
 
 namespace {
@@ -51,6 +56,35 @@ split_first_argument(std::string_view arguments) {
           trim_ascii_whitespace(trimmed.substr(separator + 1))};
 }
 
+zed::core::ContextLimits
+model_context_limits(zed::core::ContextLimits configured,
+                     const zed::providers::OpenCodeGoModelInfo *model) {
+  if (model == nullptr || model->max_context_tokens == 0 ||
+      model->max_context_tokens >= configured.max_context_tokens) {
+    return configured;
+  }
+  configured.max_context_tokens = model->max_context_tokens;
+  if (configured.reserved_output_tokens >= configured.max_context_tokens)
+    configured.reserved_output_tokens = configured.max_context_tokens / 8;
+  const auto available =
+      configured.max_context_tokens - configured.reserved_output_tokens;
+  if (configured.compaction_trigger_tokens >= available)
+    configured.compaction_trigger_tokens = 0;
+  return configured;
+}
+
+std::string subagent_worker_executable(std::string_view argument_zero) {
+  const std::filesystem::path candidate(argument_zero);
+  if (!candidate.has_parent_path())
+    return std::string(argument_zero);
+  std::error_code error;
+  auto absolute = std::filesystem::absolute(candidate, error);
+  if (error)
+    return std::string(argument_zero);
+  auto canonical = std::filesystem::weakly_canonical(absolute, error);
+  return error ? absolute.string() : canonical.string();
+}
+
 void print_usage(std::ostream &output) {
   output << "Usage: zeda [--help] [--version]\n"
          << "\n"
@@ -64,8 +98,13 @@ void print_usage(std::ostream &output) {
 } // namespace
 
 int main(int argc, char *argv[]) {
+  const auto startup_started_at = std::chrono::steady_clock::now();
   if (argc > 1) {
     const std::string_view argument(argv[1]);
+    if (argc == 2 && argument == "--subagent-worker") {
+      return zed::subagents::run_explorer_worker(std::cin, std::cout,
+                                                 std::cerr);
+    }
     if (argc == 2 && (argument == "--help" || argument == "-h")) {
       print_usage(std::cout);
       return 0;
@@ -85,6 +124,13 @@ int main(int argc, char *argv[]) {
     return 2;
   }
   const auto &runtime_config = runtime.value();
+  const auto config_ready_at = std::chrono::steady_clock::now();
+  auto model_catalog = zed::providers::default_opencode_go_models();
+  auto built_in_agents = zed::subagents::built_in_agents(model_catalog);
+  zed::subagents::ProcessSubagentRunner subagent_runner({
+      subagent_worker_executable(argv[0]),
+      runtime_config.workspace,
+  });
   zed::lsp::ClangdClient clangd({
       runtime_config.workspace,
       runtime_config.clangd_path,
@@ -94,6 +140,7 @@ int main(int argc, char *argv[]) {
       runtime_config.opencode_go_api_key,
       runtime_config.opencode_endpoint,
       runtime_config.opencode_request_timeout_ms,
+      model_catalog,
   });
   zed::core::ModelBackedContextController context_controller(
       model, runtime_config.context_model);
@@ -112,6 +159,7 @@ int main(int argc, char *argv[]) {
         runtime_config.main_model.model,
     };
   };
+  const auto core_ready_at = std::chrono::steady_clock::now();
   const auto initialized =
       session.initialize(session_metadata(runtime_config.session_path));
   if (!initialized) {
@@ -123,6 +171,7 @@ int main(int argc, char *argv[]) {
     std::cerr << startup_recovery.error().message << "\n";
     return 3;
   }
+  const auto session_ready_at = std::chrono::steady_clock::now();
 
   zed::core::ToolRegistry tools;
   if (!tools.register_tool(std::make_unique<zed::tools::ReadFileTool>(
@@ -152,6 +201,11 @@ int main(int argc, char *argv[]) {
   if (!tools.register_tool(std::make_unique<zed::tools::ClangdTool>(
           runtime_config.workspace, clangd, runtime_config.tool_limits)))
     return 3;
+  auto subagent_tool = std::make_unique<zed::tools::SubagentTool>(
+      subagent_runner, built_in_agents);
+  auto *subagent_tool_handle = subagent_tool.get();
+  if (!tools.register_tool(std::move(subagent_tool)))
+    return 3;
 
   zed::extensions::QuickBashInput quick_bash(tools,
                                              runtime_config.quick_bash_enabled);
@@ -165,22 +219,33 @@ int main(int argc, char *argv[]) {
   }
 
   std::string active_skill;
+  auto active_model = runtime_config.main_model;
   auto active_reasoning_effort = runtime_config.reasoning_effort;
+  if (const auto *model_info = zed::providers::find_opencode_go_model(
+          model_catalog, active_model.model);
+      model_info != nullptr && !zed::providers::supports_reasoning_effort(
+                                   *model_info, active_reasoning_effort)) {
+    active_reasoning_effort = zed::core::ReasoningEffort::automatic;
+  }
+  auto active_context_limits = model_context_limits(
+      runtime_config.context_limits, zed::providers::find_opencode_go_model(
+                                         model_catalog, active_model.model));
   auto active_theme =
       *zed::ui::theme_kind_from_name(runtime_config.terminal_theme);
 
   zed::core::AgentLoopConfig loop_config;
-  loop_config.model_request.model = runtime_config.main_model;
+  loop_config.model_request.model = active_model;
   loop_config.model_request.temperature = 0.0;
   loop_config.model_request.reasoning_effort = active_reasoning_effort;
-  loop_config.context_limits = runtime_config.context_limits;
+  loop_config.context_limits = active_context_limits;
   loop_config.max_turns = runtime_config.max_turns;
+  loop_config.system_prompt = runtime_config.system_prompt;
 
   zed::core::AgentLoop loop(model, tools, session, context, loop_config);
   zed::extensions::ExtensionRegistry extensions;
   zed::plugins::PluginManager plugins(
       {runtime_config.workspace, zed::plugins::default_plugin_search_paths(),
-       runtime_config.main_model, active_reasoning_effort},
+       active_model, active_reasoning_effort},
       extensions, tools, model, clangd);
   const auto register_command = [&](zed::extensions::Command command) {
     const auto result = extensions.register_command(std::move(command));
@@ -193,6 +258,18 @@ int main(int argc, char *argv[]) {
   skill_options.reserve(skills.all().size());
   for (const auto &skill : skills.all()) {
     skill_options.push_back({skill.name, skill.description});
+  }
+  std::vector<zed::extensions::CommandOption> model_options;
+  model_options.reserve(model_catalog.size() + 2);
+  model_options.push_back({"list", "List available OpenCode Go models."});
+  model_options.push_back(
+      {"refresh", "Refresh models from the local OpenCode installation."});
+  for (const auto &model_info : model_catalog) {
+    model_options.push_back(
+        {model_info.id, model_info.name + " (" +
+                            std::string(zed::providers::open_code_protocol_name(
+                                model_info.protocol)) +
+                            ")"});
   }
   std::vector<zed::extensions::CommandOption> session_options;
   session_options.push_back({"list", "List Session v2 files."});
@@ -244,6 +321,21 @@ int main(int argc, char *argv[]) {
       }))
     return 3;
   if (!register_command({
+          "agents",
+          "List built-in subagents and availability.",
+          [&](std::string_view arguments) {
+            if (!trim_ascii_whitespace(arguments).empty()) {
+              return zed::core::Result<std::string>::failure({
+                  zed::core::ErrorCode::invalid_argument,
+                  "usage: /agents",
+              });
+            }
+            return zed::core::Result<std::string>::success(
+                zed::subagents::format_agents(built_in_agents));
+          },
+      }))
+    return 3;
+  if (!register_command({
           "skill",
           "Activate a skill: /skill <name>.",
           [&](std::string_view arguments) {
@@ -262,14 +354,134 @@ int main(int argc, char *argv[]) {
           std::move(skill_options),
       }))
     return 3;
-  if (!register_command({
-          "model",
-          "Show the active models.",
-          [&](std::string_view) {
-            return zed::core::Result<std::string>::success(
-                "main: " + runtime_config.main_model.model +
-                "\ncontext: " + runtime_config.context_model.model + "\n");
-          },
+  if (!register_command(zed::extensions::Command{
+          .name = "model",
+          .description = "Show, set, or refresh OpenCode Go models: /model "
+                         "<id|list|refresh>.",
+          .options = std::move(model_options),
+          .execute_with_events =
+              [&](std::string_view arguments,
+                  zed::core::CancellationToken cancellation,
+                  zed::core::AgentEventCallback) {
+                const auto describe = [&](const auto &model_info) {
+                  std::string result =
+                      model_info.id + " — " + model_info.name + " [" +
+                      std::string(zed::providers::open_code_protocol_name(
+                          model_info.protocol)) +
+                      "]";
+                  if (!model_info.reasoning_efforts.empty()) {
+                    result += " — reasoning: ";
+                    for (std::size_t index = 0;
+                         index < model_info.reasoning_efforts.size(); ++index) {
+                      if (index > 0)
+                        result += ",";
+                      result += zed::core::reasoning_effort_name(
+                          model_info.reasoning_efforts[index]);
+                    }
+                  }
+                  return result;
+                };
+
+                std::string requested = trim_ascii_whitespace(arguments);
+                if (requested == "refresh") {
+                  const auto discovered =
+                      zed::providers::discover_opencode_go_models(
+                          runtime_config.opencode_path, 5'000, cancellation);
+                  if (!discovered) {
+                    return zed::core::Result<std::string>::failure(
+                        discovered.error());
+                  }
+                  model_catalog = discovered.value();
+                  model.set_models(model_catalog);
+                  built_in_agents =
+                      zed::subagents::built_in_agents(model_catalog);
+                  subagent_tool_handle->set_agents(built_in_agents);
+
+                  std::string result = "refreshed OpenCode Go models: " +
+                                       std::to_string(model_catalog.size()) +
+                                       "\n";
+                  const auto *active_info =
+                      zed::providers::find_opencode_go_model(
+                          model_catalog, active_model.model);
+                  if (active_info == nullptr) {
+                    result += "warning: active model is no longer available: " +
+                              active_model.model + "\n";
+                  } else {
+                    active_context_limits = model_context_limits(
+                        runtime_config.context_limits, active_info);
+                    loop.set_context_limits(active_context_limits);
+                    if (!zed::providers::supports_reasoning_effort(
+                            *active_info, active_reasoning_effort)) {
+                      active_reasoning_effort =
+                          zed::core::ReasoningEffort::automatic;
+                      loop.set_reasoning_effort(active_reasoning_effort);
+                      result += "reasoning reset to auto\n";
+                    }
+                  }
+                  if (zed::providers::find_opencode_go_model(
+                          model_catalog, runtime_config.context_model.model) ==
+                      nullptr) {
+                    result +=
+                        "warning: context model is no longer available: " +
+                        runtime_config.context_model.model + "\n";
+                  }
+                  result +=
+                      "use /model list to inspect the refreshed catalog\n";
+                  return zed::core::Result<std::string>::success(
+                      std::move(result));
+                }
+                if (requested == "list") {
+                  std::string result;
+                  for (const auto &model_info : model_catalog) {
+                    result +=
+                        (model_info.id == active_model.model ? "* " : "  ") +
+                        describe(model_info) + "\n";
+                  }
+                  return zed::core::Result<std::string>::success(
+                      std::move(result));
+                }
+                if (requested.empty()) {
+                  const auto *model_info =
+                      zed::providers::find_opencode_go_model(
+                          model_catalog, active_model.model);
+                  std::string result = "main: " + active_model.model + "\n";
+                  if (model_info != nullptr)
+                    result += describe(*model_info) + "\n";
+                  result += "context: " + runtime_config.context_model.model +
+                            "\nusage: /model <id|list|refresh>\n";
+                  return zed::core::Result<std::string>::success(
+                      std::move(result));
+                }
+                constexpr std::string_view kProviderPrefix = "opencode-go/";
+                if (requested.starts_with(kProviderPrefix))
+                  requested.erase(0, kProviderPrefix.size());
+                const auto *model_info = zed::providers::find_opencode_go_model(
+                    model_catalog, requested);
+                if (model_info == nullptr) {
+                  return zed::core::Result<std::string>::failure({
+                      zed::core::ErrorCode::not_found,
+                      "OpenCode Go model not found: " + requested +
+                          "; use /model list or /model refresh",
+                  });
+                }
+
+                active_model.model = requested;
+                loop.set_model(active_model);
+                active_context_limits = model_context_limits(
+                    runtime_config.context_limits, model_info);
+                loop.set_context_limits(active_context_limits);
+                if (!zed::providers::supports_reasoning_effort(
+                        *model_info, active_reasoning_effort)) {
+                  active_reasoning_effort =
+                      zed::core::ReasoningEffort::automatic;
+                  loop.set_reasoning_effort(active_reasoning_effort);
+                }
+                return zed::core::Result<std::string>::success(
+                    "model: " + describe(*model_info) + "\nreasoning: " +
+                    std::string(zed::core::reasoning_effort_name(
+                        active_reasoning_effort)) +
+                    "\n");
+              },
       }))
     return 3;
   if (!register_command({
@@ -331,21 +543,45 @@ int main(int argc, char *argv[]) {
     return 3;
   if (!register_command({
           "reasoning",
-          "Show or set reasoning: /reasoning <none|low|medium|high>.",
+          "Show or set reasoning for the active model.",
           [&](std::string_view arguments) {
+            const auto *model_info = zed::providers::find_opencode_go_model(
+                model_catalog, active_model.model);
+            std::string allowed = "auto";
+            if (model_info != nullptr) {
+              for (const auto effort : model_info->reasoning_efforts) {
+                allowed += ", ";
+                allowed += zed::core::reasoning_effort_name(effort);
+              }
+            } else {
+              allowed += ", none, minimal, low, medium, high, xhigh, max, "
+                         "thinking";
+            }
             if (arguments.empty()) {
               return zed::core::Result<std::string>::success(
                   "reasoning: " +
                   std::string(zed::core::reasoning_effort_name(
                       active_reasoning_effort)) +
-                  "\nusage: /reasoning <none|low|medium|high>\n");
+                  "\nmodel: " + active_model.model + "\navailable: " + allowed +
+                  "\nusage: /reasoning <effort>\n");
             }
             const auto effort =
                 zed::core::reasoning_effort_from_name(arguments);
             if (!effort.has_value()) {
               return zed::core::Result<std::string>::failure({
                   zed::core::ErrorCode::invalid_argument,
-                  "reasoning effort must be one of: none, low, medium, high",
+                  "unknown reasoning effort; available for " +
+                      active_model.model + ": " + allowed,
+              });
+            }
+            if (model_info != nullptr &&
+                !zed::providers::supports_reasoning_effort(*model_info,
+                                                           *effort)) {
+              return zed::core::Result<std::string>::failure({
+                  zed::core::ErrorCode::invalid_argument,
+                  "reasoning effort '" + std::string(arguments) +
+                      "' is not supported by " + active_model.model +
+                      "; available: " + allowed,
               });
             }
             active_reasoning_effort = *effort;
@@ -357,10 +593,15 @@ int main(int argc, char *argv[]) {
                 "\n");
           },
           {
-              {"none", "Disable model reasoning."},
+              {"auto", "Use the model's default reasoning behavior."},
+              {"none", "Disable reasoning when the model supports it."},
+              {"minimal", "Use minimal reasoning."},
               {"low", "Use fast, lightweight reasoning."},
               {"medium", "Use balanced reasoning."},
               {"high", "Use deeper, slower reasoning."},
+              {"xhigh", "Use extra-high reasoning."},
+              {"max", "Use the model's maximum reasoning effort."},
+              {"thinking", "Enable adaptive thinking."},
           },
       }))
     return 3;
@@ -511,6 +752,7 @@ int main(int argc, char *argv[]) {
           },
       }))
     return 3;
+  const auto plugins_started_at = std::chrono::steady_clock::now();
   const auto plugin_discovery = plugins.discover_and_load();
   if (!plugin_discovery) {
     std::cerr << "plugin discovery warning: "
@@ -522,6 +764,7 @@ int main(int argc, char *argv[]) {
                 << status.manifest_path.string() << ")\n";
     }
   }
+  const auto plugins_ready_at = std::chrono::steady_clock::now();
   const auto command_handler = [&](std::string_view name,
                                    std::string_view arguments,
                                    zed::core::CancellationToken cancellation,
@@ -584,14 +827,26 @@ int main(int argc, char *argv[]) {
     return info.value().metadata.title + " [" + info.value().metadata.id + "]" +
            (info.value().has_interrupted_turn ? " — interrupted" : "");
   };
+  const auto startup_ready_at = std::chrono::steady_clock::now();
+  const auto elapsed = [](auto begin, auto end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - begin);
+  };
+  const zed::ui::TerminalStartupTiming startup{
+      elapsed(startup_started_at, config_ready_at),
+      elapsed(config_ready_at, core_ready_at),
+      elapsed(core_ready_at, session_ready_at),
+      elapsed(session_ready_at, plugins_started_at),
+      elapsed(plugins_started_at, plugins_ready_at),
+      elapsed(plugins_ready_at, startup_ready_at),
+  };
 
   if (isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0) {
     zed::ui::TerminalApplication application(
-        runtime_config.workspace.string(), runtime_config.main_model.model,
-        std::string(kVersion), runtime_config.context_limits.max_context_tokens,
-        active_reasoning_effort, active_theme,
-        [&] { return quick_bash.enabled(); }, active_session_label,
-        [&] { return session.load(); }, initial_activity,
+        runtime_config.workspace.string(), active_model.model,
+        std::string(kVersion), startup,
+        active_context_limits.max_context_tokens, active_reasoning_effort,
+        active_theme, [&] { return quick_bash.enabled(); },
+        active_session_label, [&] { return session.load(); }, initial_activity,
         std::move(command_hints), submit_handler, command_handler);
     const auto result = application.run();
     if (!result) {
@@ -603,9 +858,8 @@ int main(int argc, char *argv[]) {
 
   zed::ui::TerminalRenderer renderer(
       std::cout, {isatty(STDOUT_FILENO) != 0, active_theme});
-  renderer.banner(runtime_config.workspace.string(),
-                  runtime_config.main_model.model, kVersion,
-                  active_reasoning_effort);
+  renderer.banner(runtime_config.workspace.string(), active_model.model,
+                  kVersion, startup, active_reasoning_effort);
   zed::ui::TerminalInput input_reader(std::cin);
 
   while (true) {

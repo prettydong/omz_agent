@@ -28,6 +28,23 @@ FetchContent_MakeAvailable(ftxui)
 
 option(ZEDA_BUILD_DEEPWIKI_PLUGIN "Build the bundled DeepWiki plugin" ON)
 
+set(ZEDA_DEFAULT_SYSTEM_PROMPT_FILE
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/zed_system_propmt.md)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${ZEDA_DEFAULT_SYSTEM_PROMPT_FILE})
+file(READ ${ZEDA_DEFAULT_SYSTEM_PROMPT_FILE} ZEDA_DEFAULT_SYSTEM_PROMPT)
+string(FIND "${ZEDA_DEFAULT_SYSTEM_PROMPT}" ")ZEDA_PROMPT\""
+    ZEDA_DEFAULT_SYSTEM_PROMPT_DELIMITER)
+if (NOT ZEDA_DEFAULT_SYSTEM_PROMPT_DELIMITER EQUAL -1)
+    message(FATAL_ERROR
+        "The default system prompt contains the reserved raw-string delimiter")
+endif()
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/zed/core)
+configure_file(
+    cmake/default_system_prompt.hpp.in
+    generated/zed/core/default_system_prompt.hpp
+    @ONLY)
+
 if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
     find_package(SQLite3 REQUIRED)
     set(HTTPLIB_INSTALL OFF CACHE BOOL "Do not install zeda's private cpp-httplib dependency" FORCE)
@@ -70,20 +87,27 @@ add_library(zed_core
     src/core/utf8.cpp
     src/lsp/clangd_client.cpp
     src/plugins/plugin_manager.cpp
+    src/providers/opencode_go_catalog.cpp
     src/providers/opencode_go_model.cpp
     src/session/jsonl_session_store.cpp
     src/session/session_catalog.cpp
     src/extensions/extension_registry.cpp
     src/extensions/quick_bash_input.cpp
     src/skills/skill_registry.cpp
+    src/subagents/agent_registry.cpp
+    src/subagents/subagent_runner.cpp
+    src/subagents/worker.cpp
+    src/subagents/worker_protocol.cpp
     src/tools/basic_tools.cpp
     src/tools/clangd_tool.cpp
     src/tools/multi_bash_tool.cpp
+    src/tools/subagent_tool.cpp
 )
 
 target_include_directories(zed_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 target_link_libraries(zed_core
@@ -205,6 +229,8 @@ endif()
 
 include(GNUInstallDirs)
 install(TARGETS zeda RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES ${ZEDA_DEFAULT_SYSTEM_PROMPT_FILE}
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/zeda)
 install(FILES include/zed/plugins/plugin_sdk.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/zeda)
 if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
@@ -243,6 +269,23 @@ if (BUILD_TESTING)
     target_link_libraries(zed_session_smoke PRIVATE zed_core)
     add_test(NAME zed_session_smoke COMMAND zed_session_smoke)
 
+    add_executable(zed_opencode_go_smoke tests/opencode_go_smoke.cpp)
+    target_link_libraries(zed_opencode_go_smoke PRIVATE zed_core)
+    add_test(NAME zed_opencode_go_smoke COMMAND zed_opencode_go_smoke)
+
+    add_executable(zed_fake_clangd tests/fake_clangd.cpp)
+    add_executable(zed_fake_opencode tests/fake_opencode.cpp)
+    add_executable(zed_fake_model_catalog tests/fake_model_catalog.cpp)
+
+    add_executable(zed_subagent_smoke tests/subagent_smoke.cpp)
+    target_link_libraries(zed_subagent_smoke PRIVATE zed_core)
+    target_compile_definitions(zed_subagent_smoke PRIVATE
+        ZED_TEST_FAKE_CLANGD_PATH="$<TARGET_FILE:zed_fake_clangd>"
+        ZED_TEST_FAKE_OPENCODE_PATH="$<TARGET_FILE:zed_fake_opencode>"
+    )
+    add_dependencies(zed_subagent_smoke zed_fake_clangd zed_fake_opencode)
+    add_test(NAME zed_subagent_smoke COMMAND zed_subagent_smoke)
+
     if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
         add_executable(zed_plugin_smoke tests/plugin_smoke.cpp)
         target_link_libraries(zed_plugin_smoke PRIVATE
@@ -276,6 +319,8 @@ if (BUILD_TESTING)
         zed_markdown_smoke
         zed_quick_bash_smoke
         zed_session_smoke
+        zed_opencode_go_smoke
+        zed_subagent_smoke
     )
     if (TARGET zed_plugin_smoke)
         list(APPEND ZED_ASSERTING_TEST_TARGETS zed_plugin_smoke)
@@ -299,5 +344,14 @@ if (BUILD_TESTING)
     add_test(NAME zeda_version COMMAND zeda --version)
     set_tests_properties(zeda_version PROPERTIES
         PASS_REGULAR_EXPRESSION "zeda ${PROJECT_VERSION}"
+    )
+
+    add_test(
+        NAME zeda_model_refresh_smoke
+        COMMAND ${CMAKE_COMMAND}
+            "-DZEDA_EXECUTABLE=$<TARGET_FILE:zeda>"
+            "-DFAKE_OPENCODE_EXECUTABLE=$<TARGET_FILE:zed_fake_model_catalog>"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/model-refresh-smoke"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/model_refresh_smoke.cmake
     )
 endif()

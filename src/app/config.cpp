@@ -1,16 +1,23 @@
 #include "zed/app/config.hpp"
 
+#include "zed/core/default_system_prompt.hpp"
+#include "zed/core/utf8.hpp"
 #include "zed/session/session_catalog.hpp"
 
 #include <charconv>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 
 #include <nlohmann/json.hpp>
 
 namespace zed::app {
 
 namespace {
+
+constexpr std::string_view kSystemPromptRelativePath =
+    ".zed/zed_system_propmt.md";
+constexpr std::uintmax_t kMaxSystemPromptBytes = 1024 * 1024;
 
 std::string environment_or(const char *name, std::string fallback = {}) {
   const char *value = std::getenv(name);
@@ -117,7 +124,8 @@ core::Result<core::ReasoningEffort> reasoning_effort_environment() {
     return core::Result<core::ReasoningEffort>::success(*effort);
   return core::Result<core::ReasoningEffort>::failure({
       core::ErrorCode::invalid_argument,
-      "ZED_REASONING_EFFORT must be one of: none, low, medium, high",
+      "ZED_REASONING_EFFORT must be one of: auto, none, minimal, low, medium, "
+      "high, xhigh, max, thinking",
   });
 }
 
@@ -135,17 +143,142 @@ core::Result<bool> boolean_environment(const char *name, bool fallback) {
   });
 }
 
+core::Result<std::string>
+load_workspace_system_prompt(const std::filesystem::path &path) {
+  std::error_code status_error;
+  const auto status = std::filesystem::symlink_status(path, status_error);
+  if (status_error == std::errc::no_such_file_or_directory ||
+      (!status_error && !std::filesystem::exists(status))) {
+    const auto parent = path.parent_path();
+    std::error_code create_error;
+    std::filesystem::create_directories(parent, create_error);
+    if (create_error) {
+      return core::Result<std::string>::failure({
+          core::ErrorCode::invalid_argument,
+          "cannot create system prompt directory " + parent.string() + ": " +
+              create_error.message(),
+      });
+    }
+
+    std::error_code parent_status_error;
+    const auto parent_status =
+        std::filesystem::symlink_status(parent, parent_status_error);
+    if (parent_status_error || std::filesystem::is_symlink(parent_status) ||
+        !std::filesystem::is_directory(parent_status)) {
+      return core::Result<std::string>::failure({
+          core::ErrorCode::invalid_argument,
+          "system prompt directory must be a regular directory, not a "
+          "symlink: " +
+              parent.string(),
+      });
+    }
+
+    std::ofstream output(path, std::ios::binary);
+    if (!output) {
+      return core::Result<std::string>::failure({
+          core::ErrorCode::invalid_argument,
+          "cannot install default system prompt file " + path.string(),
+      });
+    }
+    output.write(
+        core::kDefaultSystemPrompt.data(),
+        static_cast<std::streamsize>(core::kDefaultSystemPrompt.size()));
+    output.close();
+    if (!output) {
+      std::error_code remove_error;
+      std::filesystem::remove(path, remove_error);
+      return core::Result<std::string>::failure({
+          core::ErrorCode::invalid_argument,
+          "cannot finish installing default system prompt file " +
+              path.string(),
+      });
+    }
+    return core::Result<std::string>::success(
+        std::string(core::kDefaultSystemPrompt));
+  }
+  if (status_error) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "cannot inspect system prompt file " + path.string() + ": " +
+            status_error.message(),
+    });
+  }
+  if (std::filesystem::is_symlink(status) ||
+      !std::filesystem::is_regular_file(status)) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "system prompt path must be a regular file, not a symlink: " +
+            path.string(),
+    });
+  }
+
+  std::error_code size_error;
+  const auto size = std::filesystem::file_size(path, size_error);
+  if (size_error) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "cannot inspect system prompt size " + path.string() + ": " +
+            size_error.message(),
+    });
+  }
+  if (size > kMaxSystemPromptBytes) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "system prompt file exceeds 1 MiB: " + path.string(),
+    });
+  }
+
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "cannot read system prompt file " + path.string(),
+    });
+  }
+  std::string prompt{std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>()};
+  if (input.bad()) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "cannot finish reading system prompt file " + path.string(),
+    });
+  }
+  if (prompt.starts_with("\xEF\xBB\xBF"))
+    prompt.erase(0, 3);
+  if (!core::is_valid_utf8(prompt)) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "system prompt file is not valid UTF-8: " + path.string(),
+    });
+  }
+  if (prompt.find_first_not_of(" \t\r\n") == std::string::npos) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "system prompt file cannot be empty: " + path.string(),
+    });
+  }
+  return core::Result<std::string>::success(std::move(prompt));
+}
+
 } // namespace
 
-core::Result<RuntimeConfig> load_runtime_config() {
+core::Result<RuntimeConfig>
+load_runtime_config(RuntimeConfigLoadOptions options) {
   RuntimeConfig config;
   const auto api_key = load_opencode_go_api_key();
   if (!api_key)
     return core::Result<RuntimeConfig>::failure(api_key.error());
   config.opencode_go_api_key = api_key.value();
 
-  config.opencode_endpoint = environment_or(
-      "ZED_OPENCODE_ENDPOINT", "https://opencode.ai/zen/go/v1/responses");
+  config.opencode_endpoint =
+      environment_or("ZED_OPENCODE_ENDPOINT", "https://opencode.ai/zen/go/v1");
+  config.opencode_path = environment_or("ZED_OPENCODE_PATH", "opencode");
+  if (config.opencode_path.empty()) {
+    return core::Result<RuntimeConfig>::failure({
+        core::ErrorCode::invalid_argument,
+        "ZED_OPENCODE_PATH cannot be empty",
+    });
+  }
   config.clangd_path = environment_or("ZED_CLANGD_PATH", "clangd");
   if (config.clangd_path.empty()) {
     return core::Result<RuntimeConfig>::failure({
@@ -157,6 +290,14 @@ core::Result<RuntimeConfig> load_runtime_config() {
   config.workspace =
       environment_or("ZED_WORKSPACE", std::filesystem::current_path().string());
   config.workspace = std::filesystem::weakly_canonical(config.workspace);
+  config.system_prompt_path = config.workspace / kSystemPromptRelativePath;
+  if (options.load_workspace_system_prompt) {
+    const auto system_prompt =
+        load_workspace_system_prompt(config.system_prompt_path);
+    if (!system_prompt)
+      return core::Result<RuntimeConfig>::failure(system_prompt.error());
+    config.system_prompt = system_prompt.value();
+  }
   const auto configured_session = environment_or("ZED_SESSION_PATH");
   config.session_path = configured_session.empty()
                             ? zed::session::new_session_path(

@@ -17,6 +17,7 @@ enum class AgentEventType {
   assistant_delta,
   assistant_message,
   tool_start,
+  tool_update,
   tool_result,
   agent_end,
   error,

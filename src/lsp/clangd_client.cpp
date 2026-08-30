@@ -345,40 +345,29 @@ private:
       arguments.push_back("--compile-commands-dir=" +
                           config_.compile_commands_directory.string());
     }
-    std::vector<char *> argv;
-    argv.reserve(arguments.size() + 1);
-    for (auto &argument : arguments)
-      argv.push_back(argument.data());
-    argv.push_back(nullptr);
-
-    const pid_t child = fork();
-    if (child == -1) {
+    support::SpawnOptions spawn_options;
+    spawn_options.executable = arguments.front();
+    spawn_options.arguments.assign(arguments.begin() + 1, arguments.end());
+    spawn_options.working_directory = workspace_root_;
+    spawn_options.duplicate_descriptors = {
+        {input_read.get(), STDIN_FILENO},
+        {output_write.get(), STDOUT_FILENO},
+        {error_write.get(), STDERR_FILENO},
+    };
+    spawn_options.close_descriptors = {
+        input_read.get(),   input_write.get(), output_read.get(),
+        output_write.get(), error_read.get(),  error_write.get(),
+    };
+    spawn_options.additional_environment_variables =
+        config_.environment_allowlist;
+    pid_t child = -1;
+    const int spawn_error = support::spawn_process(spawn_options, child);
+    if (spawn_error != 0) {
       return core::Result<void>::failure(
-          process_error("cannot fork clangd", std::strerror(errno)));
-    }
-    if (child == 0) {
-      setpgid(0, 0);
-      close(input_write.get());
-      close(output_read.get());
-      close(error_read.get());
-      if (chdir(workspace_root_.c_str()) != 0)
-        _exit(126);
-      if (dup2(input_read.get(), STDIN_FILENO) == -1 ||
-          dup2(output_write.get(), STDOUT_FILENO) == -1 ||
-          dup2(error_write.get(), STDERR_FILENO) == -1) {
-        _exit(126);
-      }
-      close(input_read.get());
-      close(output_write.get());
-      close(error_write.get());
-      support::clear_sensitive_environment();
-      execvp(argv[0], argv.data());
-      _exit(127);
+          process_error("cannot start clangd", std::strerror(spawn_error)));
     }
 
     spawn_lock.unlock();
-
-    setpgid(child, child);
     input_read.reset();
     output_write.reset();
     error_write.reset();

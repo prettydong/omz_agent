@@ -418,6 +418,28 @@ int main() {
       {});
   assert(edit);
 
+  {
+    std::ofstream limited_file(root / "limited-edit.txt");
+    limited_file << "aaaa";
+  }
+  zed::core::ToolRegistry limited_edit_registry;
+  assert(limited_edit_registry.register_tool(
+      std::make_unique<zed::tools::EditFileTool>(
+          root, zed::tools::ToolLimits{256 * 1024, 8, 256 * 1024, 1'000})));
+  const auto oversized_edit = limited_edit_registry.execute(
+      call(
+          "edit-limit", "edit",
+          R"({"path":"limited-edit.txt","old_text":"a","new_text":"bbbb","expected_replacements":4})"),
+      {});
+  assert(!oversized_edit);
+  assert(oversized_edit.error().message.find("exceeds write limit") !=
+         std::string::npos);
+  {
+    std::ifstream limited_file(root / "limited-edit.txt");
+    assert(std::string(std::istreambuf_iterator<char>(limited_file), {}) ==
+           "aaaa");
+  }
+
   const auto protected_outside = root.parent_path() / "zed-edit-outside.txt";
   {
     std::ofstream outside_file(protected_outside);
@@ -729,22 +751,41 @@ int main() {
   assert(!cancelled_bash.value());
   assert(cancelled_bash->error().code == ErrorCode::cancelled);
 
+  const auto background_started_at = std::chrono::steady_clock::now();
+  const auto timed_out_background =
+      registry.execute(call("bash-background", "bash",
+                            R"({"command":"sleep 5 &","timeout_ms":50})"),
+                       {});
+  assert(timed_out_background);
+  assert(timed_out_background.value().content.find("timed out") !=
+         std::string::npos);
+  assert(std::chrono::steady_clock::now() - background_started_at <
+         std::chrono::seconds(1));
+
   assert(setenv("AWS_SECRET_ACCESS_KEY", "super-secret-from-host", 1) == 0);
   assert(setenv("OPENAI_API_KEY", "openai-secret-from-host", 1) == 0);
+  assert(setenv("NPM_TOKEN", "npm-secret-from-host", 1) == 0);
+  assert(setenv("DATABASE_URL", "postgres://secret-from-host", 1) == 0);
   const auto scrubbed_bash = registry.execute(
       call(
           "bash-env-1", "bash",
-          R"({"command":"printf ${AWS_SECRET_ACCESS_KEY:-unset}:${OPENAI_API_KEY:-unset}","timeout_ms":1000})"),
+          R"({"command":"printf ${AWS_SECRET_ACCESS_KEY:-unset}:${OPENAI_API_KEY:-unset}:${NPM_TOKEN:-unset}:${DATABASE_URL:-unset}:${PATH:+path-set}","timeout_ms":1000})"),
       {});
   assert(scrubbed_bash);
   assert(scrubbed_bash.value().content.find("super-secret-from-host") ==
          std::string::npos);
   assert(scrubbed_bash.value().content.find("openai-secret-from-host") ==
          std::string::npos);
-  assert(scrubbed_bash.value().content.find("unset:unset") !=
+  assert(scrubbed_bash.value().content.find("npm-secret-from-host") ==
          std::string::npos);
+  assert(scrubbed_bash.value().content.find("postgres://secret-from-host") ==
+         std::string::npos);
+  assert(scrubbed_bash.value().content.find(
+             "unset:unset:unset:unset:path-set") != std::string::npos);
   assert(unsetenv("AWS_SECRET_ACCESS_KEY") == 0);
   assert(unsetenv("OPENAI_API_KEY") == 0);
+  assert(unsetenv("NPM_TOKEN") == 0);
+  assert(unsetenv("DATABASE_URL") == 0);
 
   zed::core::ToolRegistry capped_bash_registry;
   assert(
@@ -777,6 +818,45 @@ int main() {
   assert(review_skill->description == "Review code carefully.");
   assert(skills.prompt_context("code-review").find("Check correctness") !=
          std::string::npos);
+
+  const auto linked_skill_root = root / "linked-skills";
+  std::filesystem::create_directory_symlink(skill_root, linked_skill_root);
+  zed::skills::SkillRegistry linked_root_skills;
+  assert(!linked_root_skills.discover({linked_skill_root}));
+
+  const auto linked_directory_root = root / "linked-directory-skills";
+  std::filesystem::create_directories(linked_directory_root);
+  std::filesystem::create_directory_symlink(skill_directory,
+                                            linked_directory_root / "review");
+  zed::skills::SkillRegistry linked_directory_skills;
+  assert(!linked_directory_skills.discover({linked_directory_root}));
+
+  const auto linked_file_root = root / "linked-file-skills";
+  std::filesystem::create_directories(linked_file_root / "review");
+  std::filesystem::create_symlink(skill_directory / "SKILL.md",
+                                  linked_file_root / "review" / "SKILL.md");
+  zed::skills::SkillRegistry linked_file_skills;
+  assert(!linked_file_skills.discover({linked_file_root}));
+
+  const auto oversized_skill_root = root / "oversized-skills";
+  std::filesystem::create_directories(oversized_skill_root / "large");
+  {
+    std::ofstream oversized_skill(oversized_skill_root / "large" / "SKILL.md");
+    oversized_skill << std::string(1024 * 1024 + 4 * 1024 + 1, 'x');
+  }
+  zed::skills::SkillRegistry oversized_skills;
+  assert(!oversized_skills.discover({oversized_skill_root}));
+
+  const auto invalid_skill_root = root / "invalid-utf8-skills";
+  std::filesystem::create_directories(invalid_skill_root / "invalid");
+  {
+    std::ofstream invalid_skill(invalid_skill_root / "invalid" / "SKILL.md",
+                                std::ios::binary);
+    invalid_skill << "instructions";
+    invalid_skill.put(static_cast<char>(0xFF));
+  }
+  zed::skills::SkillRegistry invalid_skills;
+  assert(!invalid_skills.discover({invalid_skill_root}));
 
   auto managed_skills = zed::skills::load_workspace_skills(root);
   assert(managed_skills);

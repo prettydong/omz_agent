@@ -2,17 +2,28 @@
 
 #include "zed/core/utf8.hpp"
 #include "zed/support/atomic_file.hpp"
+#include "zed/support/unique_fd.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
-#include <fstream>
+#include <cstring>
+#include <fcntl.h>
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace zed::skills {
 
 namespace {
+
+constexpr std::size_t kMaximumSkills = 64;
+constexpr std::size_t kMaximumInstructionsBytes = 1024 * 1024;
+constexpr std::size_t kMaximumSkillFileBytes =
+    kMaximumInstructionsBytes + 4 * 1024;
 
 std::string trim(std::string value) {
   const auto first = value.find_first_not_of(" \t\r\n");
@@ -50,6 +61,67 @@ bool valid_metadata(std::string_view value, std::size_t maximum,
   return std::none_of(value.begin(), value.end(), [](unsigned char character) {
     return character < 0x20 || character == 0x7f;
   });
+}
+
+core::Result<std::string>
+read_regular_skill_file(const std::filesystem::path &file) {
+  support::UniqueFd descriptor(
+      open(file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+  if (!descriptor.valid()) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "cannot open regular skill file " + file.string() + ": " +
+            std::string(std::strerror(errno)),
+    });
+  }
+  struct stat status{};
+  if (fstat(descriptor.get(), &status) != 0 || !S_ISREG(status.st_mode)) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "skill file must be a regular file: " + file.string(),
+    });
+  }
+  if (status.st_size < 0 ||
+      static_cast<std::uintmax_t>(status.st_size) > kMaximumSkillFileBytes) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "skill file exceeds the 1 MiB instruction limit: " + file.string(),
+    });
+  }
+
+  std::string content;
+  content.reserve(static_cast<std::size_t>(status.st_size));
+  std::array<char, 8192> buffer{};
+  while (true) {
+    const auto count = read(descriptor.get(), buffer.data(), buffer.size());
+    if (count > 0) {
+      const auto chunk_size = static_cast<std::size_t>(count);
+      if (chunk_size > kMaximumSkillFileBytes - content.size()) {
+        return core::Result<std::string>::failure({
+            core::ErrorCode::invalid_argument,
+            "skill file exceeds the 1 MiB instruction limit: " + file.string(),
+        });
+      }
+      content.append(buffer.data(), chunk_size);
+      continue;
+    }
+    if (count == 0)
+      break;
+    if (errno == EINTR)
+      continue;
+    return core::Result<std::string>::failure({
+        core::ErrorCode::internal,
+        "cannot read skill file " + file.string() + ": " +
+            std::string(std::strerror(errno)),
+    });
+  }
+  if (!core::is_valid_utf8(content)) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "skill file must contain valid UTF-8: " + file.string(),
+    });
+  }
+  return core::Result<std::string>::success(std::move(content));
 }
 
 std::string serialize_skill(const ManagedSkill &skill) {
@@ -117,15 +189,29 @@ core::Result<void> archive_skill(const std::filesystem::path &workspace,
 
 core::Result<void>
 SkillRegistry::discover(const std::vector<std::filesystem::path> &roots) {
-  skills_.clear();
+  std::vector<Skill> discovered_skills;
   for (const auto &root : roots) {
     std::error_code error;
-    if (!std::filesystem::exists(root, error))
+    const auto root_status = std::filesystem::symlink_status(root, error);
+    if (error == std::errc::no_such_file_or_directory ||
+        (!error && !std::filesystem::exists(root_status))) {
       continue;
+    }
     if (error) {
       return core::Result<void>::failure({
           core::ErrorCode::internal,
           "cannot inspect skill root: " + error.message(),
+      });
+    }
+    const auto parent_status =
+        std::filesystem::symlink_status(root.parent_path(), error);
+    if (error || std::filesystem::is_symlink(parent_status) ||
+        std::filesystem::is_symlink(root_status) ||
+        !std::filesystem::is_directory(root_status)) {
+      return core::Result<void>::failure({
+          core::ErrorCode::invalid_argument,
+          "skill root and its parent must be regular directories: " +
+              root.string(),
       });
     }
 
@@ -137,21 +223,56 @@ SkillRegistry::discover(const std::vector<std::filesystem::path> &roots) {
       });
     }
     for (const auto &entry : iterator) {
-      if (!entry.is_directory(error) || error) {
+      const auto entry_status = entry.symlink_status(error);
+      if (error) {
         error.clear();
         continue;
       }
+      if (std::filesystem::is_symlink(entry_status)) {
+        return core::Result<void>::failure({
+            core::ErrorCode::invalid_argument,
+            "skill directory cannot be a symlink: " + entry.path().string(),
+        });
+      }
+      if (!std::filesystem::is_directory(entry_status))
+        continue;
       const auto skill_file = entry.path() / "SKILL.md";
-      if (!std::filesystem::is_regular_file(skill_file, error) || error) {
+      const auto skill_status =
+          std::filesystem::symlink_status(skill_file, error);
+      if (error == std::errc::no_such_file_or_directory ||
+          (!error && !std::filesystem::exists(skill_status))) {
         error.clear();
         continue;
       }
-      const auto skill = load_skill(skill_file);
+      if (error) {
+        return core::Result<void>::failure({
+            core::ErrorCode::internal,
+            "cannot inspect skill file " + skill_file.string() + ": " +
+                error.message(),
+        });
+      }
+      if (std::filesystem::is_symlink(skill_status) ||
+          !std::filesystem::is_regular_file(skill_status)) {
+        return core::Result<void>::failure({
+            core::ErrorCode::invalid_argument,
+            "SKILL.md must be a regular file and cannot be a symlink: " +
+                skill_file.string(),
+        });
+      }
+      auto skill = load_skill(skill_file);
       if (!skill)
         return core::Result<void>::failure(skill.error());
-      skills_.push_back(skill.value());
+      discovered_skills.push_back(std::move(skill.value()));
+      if (discovered_skills.size() > kMaximumSkills) {
+        return core::Result<void>::failure({
+            core::ErrorCode::invalid_argument,
+            "skill discovery exceeds the limit of " +
+                std::to_string(kMaximumSkills),
+        });
+      }
     }
   }
+  skills_ = std::move(discovered_skills);
   return core::Result<void>::success();
 }
 
@@ -174,13 +295,10 @@ std::string SkillRegistry::prompt_context(std::string_view active_skill) const {
 
 core::Result<Skill>
 SkillRegistry::load_skill(const std::filesystem::path &file) const {
-  std::ifstream input(file);
-  if (!input) {
-    return core::Result<Skill>::failure({
-        core::ErrorCode::internal,
-        "cannot open skill: " + file.string(),
-    });
-  }
+  const auto content = read_regular_skill_file(file);
+  if (!content)
+    return core::Result<Skill>::failure(content.error());
+  std::istringstream input(content.value());
 
   Skill skill;
   skill.path = file;
@@ -215,10 +333,15 @@ SkillRegistry::load_skill(const std::filesystem::path &file) const {
     const auto newline = skill.instructions.find('\n');
     skill.description = skill.instructions.substr(0, newline);
   }
-  if (skill.name.empty() || skill.instructions.empty()) {
+  if (!valid_metadata(skill.name, 128) ||
+      !valid_metadata(skill.description, 1'024, true) ||
+      skill.instructions.empty() ||
+      skill.instructions.size() > kMaximumInstructionsBytes) {
     return core::Result<Skill>::failure({
         core::ErrorCode::invalid_argument,
-        "skill must have a name and instructions: " + file.string(),
+        "skill requires valid UTF-8 metadata and non-empty instructions up to "
+        "1 MiB: " +
+            file.string(),
     });
   }
   return core::Result<Skill>::success(std::move(skill));
@@ -293,7 +416,7 @@ load_workspace_skills(const std::filesystem::path &workspace) {
 
 core::Result<void>
 validate_workspace_skills(const std::vector<ManagedSkill> &skills) {
-  if (skills.size() > 64) {
+  if (skills.size() > kMaximumSkills) {
     return core::Result<void>::failure(
         {core::ErrorCode::invalid_argument,
          "workspace supports at most 64 managed skills"});
@@ -302,7 +425,8 @@ validate_workspace_skills(const std::vector<ManagedSkill> &skills) {
   for (const auto &skill : skills) {
     if (!valid_id(skill.id) || !valid_metadata(skill.name, 128) ||
         !valid_metadata(skill.description, 1'024, true) ||
-        skill.instructions.empty() || skill.instructions.size() > 1024 * 1024 ||
+        skill.instructions.empty() ||
+        skill.instructions.size() > kMaximumInstructionsBytes ||
         !core::is_valid_utf8(skill.instructions) ||
         std::find(ids.begin(), ids.end(), skill.id) != ids.end()) {
       return core::Result<void>::failure({

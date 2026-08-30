@@ -21,6 +21,9 @@ struct ClangdConfig {
   std::size_t max_message_bytes{16 * 1024 * 1024};
   std::size_t max_diagnostics{50};
   bool background_index{true};
+  // Extra parent environment variables explicitly required by a clangd
+  // wrapper. The default child environment is otherwise a minimal allowlist.
+  std::vector<std::string> environment_allowlist;
 };
 
 struct Diagnostic {

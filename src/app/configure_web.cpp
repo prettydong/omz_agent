@@ -188,26 +188,28 @@ void launch_url(std::string_view url) {
 #if defined(__APPLE__) || defined(__linux__)
   const std::string target(url);
   auto spawn_lock = zed::support::lock_process_spawn();
-  const pid_t child = fork();
-  if (child < 0)
-    return;
-  if (child == 0) {
-    const pid_t grandchild = fork();
-    if (grandchild != 0)
-      _exit(grandchild < 0 ? 127 : 0);
-    static_cast<void>(setsid());
+  zed::support::SpawnOptions spawn_options;
 #if defined(__APPLE__)
-    execlp("open", "open", target.c_str(), static_cast<char *>(nullptr));
+  spawn_options.executable = "open";
 #else
-    execlp("xdg-open", "xdg-open", target.c_str(),
-           static_cast<char *>(nullptr));
+  spawn_options.executable = "xdg-open";
 #endif
-    _exit(127);
-  }
+  spawn_options.arguments = {target};
+  spawn_options.additional_environment_variables = {
+      "DISPLAY",
+      "WAYLAND_DISPLAY",
+      "DBUS_SESSION_BUS_ADDRESS",
+      "XAUTHORITY",
+  };
+  pid_t child = -1;
+  if (zed::support::spawn_process(spawn_options, child) != 0)
+    return;
   spawn_lock.unlock();
-  int status = 0;
-  while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
-  }
+  std::thread([child] {
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+  }).detach();
 #else
   static_cast<void>(url);
 #endif

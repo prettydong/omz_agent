@@ -123,39 +123,44 @@ spawn_worker(const ProcessSubagentRunnerConfig &config) {
                                     std::string(std::strerror(errno))});
   }
 
-  const pid_t child = fork();
-  if (child == -1) {
+  support::SpawnOptions spawn_options;
+  spawn_options.executable = config.executable;
+  spawn_options.arguments = {"--subagent-worker"};
+  spawn_options.working_directory = config.workspace_root;
+  spawn_options.duplicate_descriptors = {
+      {input_pipe[0], STDIN_FILENO},
+      {output_pipe[1], STDOUT_FILENO},
+      {error_pipe[1], STDERR_FILENO},
+  };
+  spawn_options.close_descriptors = {
+      input_pipe[0],  input_pipe[1], output_pipe[0],
+      output_pipe[1], error_pipe[0], error_pipe[1],
+  };
+  // The worker is a trusted zeda process and needs only provider/configuration
+  // inputs. Arbitrary host credentials are intentionally not inherited.
+  spawn_options.additional_environment_variables = {
+      "OPENCODE_GO_API_KEY",
+      "ZED_OPENCODE_AUTH_PATH",
+      "ZED_OPENCODE_ENDPOINT",
+      "ZED_CLANGD_PATH",
+      "ZED_MAX_CONTEXT_TOKENS",
+      "ZED_RESERVED_OUTPUT_TOKENS",
+      "ZED_CONTEXT_TRIGGER_TOKENS",
+      "ZED_REQUEST_TIMEOUT_MS",
+      "ZED_WORKSPACE",
+  };
+  pid_t child = -1;
+  const int spawn_error = support::spawn_process(spawn_options, child);
+  if (spawn_error != 0) {
     close_pair(input_pipe);
     close_pair(output_pipe);
     close_pair(error_pipe);
     return core::Result<SpawnedWorker>::failure(
-        {ErrorCode::tool_error,
-         "cannot fork subagent worker: " + std::string(std::strerror(errno))});
-  }
-  if (child == 0) {
-    static_cast<void>(setpgid(0, 0));
-    close(input_pipe[1]);
-    close(output_pipe[0]);
-    close(error_pipe[0]);
-    if (chdir(config.workspace_root.c_str()) != 0 ||
-        dup2(input_pipe[0], STDIN_FILENO) == -1 ||
-        dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
-        dup2(error_pipe[1], STDERR_FILENO) == -1) {
-      _exit(126);
-    }
-    close(input_pipe[0]);
-    close(output_pipe[1]);
-    close(error_pipe[1]);
-    std::array<char *, 3> arguments{
-        const_cast<char *>(config.executable.c_str()),
-        const_cast<char *>("--subagent-worker"), nullptr};
-    execvp(arguments[0], arguments.data());
-    _exit(127);
+        {ErrorCode::tool_error, "cannot start subagent worker: " +
+                                    std::string(std::strerror(spawn_error))});
   }
 
   spawn_lock.unlock();
-
-  static_cast<void>(setpgid(child, child));
   close(input_pipe[0]);
   close(output_pipe[1]);
   close(error_pipe[1]);

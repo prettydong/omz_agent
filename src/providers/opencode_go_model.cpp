@@ -5,6 +5,8 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <functional>
@@ -29,6 +31,10 @@ using core::ModelRequest;
 using core::Role;
 using core::ToolCall;
 using Json = nlohmann::json;
+
+constexpr std::size_t kMaximumSseLineBytes = 1024 * 1024;
+constexpr std::size_t kMaximumStreamBytes = 16 * 1024 * 1024;
+constexpr std::size_t kMaximumToolCalls = 128;
 
 const Json *field(const Json &object, std::string_view name) {
   if (!object.is_object())
@@ -585,10 +591,18 @@ struct ChatStreamState {
   std::vector<ToolCall> indexed_calls;
 };
 
-ToolCall &chat_tool_call(ChatStreamState &state, std::size_t index) {
+core::Result<ToolCall *> chat_tool_call(ChatStreamState &state,
+                                        std::size_t index) {
+  if (index >= kMaximumToolCalls) {
+    return core::Result<ToolCall *>::failure({
+        ErrorCode::model_error,
+        "OpenCode returned a tool call index above the limit of " +
+            std::to_string(kMaximumToolCalls),
+    });
+  }
   if (state.indexed_calls.size() <= index)
     state.indexed_calls.resize(index + 1);
-  return state.indexed_calls[index];
+  return core::Result<ToolCall *>::success(&state.indexed_calls[index]);
 }
 
 core::Result<void> process_chat_sse(std::string_view line,
@@ -639,7 +653,19 @@ core::Result<void> process_chat_sse(std::string_view line,
           const auto *index_value = field(call_delta, "index");
           if (index_value == nullptr || !index_value->is_number_unsigned())
             continue;
-          auto &call = chat_tool_call(state, index_value->get<std::size_t>());
+          const auto raw_index = index_value->get<std::uint64_t>();
+          if (raw_index >= kMaximumToolCalls) {
+            return core::Result<void>::failure({
+                ErrorCode::model_error,
+                "OpenCode returned a tool call index above the limit of " +
+                    std::to_string(kMaximumToolCalls),
+            });
+          }
+          const auto call_result =
+              chat_tool_call(state, static_cast<std::size_t>(raw_index));
+          if (!call_result)
+            return core::Result<void>::failure(call_result.error());
+          auto &call = *call_result.value();
           if (const auto *id = field(call_delta, "id");
               id != nullptr && id->is_string()) {
             call.id = id->get<std::string>();
@@ -760,7 +786,15 @@ core::Result<void> process_messages_sse(std::string_view line,
     const auto *block = field(event, "content_block");
     if (index_value != nullptr && index_value->is_number_unsigned() &&
         block != nullptr && block->is_object()) {
-      const auto index = index_value->get<std::size_t>();
+      const auto raw_index = index_value->get<std::uint64_t>();
+      if (raw_index >= kMaximumToolCalls) {
+        return core::Result<void>::failure({
+            ErrorCode::model_error,
+            "OpenCode returned a content block index above the limit of " +
+                std::to_string(kMaximumToolCalls),
+        });
+      }
+      const auto index = static_cast<std::size_t>(raw_index);
       if (const auto *block_type = field(*block, "type");
           block_type != nullptr && block_type->is_string() &&
           block_type->get<std::string>() == "tool_use") {
@@ -781,7 +815,15 @@ core::Result<void> process_messages_sse(std::string_view line,
     const auto *delta = field(event, "delta");
     if (index_value != nullptr && index_value->is_number_unsigned() &&
         delta != nullptr && delta->is_object()) {
-      const auto index = index_value->get<std::size_t>();
+      const auto raw_index = index_value->get<std::uint64_t>();
+      if (raw_index >= kMaximumToolCalls) {
+        return core::Result<void>::failure({
+            ErrorCode::model_error,
+            "OpenCode returned a content block index above the limit of " +
+                std::to_string(kMaximumToolCalls),
+        });
+      }
+      const auto index = static_cast<std::size_t>(raw_index);
       const auto *delta_type = field(*delta, "type");
       const std::string delta_name =
           delta_type != nullptr && delta_type->is_string()
@@ -805,7 +847,16 @@ core::Result<void> process_messages_sse(std::string_view line,
   } else if (type == "content_block_stop") {
     const auto *index_value = field(event, "index");
     if (index_value != nullptr && index_value->is_number_unsigned()) {
-      const auto iterator = state.blocks.find(index_value->get<std::size_t>());
+      const auto raw_index = index_value->get<std::uint64_t>();
+      if (raw_index >= kMaximumToolCalls) {
+        return core::Result<void>::failure({
+            ErrorCode::model_error,
+            "OpenCode returned a content block index above the limit of " +
+                std::to_string(kMaximumToolCalls),
+        });
+      }
+      const auto iterator =
+          state.blocks.find(static_cast<std::size_t>(raw_index));
       if (iterator != state.blocks.end()) {
         auto arguments = iterator->second.arguments;
         if (arguments.empty())
@@ -834,6 +885,13 @@ core::Result<void> process_messages_sse(std::string_view line,
 }
 
 core::Result<void> validate_tool_calls(const std::vector<ToolCall> &calls) {
+  if (calls.size() > kMaximumToolCalls) {
+    return core::Result<void>::failure({
+        ErrorCode::model_error,
+        "OpenCode returned more than " + std::to_string(kMaximumToolCalls) +
+            " tool calls",
+    });
+  }
   for (const auto &call : calls) {
     if (call.id.empty() || call.name.empty() || call.arguments_json.empty()) {
       return core::Result<void>::failure({
@@ -924,6 +982,13 @@ public:
       : on_line_(on_line) {}
 
   core::Result<void> append(std::string_view chunk) {
+    if (chunk.size() > kMaximumStreamBytes - total_bytes_) {
+      return core::Result<void>::failure({
+          ErrorCode::model_error,
+          "OpenCode response exceeded the 16 MiB stream limit",
+      });
+    }
+    total_bytes_ += chunk.size();
     pending_.append(chunk);
     return process(false);
   }
@@ -936,6 +1001,12 @@ private:
       const auto newline = pending_.find('\n');
       if (newline == std::string::npos)
         break;
+      if (newline > kMaximumSseLineBytes) {
+        return core::Result<void>::failure({
+            ErrorCode::model_error,
+            "OpenCode response contained an SSE line above the 1 MiB limit",
+        });
+      }
       std::string line = pending_.substr(0, newline);
       pending_.erase(0, newline + 1);
       if (!line.empty() && line.back() == '\r')
@@ -943,6 +1014,12 @@ private:
       const auto processed = on_line_(line);
       if (!processed)
         return processed;
+    }
+    if (pending_.size() > kMaximumSseLineBytes) {
+      return core::Result<void>::failure({
+          ErrorCode::model_error,
+          "OpenCode response contained an SSE line above the 1 MiB limit",
+      });
     }
     if (flush && !pending_.empty()) {
       if (pending_.back() == '\r')
@@ -957,6 +1034,7 @@ private:
 
   const std::function<core::Result<void>(std::string_view)> &on_line_;
   std::string pending_;
+  std::size_t total_bytes_{};
 };
 
 core::Result<void>
@@ -983,38 +1061,37 @@ run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
   support::UniqueFd config_read(config_pipe[0]);
   support::UniqueFd config_write(config_pipe[1]);
 
-  const pid_t child = fork();
-  if (child == -1)
+  support::UniqueFd error_output(open("/dev/null", O_WRONLY | O_CLOEXEC));
+  support::SpawnOptions spawn_options;
+  spawn_options.executable = "curl";
+  spawn_options.arguments = {
+      "-sS", "--no-buffer", "--fail-with-body", "--config", "-",
+  };
+  spawn_options.duplicate_descriptors = {
+      {output_write.get(), STDOUT_FILENO},
+      {config_read.get(), STDIN_FILENO},
+  };
+  if (error_output.valid()) {
+    spawn_options.duplicate_descriptors.push_back(
+        {error_output.get(), STDERR_FILENO});
+  }
+  spawn_options.close_descriptors = {
+      output_read.get(),
+      output_write.get(),
+      config_read.get(),
+      config_write.get(),
+  };
+  if (error_output.valid())
+    spawn_options.close_descriptors.push_back(error_output.get());
+  pid_t child = -1;
+  const int spawn_error = support::spawn_process(spawn_options, child);
+  if (spawn_error != 0) {
     return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot start curl"});
-  if (child == 0) {
-    output_read.reset();
-    config_write.reset();
-    setpgid(0, 0);
-    dup2(output_write.get(), STDOUT_FILENO);
-    dup2(config_read.get(), STDIN_FILENO);
-    output_write.reset();
-    config_read.reset();
-    const int error_fd = open("/dev/null", O_WRONLY);
-    if (error_fd >= 0) {
-      dup2(error_fd, STDERR_FILENO);
-      close(error_fd);
-    }
-    std::vector<std::string> arguments{
-        "curl", "-sS", "--no-buffer", "--fail-with-body", "--config", "-",
-    };
-    std::vector<char *> raw_arguments;
-    raw_arguments.reserve(arguments.size() + 1);
-    for (auto &argument : arguments)
-      raw_arguments.push_back(argument.data());
-    raw_arguments.push_back(nullptr);
-    execvp(raw_arguments[0], raw_arguments.data());
-    _exit(127);
+        {ErrorCode::model_error,
+         "cannot start curl: " + std::string(std::strerror(spawn_error))});
   }
 
   spawn_lock.unlock();
-
-  setpgid(child, child);
 
   output_write.reset();
   config_read.reset();
@@ -1051,6 +1128,7 @@ run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
   bool cancelled = false;
   bool timed_out = false;
   bool pipe_closed = false;
+  bool termination_requested = false;
   LineBuffer line_buffer(on_line);
   const auto started_at = std::chrono::steady_clock::now();
   while (!pipe_closed || !child_finished) {
@@ -1100,8 +1178,11 @@ run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
 
     if (!child_finished)
       child_finished = support::try_reap_child(child, status);
-    if ((cancelled || timed_out) && !child_finished) {
+    if ((cancelled || timed_out) && !termination_requested) {
       terminate_child();
+      termination_requested = true;
+      output_read.reset();
+      pipe_closed = true;
     }
   }
 

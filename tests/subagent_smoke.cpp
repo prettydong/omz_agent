@@ -255,7 +255,10 @@ void test_registry_and_read_only_tools(const std::filesystem::path &root) {
     names.push_back(definition.name);
   assert(
       (names == std::vector<std::string>{"read", "grep", "find", "ls", "lsp"}));
+  // Shell exclusion is a Sub Agent design invariant, not a configurable
+  // default.
   assert(std::find(names.begin(), names.end(), "bash") == names.end());
+  assert(std::find(names.begin(), names.end(), "multi_bash") == names.end());
   assert(std::find(names.begin(), names.end(), "write") == names.end());
   assert(std::find(names.begin(), names.end(), "subagent") == names.end());
   assert(!std::filesystem::exists(root / ".zed" / "sessions"));
@@ -272,6 +275,8 @@ void test_clangd_credential_boundary(const std::filesystem::path &root) {
   setenv("OPENCODE_GO_API_KEY", "opencode-secret", 1);
   setenv("ANTHROPIC_API_KEY", "anthropic-secret", 1);
   setenv("AWS_SECRET_ACCESS_KEY", "aws-secret", 1);
+  setenv("NPM_TOKEN", "npm-secret", 1);
+  setenv("DATABASE_URL", "postgres://secret", 1);
   setenv("ZED_TEST_CLANGD_ENV_MARKER", marker_path.c_str(), 1);
 
   zed::lsp::ClangdConfig config;
@@ -280,6 +285,7 @@ void test_clangd_credential_boundary(const std::filesystem::path &root) {
   config.initialize_timeout_ms = 500;
   config.request_timeout_ms = 500;
   config.background_index = false;
+  config.environment_allowlist = {"ZED_TEST_CLANGD_ENV_MARKER"};
   zed::lsp::ClangdClient client(std::move(config));
   const auto result = client.diagnostics(source_path);
   assert(!result);
@@ -292,6 +298,8 @@ void test_clangd_credential_boundary(const std::filesystem::path &root) {
   unsetenv("OPENCODE_GO_API_KEY");
   unsetenv("ANTHROPIC_API_KEY");
   unsetenv("AWS_SECRET_ACCESS_KEY");
+  unsetenv("NPM_TOKEN");
+  unsetenv("DATABASE_URL");
   unsetenv("ZED_TEST_CLANGD_ENV_MARKER");
 }
 

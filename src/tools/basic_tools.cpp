@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <poll.h>
@@ -471,32 +472,35 @@ BashTool::execute(const ToolCall &call, core::CancellationToken cancellation) {
   }
   support::UniqueFd output_read(output_pipe[0]);
   support::UniqueFd output_write(output_pipe[1]);
-  const pid_t child = fork();
-  if (child == -1) {
+  support::SpawnOptions spawn_options;
+  spawn_options.executable = "/bin/sh";
+  spawn_options.arguments = {"-c", command.value()};
+  spawn_options.working_directory = working_directory;
+  spawn_options.duplicate_descriptors = {
+      {output_write.get(), STDOUT_FILENO},
+      {output_write.get(), STDERR_FILENO},
+  };
+  spawn_options.close_descriptors = {output_read.get(), output_write.get()};
+  pid_t child = -1;
+  const int spawn_error = support::spawn_process(spawn_options, child);
+  if (spawn_error != 0) {
     return core::Result<ToolResult>::failure(
-        {ErrorCode::tool_error, "cannot fork command process"});
-  }
-  if (child == 0) {
-    close(output_read.get());
-    setpgid(0, 0);
-    if (chdir(working_directory.c_str()) != 0)
-      _exit(126);
-    dup2(output_write.get(), STDOUT_FILENO);
-    dup2(output_write.get(), STDERR_FILENO);
-    close(output_write.get());
-    support::clear_sensitive_environment();
-    execl("/bin/sh", "sh", "-c", command.value().c_str(),
-          static_cast<char *>(nullptr));
-    _exit(127);
+        {ErrorCode::tool_error, "cannot start command process: " +
+                                    std::string(std::strerror(spawn_error))});
   }
 
   spawn_lock.unlock();
 
-  setpgid(child, child);
-
   output_write.reset();
   const int flags = fcntl(output_read.get(), F_GETFL, 0);
-  fcntl(output_read.get(), F_SETFL, flags | O_NONBLOCK);
+  if (flags < 0 || fcntl(output_read.get(), F_SETFL, flags | O_NONBLOCK) < 0) {
+    bool reaped = false;
+    int status = 0;
+    support::terminate_process_group(child, std::chrono::milliseconds(250),
+                                     reaped, status);
+    return core::Result<ToolResult>::failure(
+        {ErrorCode::tool_error, "cannot configure command output"});
+  }
   std::string output;
   bool output_truncated = false;
   bool timed_out = false;
@@ -504,6 +508,7 @@ BashTool::execute(const ToolCall &call, core::CancellationToken cancellation) {
   bool pipe_closed = false;
   int status = 0;
   bool child_finished = false;
+  bool termination_requested = false;
   const auto terminate_child = [&] {
     support::terminate_process_group(child, std::chrono::milliseconds(250),
                                      child_finished, status);
@@ -541,8 +546,11 @@ BashTool::execute(const ToolCall &call, core::CancellationToken cancellation) {
 
     if (!child_finished)
       child_finished = support::try_reap_child(child, status);
-    if ((timed_out || cancelled) && !child_finished) {
+    if ((timed_out || cancelled) && !termination_requested) {
       terminate_child();
+      termination_requested = true;
+      output_read.reset();
+      pipe_closed = true;
     }
   }
   output = truncate_output(std::move(output), max_output, output_truncated);
@@ -920,8 +928,17 @@ EditFileTool::execute(const ToolCall &call,
     });
   }
 
+  const std::size_t retained_bytes =
+      content.size() - old_text.value().size() * count;
+  if (count > 0 && new_text.value().size() >
+                       (limits().max_write_bytes - retained_bytes) / count) {
+    return core::Result<ToolResult>::failure(
+        {ErrorCode::tool_error, "edited file exceeds write limit"});
+  }
+  const std::size_t final_size =
+      retained_bytes + new_text.value().size() * count;
   std::string updated;
-  updated.reserve(content.size() + new_text.value().size() * count);
+  updated.reserve(final_size);
   position = 0;
   while (true) {
     const auto found = content.find(old_text.value(), position);

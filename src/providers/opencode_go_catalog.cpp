@@ -1,10 +1,12 @@
 #include "zed/providers/opencode_go_catalog.hpp"
 
 #include "zed/support/child_process.hpp"
+#include "zed/support/unique_fd.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <fcntl.h>
 #include <poll.h>
 #include <string>
@@ -70,40 +72,31 @@ capture_catalog(std::string_view executable, std::size_t timeout_ms,
     });
   }
 
-  const pid_t child = fork();
-  if (child == -1) {
+  support::UniqueFd error_output(open("/dev/null", O_WRONLY | O_CLOEXEC));
+  support::SpawnOptions spawn_options;
+  spawn_options.executable = std::string(executable);
+  spawn_options.arguments = {"models", "opencode-go", "--verbose"};
+  spawn_options.duplicate_descriptors = {{output_pipe[1], STDOUT_FILENO}};
+  if (error_output.valid()) {
+    spawn_options.duplicate_descriptors.push_back(
+        {error_output.get(), STDERR_FILENO});
+  }
+  spawn_options.close_descriptors = {output_pipe[0], output_pipe[1]};
+  if (error_output.valid())
+    spawn_options.close_descriptors.push_back(error_output.get());
+  pid_t child = -1;
+  const int spawn_error = support::spawn_process(spawn_options, child);
+  if (spawn_error != 0) {
     close(output_pipe[0]);
     close(output_pipe[1]);
     return core::Result<std::string>::failure({
         core::ErrorCode::internal,
-        "cannot start OpenCode model discovery",
+        "cannot start OpenCode model discovery: " +
+            std::string(std::strerror(spawn_error)),
     });
-  }
-  if (child == 0) {
-    close(output_pipe[0]);
-    setpgid(0, 0);
-    dup2(output_pipe[1], STDOUT_FILENO);
-    close(output_pipe[1]);
-    const int error_fd = open("/dev/null", O_WRONLY);
-    if (error_fd >= 0) {
-      dup2(error_fd, STDERR_FILENO);
-      close(error_fd);
-    }
-    std::string executable_copy(executable);
-    std::vector<std::string> arguments{executable_copy, "models", "opencode-go",
-                                       "--verbose"};
-    std::vector<char *> raw_arguments;
-    raw_arguments.reserve(arguments.size() + 1);
-    for (auto &argument : arguments)
-      raw_arguments.push_back(argument.data());
-    raw_arguments.push_back(nullptr);
-    execvp(raw_arguments[0], raw_arguments.data());
-    _exit(127);
   }
 
   spawn_lock.unlock();
-
-  setpgid(child, child);
   close(output_pipe[1]);
   bool child_finished = false;
   int status = 0;

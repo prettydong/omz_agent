@@ -1,5 +1,3 @@
-#include <cstdlib>
-#include <fstream>
 #include <iostream>
 #include <string_view>
 
@@ -9,17 +7,6 @@ int main(int argc, char *argv[]) {
       std::string_view(argv[3]) != "--verbose") {
     return 2;
   }
-
-  const char *marker_path = std::getenv("ZEDA_FAKE_DISCOVERY_MARKER");
-  if (marker_path == nullptr || *marker_path == '\0')
-    return 3;
-  std::ofstream marker(marker_path, std::ios::app);
-  if (!marker)
-    return 4;
-  marker << "called\n";
-  marker.close();
-  if (!marker)
-    return 5;
 
   std::cout << R"(opencode-go/manual-refresh-model
 {

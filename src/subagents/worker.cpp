@@ -100,6 +100,12 @@ std::string limit_final_output(std::string output) {
 core::Result<void> register_explorer_tools(core::ToolRegistry &registry,
                                            const app::RuntimeConfig &runtime,
                                            lsp::ClangdClient &clangd) {
+  // Design invariant: Sub Agents never receive Shell-capable tools. Keep this
+  // as an explicit read-only allowlist instead of reusing the main Agent's tool
+  // registration. This deliberately avoids inheriting command execution,
+  // environment filtering, process lifetime, and nested delegation semantics in
+  // worker processes, which keeps the Sub Agent security model and state space
+  // small enough to reason about.
   const auto register_tool = [&](std::unique_ptr<core::Tool> tool) {
     return registry.register_tool(std::move(tool));
   };

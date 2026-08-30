@@ -89,8 +89,15 @@ FixtureServer start_server(
                                  std::to_string(response_body.size()) +
                                  "\r\nConnection: close\r\n\r\n" +
                                  response_body;
-    const auto sent = send(client, response.data(), response.size(), 0);
-    require(sent == static_cast<ssize_t>(response.size()));
+    std::size_t sent = 0;
+    while (sent < response.size()) {
+      const auto count =
+          send(client, response.data() + sent, response.size() - sent, 0);
+      if (count < 0 && errno == EINTR)
+        continue;
+      require(count > 0);
+      sent += static_cast<std::size_t>(count);
+    }
     close(client);
     close(server_socket);
   });
@@ -201,6 +208,42 @@ opencode-go/responses-model
          R"({"purpose":"Read fixture","path":"x.txt"})");
   assert(chat_response.value().usage.input_tokens == 12);
   assert(chat_response.value().usage.cached_input_tokens == 7);
+
+  const std::string invalid_index_events =
+      R"(data: {"choices":[{"delta":{"tool_calls":[{"index":128,"id":"too-large","function":{"name":"read","arguments":"{}"}}]}}]}
+
+)";
+  auto invalid_index_server = start_server(
+      invalid_index_events, [](std::string_view, const nlohmann::json &) {});
+  zed::providers::OpenCodeGoModel invalid_index_model({
+      "fixture-key",
+      "http://127.0.0.1:" + std::to_string(invalid_index_server.port) + "/v1",
+      5'000,
+      parsed.value(),
+  });
+  const auto invalid_index_response = invalid_index_model.complete(
+      request_for("chat-model", ReasoningEffort::max), {}, {});
+  invalid_index_server.thread.join();
+  assert(!invalid_index_response);
+  assert(invalid_index_response.error().message.find("index above the limit") !=
+         std::string::npos);
+
+  const std::string oversized_line =
+      "data: " + std::string(1024 * 1024 + 1, 'x') + "\n";
+  auto oversized_line_server = start_server(
+      oversized_line, [](std::string_view, const nlohmann::json &) {});
+  zed::providers::OpenCodeGoModel oversized_line_model({
+      "fixture-key",
+      "http://127.0.0.1:" + std::to_string(oversized_line_server.port) + "/v1",
+      5'000,
+      parsed.value(),
+  });
+  const auto oversized_line_response = oversized_line_model.complete(
+      request_for("chat-model", ReasoningEffort::max), {}, {});
+  oversized_line_server.thread.join();
+  assert(!oversized_line_response);
+  assert(oversized_line_response.error().message.find("1 MiB limit") !=
+         std::string::npos);
 
   const std::string messages_events =
       "event: message_start\ndata: "

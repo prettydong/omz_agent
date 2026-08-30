@@ -50,6 +50,7 @@ OpenCode 登录后，后续启动无需再输入。`OPENCODE_GO_API_KEY` 仍可�
 
 - [nlohmann/json 3.12.0](https://github.com/nlohmann/json)：JSON 解析和序列化
 - [FTXUI 7.0.3](https://github.com/ArthurSonzogni/FTXUI)：交互式终端 UI 和 DOM 渲染
+- [cpp-httplib 0.51.0](https://github.com/yhirose/cpp-httplib)：仅绑定本机回环地址的配置页和 DeepWiki HTTP 服务
 
 默认模型是 `muse-spark-1.2-contributor`，也可以通过环境变量切换：
 
@@ -85,6 +86,51 @@ ZED_CLANGD_PATH                本机 clangd 可执行文件，默认从 PATH �
 ZED_PLUGIN_PATH                追加外部插件发现目录，多个目录使用冒号分隔
 ```
 
+### Web 配置
+
+运行中输入 `/configure-web` 会启动一个仅监听 `127.0.0.1` 随机端口的页面并在默认
+浏览器中打开。页面统一管理 Agent、Sub Agent、Skill 和上下文：
+
+- 可新增多个主 Agent 配置档案，并选择一个 Active Agent；每个档案独立保存模型、
+  reasoning、最大回合、输出上限、temperature、自动上下文压缩、Tool 权限和完整系统
+  提示词；
+- 可新增多个命名 Sub Agent；每个角色独立保存模型、reasoning、执行上限和完整系统
+  提示词，并与 Explorer 一起进入 `subagent` 工具的动态 schema；
+- 可新增、编辑、启用、停用或移除 workspace Skill；
+- 可配置 Sub Agent 并发、总超时和聚合输出上限；
+- 上下文控制模型、窗口预算、摘要输出上限和完整系统提示词。
+
+页面采用无标签页的三栏单页结构：左侧同时显示 Agent、Sub Agent 和 Skill 清单，中间
+编辑当前资源，右侧常驻上下文与 Sub Agent 执行参数。界面使用无圆角、无阴影的高密度
+机械风格。
+
+页面使用每次进程随机生成的访问令牌，拒绝非同源写入，不加载外部脚本，也不会读取、
+显示或保存 API Key。配置经过严格校验后以 `0600` 权限原子写入当前 workspace 的：
+
+```text
+.zed/config.json
+.zed/agent_management.json
+.zed/zed_system_propmt.md
+.zed/explorer_system_prompt.md
+.zed/context_system_prompt.md
+.zed/skills/<id>/SKILL.md
+```
+
+保存后重启 `zeda` 生效。已有环境变量保持最高优先级，例如 `ZED_MODEL` 会覆盖网页中
+保存的主模型；Explorer 当前没有环境变量覆盖项。配置文件使用版本化且不接受额外字段
+的 JSON schema，手工修改错误会在下次启动时明确报告，不会静默回退。
+
+`agent_management.json` 保存 Agent 档案、Active Agent 和自定义 Sub Agent。为了兼容
+已有配置，Active Agent 的运行参数和提示词也会同步到原有 `config.json` 与主提示词
+文件；其他 Agent 档案和自定义 Sub Agent 的提示词以该管理文件为准。Skill 启用时位于
+`.zed/skills/`，停用时移动到 `.zed/skills-disabled/`；从管理
+页移除时会将完整目录移动到 `.zed/skill-archive/`，不会直接删除其中的附加资源。
+
+每个主 Agent 的 Tool 权限是运行时白名单，既控制发送给模型的 Tool schema，也阻止对
+未授权 Tool 的执行；`*` 表示允许全部已注册 Tool，并用于兼容旧配置。自动上下文压缩
+关闭后，低于模型硬窗口时不主动摘要；超过硬窗口时仍执行确定性裁剪，避免发送无效请求。
+版本 1 的 Agent 管理文件会在内存中迁移为版本 2，并沿用原有全局压缩阈值。
+
 运行中可用 `/reasoning` 查看当前模型支持的思考强度，或使用 `/reasoning <effort>`
 调整后续模型请求。完整档位包括 `auto`、`none`、`minimal`、`low`、`medium`、
 `high`、`xhigh`、`max` 和 `thinking`，命令会拒绝当前模型不支持的档位。例如：
@@ -97,17 +143,18 @@ ZED_PLUGIN_PATH                追加外部插件发现目录，多个目录使�
 
 ## 系统提示词
 
-项目级系统提示词文件固定为：
+三个系统提示词文件分别用于主 Agent、Explorer 和上下文控制模型：
 
 ```text
 .zed/zed_system_propmt.md
+.zed/explorer_system_prompt.md
+.zed/context_system_prompt.md
 ```
 
-安装 `zeda` 时会同时安装中文提示词模板。项目中缺少该文件时，`zeda` 首次启动会
-自动创建 `.zed/zed_system_propmt.md`；已有文件不会被覆盖。文件的完整内容会替换
-程序内置提示词，当前启用的 Skill 指令仍会附加在其后。修改文件后需要重新启动
-`zeda`。该文件必须是非空的 UTF-8 普通文件，不能是符号链接，大小不得超过 1 MiB；
-创建、读取或校验失败都会在启动时明确报错。
+项目中缺少文件时，`zeda` 会写入对应的内置默认提示词；已有文件不会被覆盖。主 Agent
+启用的 Skill 指令仍会附加在主提示词之后。网页或手工修改后需要重启 `zeda`。三个
+文件都必须是非空的 UTF-8 普通文件，不能是符号链接，单个文件不得超过 1 MiB；创建、
+读取或校验失败都会在启动时明确报错。
 
 终端只提供两个内置主题，不支持自定义主题。`light` 使用 OpenCode
 默认亮色风格，`monaka` 使用 Monokai 风格的暗色配色。运行中可以切换：
@@ -197,16 +244,19 @@ Session v2 不兼容早期 beta 的 message-only JSONL。旧文件不会被删�
 
 ## Sub Agent
 
-主 Agent 可以通过内置 `subagent` 工具把读密集、彼此独立的调查任务委派给
-Explorer。使用 `/agents` 查看角色、固定模型、reasoning、工具白名单和当前可用
-状态；第一版不提供用户直接运行 Agent 的斜杠命令。
+Active Agent 可以通过内置 `subagent` 工具把读密集、彼此独立的调查任务委派给
+Explorer 或网页中新增的 Sub Agent。使用 `/agents` 查看角色、模型、reasoning、执行
+上限、工具白名单和当前可用状态；不提供用户直接运行 Sub Agent 的斜杠命令。
 
-Explorer 固定使用 `opencode-go/muse-spark-1.2-contributor` 和 `low` reasoning，
-不会跟随 `/model` 切换，也不会静默回退到主模型。该模型不在有效 OpenCode Go
-目录中时，`/agents` 会显示 `unavailable`，工具调用会明确失败。使用 Explorer
-同样意味着接受前文所述 Contributor 数据政策。
+Explorer 默认使用 `opencode-go/muse-spark-1.2-contributor` 和 `low` reasoning，
+不会跟随 `/model` 切换，也不会静默回退到主模型。可通过 `/configure-web` 为它选择
+其他内置目录模型或禁用它；模型不存在或不支持所选 reasoning 时，`/agents` 会显示
+`unavailable`，工具调用会明确失败。选择 Contributor 模型仍意味着接受前文所述
+数据政策。无论模型或提示词如何配置，Explorer 和自定义 Sub Agent 的工具白名单都
+不可放宽。Worker 注册的工具白名单固定为只读工具；修改提示词不能获得 Shell、写文件、
+插件、Skill 或嵌套 Sub Agent 权限。
 
-每个 Explorer 任务在独立的 `zeda --subagent-worker` 子进程和新上下文中运行，
+每个 Sub Agent 任务在独立的 `zeda --subagent-worker` 子进程和新上下文中运行，
 只注册 `read`、`grep`、`find`、`ls` 和只读 `lsp`。Worker 不加载 Shell、写入工具、
 Quick Bash、Skill、插件或 `subagent` 本身，也不创建 Session 文件。主 Session 仅
 保存一次 `subagent` 调用及其最终结果；运行中的 queued、running、completed 和
@@ -220,12 +270,13 @@ failed 状态只显示在当前工具卡片中。
 {"chain":[{"agent":"explorer","task":"先调查 A"},{"agent":"explorer","task":"根据 {previous} 调查 B"}]}
 ```
 
-Parallel 和 Chain 都接受 2–8 个任务；Parallel 最多同时运行 4 个并按输入顺序返回，
+Parallel 和 Chain 都接受 2–8 个任务；Parallel 默认最多同时运行 4 个并按输入顺序返回，
 单个失败不会丢弃其他结果。Chain 用上一步结果替换 `{previous}`，首个失败后停止。
-一次调用总超时为 10 分钟，每个 Worker 最多执行 12 个 Agent Loop 回合；每个任务的
+一次调用默认总超时为 10 分钟，每个 Worker 默认最多执行 12 个 Agent Loop 回合；每个任务的
 输入和最终输出上限都是 32 KiB，聚合工具结果上限是 256 KiB。取消会终止所有活动
-及排队任务。子任务的模型 token 会计入终端累计用量，但不会覆盖主 Agent 的当前
-上下文占用。
+及排队任务。并发数、总超时、聚合输出、Worker 回合数和模型最终输出 Token 上限可在
+配置页调整，但单任务输入和协议最终输出的 32 KiB 限制保持不变。子任务的模型 token
+会计入终端累计用量，但不会覆盖主 Agent 的当前上下文占用。
 
 zeda 只集成本机 `clangd`，不下载或启动其他语言服务器。C/C++ 文件可通过 `lsp`
 工具查询 diagnostics、hover、definition、references 和 document symbols；成功的
@@ -282,6 +333,7 @@ include/zed/skills/     Skill 发现和加载
 include/zed/extensions/ Extension 命令注册
 include/zed/plugins/    外部插件 C ABI 和宿主加载器
 include/zed/subagents/  内置 Agent、Worker 协议与进程编排
+include/zed/app/        启动配置与本地 Web 配置服务
 plugins/deepwiki/       C/C++ DeepWiki 插件与本地网页资源
 ```
 

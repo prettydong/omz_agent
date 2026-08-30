@@ -11,6 +11,12 @@ namespace {
 
 using Json = nlohmann::json;
 
+constexpr std::string_view kDefaultContextSystemPrompt =
+    "You manage coding-agent context. Return JSON only with this exact shape: "
+    "{\"selected_ids\":[string],\"summarized_ids\":[string],\"summary\":"
+    "string}. Always select every candidate where required is true. Keep the "
+    "latest task relevant. Do not invent ids.";
+
 const Json *field(const Json &object, std::string_view name) {
   if (!object.is_object())
     return nullptr;
@@ -47,22 +53,22 @@ std::string strip_code_fence(std::string text) {
 
 } // namespace
 
-ModelBackedContextController::ModelBackedContextController(Model &model,
-                                                           ModelRef model_ref)
-    : model_(model), model_ref_(std::move(model_ref)) {}
+ModelBackedContextController::ModelBackedContextController(
+    Model &model, ModelRef model_ref, std::string system_prompt,
+    std::size_t max_output_tokens)
+    : model_(model), model_ref_(std::move(model_ref)),
+      system_prompt_(system_prompt.empty()
+                         ? std::string(kDefaultContextSystemPrompt)
+                         : std::move(system_prompt)),
+      max_output_tokens_(max_output_tokens) {}
+
+std::string_view default_context_system_prompt() {
+  return kDefaultContextSystemPrompt;
+}
 
 Result<ContextDecision>
 ModelBackedContextController::decide(const ContextRequest &request,
                                      CancellationToken cancellation) {
-  const std::string system_prompt =
-      "You manage coding-agent context. Return JSON only with this exact "
-      "shape: "
-      "{\"selected_ids\":[string],\"summarized_ids\":[string],\"summary\":"
-      "string}. "
-      "Always select every candidate where required is true. Keep the latest "
-      "task relevant. "
-      "Do not invent ids.";
-
   Message user_message{
       "context-controller-request",
       Role::user,
@@ -75,12 +81,12 @@ ModelBackedContextController::decide(const ContextRequest &request,
   model_request.messages = {Message{
                                 "context-controller-system",
                                 Role::system,
-                                system_prompt,
+                                system_prompt_,
                                 {},
                                 std::nullopt,
                             },
                             user_message};
-  model_request.max_output_tokens = 1024;
+  model_request.max_output_tokens = max_output_tokens_;
   model_request.temperature = 0.0;
   model_request.reasoning_effort = ReasoningEffort::none;
 

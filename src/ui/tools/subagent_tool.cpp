@@ -41,16 +41,50 @@ struct TaskOutcome {
   std::optional<core::Error> error;
 };
 
-const core::ToolDefinition &subagent_definition() {
-  static const core::ToolDefinition definition{
-      "subagent",
-      "Delegate independent, read-only workspace investigation to the "
-      "built-in Explorer. Use task+agent for one task, tasks for parallel "
-      "work, or chain for ordered work whose later prompts may contain "
-      "{previous}.",
-      R"({"type":"object","additionalProperties":false,"properties":{"purpose":{"type":"string","minLength":1},"agent":{"type":"string","enum":["explorer"]},"task":{"type":"string","minLength":1,"maxLength":32768},"tasks":{"type":"array","minItems":2,"maxItems":8,"items":{"type":"object","additionalProperties":false,"required":["agent","task"],"properties":{"agent":{"type":"string","enum":["explorer"]},"task":{"type":"string","minLength":1,"maxLength":32768}}}},"chain":{"type":"array","minItems":2,"maxItems":8,"items":{"type":"object","additionalProperties":false,"required":["agent","task"],"properties":{"agent":{"type":"string","enum":["explorer"]},"task":{"type":"string","minLength":1,"maxLength":32768}}}}},"required":["purpose"],"oneOf":[{"required":["agent","task"]},{"required":["tasks"]},{"required":["chain"]}]})",
+core::ToolDefinition
+subagent_definition(const std::vector<subagents::AgentDefinition> &agents) {
+  Json agent_names = Json::array();
+  std::string description =
+      "Delegate independent, read-only workspace investigation to a "
+      "configured Sub Agent. Available roles: ";
+  for (std::size_t index = 0; index < agents.size(); ++index) {
+    agent_names.push_back(agents[index].name);
+    if (index > 0)
+      description += ", ";
+    description += agents[index].name;
+  }
+  description +=
+      ". Use task+agent for one task, tasks for parallel work, or chain for "
+      "ordered work whose later prompts may contain {previous}.";
+  const Json agent_field{{"type", "string"}, {"enum", agent_names}};
+  const Json task_field{{"type", "string"},
+                        {"minLength", 1},
+                        {"maxLength", subagents::kMaximumTaskBytes}};
+  const Json task_item{
+      {"type", "object"},
+      {"additionalProperties", false},
+      {"required", Json::array({"agent", "task"})},
+      {"properties", {{"agent", agent_field}, {"task", task_field}}},
   };
-  return definition;
+  const Json task_list{{"type", "array"},
+                       {"minItems", 2},
+                       {"maxItems", 8},
+                       {"items", task_item}};
+  const Json schema{
+      {"type", "object"},
+      {"additionalProperties", false},
+      {"properties",
+       {{"purpose", {{"type", "string"}, {"minLength", 1}}},
+        {"agent", agent_field},
+        {"task", task_field},
+        {"tasks", task_list},
+        {"chain", task_list}}},
+      {"required", Json::array({"purpose"})},
+      {"oneOf", Json::array({Json{{"required", Json::array({"agent", "task"})}},
+                             Json{{"required", Json::array({"tasks"})}},
+                             Json{{"required", Json::array({"chain"})}}})},
+  };
+  return {"subagent", std::move(description), schema.dump()};
 }
 
 core::Result<void>
@@ -242,14 +276,16 @@ std::string replace_previous(std::string task, std::string_view previous) {
 SubagentTool::SubagentTool(subagents::SubagentRunner &runner,
                            std::vector<subagents::AgentDefinition> agents,
                            SubagentToolConfig config)
-    : runner_(runner), agents_(std::move(agents)), config_(config) {}
+    : runner_(runner), agents_(std::move(agents)), config_(config),
+      definition_(subagent_definition(agents_)) {}
 
 const core::ToolDefinition &SubagentTool::definition() const {
-  return subagent_definition();
+  return definition_;
 }
 
 void SubagentTool::set_agents(std::vector<subagents::AgentDefinition> agents) {
   agents_ = std::move(agents);
+  definition_ = subagent_definition(agents_);
 }
 
 core::Result<core::ToolResult>
@@ -275,7 +311,7 @@ core::Result<core::ToolResult> SubagentTool::execute_with_progress(
     const auto *agent = subagents::find_agent(agents_, task.agent);
     if (agent == nullptr) {
       return core::Result<core::ToolResult>::failure(
-          {ErrorCode::not_found, "unknown built-in agent: " + task.agent});
+          {ErrorCode::not_found, "unknown configured agent: " + task.agent});
     }
     if (!agent->available) {
       return core::Result<core::ToolResult>::failure(

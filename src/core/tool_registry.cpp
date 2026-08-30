@@ -66,6 +66,15 @@ Result<Json> schema_with_purpose(const ToolDefinition &definition) {
 
 } // namespace
 
+ToolRegistry::ToolRegistry(std::vector<std::string> allowed_tools)
+    : allowed_tools_(std::in_place, allowed_tools.begin(),
+                     allowed_tools.end()) {}
+
+bool ToolRegistry::allowed(std::string_view name) const {
+  return !allowed_tools_.has_value() || allowed_tools_->contains("*") ||
+         allowed_tools_->contains(std::string(name));
+}
+
 Result<std::string> tool_call_purpose(const ToolCall &call) {
   try {
     const auto arguments = Json::parse(call.arguments_json);
@@ -142,6 +151,22 @@ std::vector<ToolDefinition> ToolRegistry::definitions() const {
   std::vector<ToolDefinition> result;
   result.reserve(tools_.size());
   for (const auto &tool : tools_) {
+    if (!allowed(tool->definition().name))
+      continue;
+    auto definition = tool->definition();
+    const auto schema = schema_with_purpose(definition);
+    if (schema)
+      definition.input_schema_json = schema.value().dump();
+    result.push_back(std::move(definition));
+  }
+  return result;
+}
+
+std::vector<ToolDefinition> ToolRegistry::registered_definitions() const {
+  std::scoped_lock lock(mutex_);
+  std::vector<ToolDefinition> result;
+  result.reserve(tools_.size());
+  for (const auto &tool : tools_) {
     auto definition = tool->definition();
     const auto schema = schema_with_purpose(definition);
     if (schema)
@@ -158,6 +183,12 @@ ToolRegistry::execute(const ToolCall &call, CancellationToken cancellation,
     return Result<ToolResult>::failure({
         ErrorCode::cancelled,
         "tool execution cancelled",
+    });
+  }
+  if (!allowed(call.name)) {
+    return Result<ToolResult>::failure({
+        ErrorCode::not_found,
+        "tool is not permitted for the active Agent: " + call.name,
     });
   }
   const auto purpose = tool_call_purpose(call);

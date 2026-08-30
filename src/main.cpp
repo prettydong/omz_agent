@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "zed/app/config.hpp"
+#include "zed/app/configure_web.hpp"
 #include "zed/core/agent_loop.hpp"
 #include "zed/core/model_context_controller.hpp"
 #include "zed/extensions/extension_registry.hpp"
@@ -126,7 +127,9 @@ int main(int argc, char *argv[]) {
   const auto &runtime_config = runtime.value();
   const auto config_ready_at = std::chrono::steady_clock::now();
   auto model_catalog = zed::providers::default_opencode_go_models();
-  auto built_in_agents = zed::subagents::built_in_agents(model_catalog);
+  zed::app::ConfigureWebServer configure_web(runtime_config.workspace);
+  auto built_in_agents = zed::subagents::configured_agents(
+      model_catalog, runtime_config.subagents);
   zed::subagents::ProcessSubagentRunner subagent_runner({
       subagent_worker_executable(argv[0]),
       runtime_config.workspace,
@@ -143,7 +146,8 @@ int main(int argc, char *argv[]) {
       model_catalog,
   });
   zed::core::ModelBackedContextController context_controller(
-      model, runtime_config.context_model);
+      model, runtime_config.context_model, runtime_config.context_system_prompt,
+      runtime_config.context_max_output_tokens);
   zed::core::ApproximateTokenEstimator estimator;
   zed::core::BasicContextManager context(estimator, &context_controller);
   zed::session::JsonlSessionStore session(runtime_config.session_path);
@@ -173,7 +177,7 @@ int main(int argc, char *argv[]) {
   }
   const auto session_ready_at = std::chrono::steady_clock::now();
 
-  zed::core::ToolRegistry tools;
+  zed::core::ToolRegistry tools(runtime_config.agent_tools);
   if (!tools.register_tool(std::make_unique<zed::tools::ReadFileTool>(
           runtime_config.workspace, runtime_config.tool_limits)))
     return 3;
@@ -201,8 +205,15 @@ int main(int argc, char *argv[]) {
   if (!tools.register_tool(std::make_unique<zed::tools::ClangdTool>(
           runtime_config.workspace, clangd, runtime_config.tool_limits)))
     return 3;
+  zed::tools::SubagentToolConfig subagent_config;
+  subagent_config.max_concurrency =
+      runtime_config.subagent_execution.max_concurrency;
+  subagent_config.max_aggregate_output_bytes =
+      runtime_config.subagent_execution.max_aggregate_output_bytes;
+  subagent_config.total_timeout = std::chrono::milliseconds(
+      runtime_config.subagent_execution.total_timeout_ms);
   auto subagent_tool = std::make_unique<zed::tools::SubagentTool>(
-      subagent_runner, built_in_agents);
+      subagent_runner, built_in_agents, subagent_config);
   auto *subagent_tool_handle = subagent_tool.get();
   if (!tools.register_tool(std::move(subagent_tool)))
     return 3;
@@ -235,8 +246,12 @@ int main(int argc, char *argv[]) {
 
   zed::core::AgentLoopConfig loop_config;
   loop_config.model_request.model = active_model;
-  loop_config.model_request.temperature = 0.0;
+  loop_config.model_request.temperature = runtime_config.main_temperature;
   loop_config.model_request.reasoning_effort = active_reasoning_effort;
+  if (runtime_config.main_max_output_tokens > 0) {
+    loop_config.model_request.max_output_tokens =
+        runtime_config.main_max_output_tokens;
+  }
   loop_config.context_limits = active_context_limits;
   loop_config.max_turns = runtime_config.max_turns;
   loop_config.system_prompt = runtime_config.system_prompt;
@@ -322,7 +337,7 @@ int main(int argc, char *argv[]) {
     return 3;
   if (!register_command({
           "agents",
-          "List built-in subagents and availability.",
+          "List configured subagents and availability.",
           [&](std::string_view arguments) {
             if (!trim_ascii_whitespace(arguments).empty()) {
               return zed::core::Result<std::string>::failure({
@@ -332,6 +347,28 @@ int main(int argc, char *argv[]) {
             }
             return zed::core::Result<std::string>::success(
                 zed::subagents::format_agents(built_in_agents));
+          },
+      }))
+    return 3;
+  if (!register_command({
+          "configure-web",
+          "Open the local Agent, Sub Agent, Skill, and context manager.",
+          [&](std::string_view arguments) {
+            if (!trim_ascii_whitespace(arguments).empty()) {
+              return zed::core::Result<std::string>::failure({
+                  zed::core::ErrorCode::invalid_argument,
+                  "usage: /configure-web",
+              });
+            }
+            const auto opened = configure_web.open(
+                model_catalog, true, tools.registered_definitions());
+            if (!opened)
+              return zed::core::Result<std::string>::failure(opened.error());
+            return zed::core::Result<std::string>::success(
+                "configuration: " + opened.value() +
+                "\nsettings are stored in " +
+                runtime_config.workspace_config_path.string() +
+                " and take effect after restarting zeda\n");
           },
       }))
     return 3;
@@ -393,8 +430,8 @@ int main(int argc, char *argv[]) {
                   }
                   model_catalog = discovered.value();
                   model.set_models(model_catalog);
-                  built_in_agents =
-                      zed::subagents::built_in_agents(model_catalog);
+                  built_in_agents = zed::subagents::configured_agents(
+                      model_catalog, runtime_config.subagents);
                   subagent_tool_handle->set_agents(built_in_agents);
 
                   std::string result = "refreshed OpenCode Go models: " +

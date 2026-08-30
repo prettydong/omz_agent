@@ -214,6 +214,35 @@ void test_registry_and_read_only_tools(const std::filesystem::path &root) {
   assert(zed::subagents::format_agents(unavailable).find("unavailable") !=
          std::string::npos);
 
+  zed::subagents::ExplorerAgentConfig custom;
+  custom.enabled = false;
+  custom.model.model = "gpt-5.6-luna";
+  custom.reasoning_effort = zed::core::ReasoningEffort::high;
+  custom.max_turns = 7;
+  custom.max_output_tokens = 2'048;
+  custom.system_prompt = "Custom Explorer role.";
+  const auto configured = zed::subagents::built_in_agents(
+      zed::providers::default_opencode_go_models(), custom);
+  assert(!configured[0].available);
+  assert(configured[0].model.model == "gpt-5.6-luna");
+  assert(configured[0].reasoning_effort == zed::core::ReasoningEffort::high);
+  assert(configured[0].max_turns == 7);
+  assert(configured[0].max_output_tokens == 2'048);
+  assert(configured[0].system_prompt == "Custom Explorer role.");
+  assert(configured[0].unavailable_reason.find("disabled") !=
+         std::string::npos);
+
+  zed::subagents::ExplorerAgentConfig reviewer;
+  reviewer.name = "reviewer";
+  reviewer.description = "Review workspace evidence.";
+  reviewer.system_prompt = "Custom reviewer prompt.";
+  const auto multiple = zed::subagents::configured_agents(
+      zed::providers::default_opencode_go_models(),
+      {zed::subagents::ExplorerAgentConfig{}, reviewer});
+  assert(multiple.size() == 2);
+  assert(multiple[1].name == "reviewer");
+  assert(multiple[1].system_prompt == "Custom reviewer prompt.");
+
   zed::app::RuntimeConfig runtime;
   runtime.workspace = root;
   runtime.clangd_path = "clangd-does-not-run-in-this-test";
@@ -288,6 +317,24 @@ void test_tool_orchestration() {
 
   FakeRunner single_runner;
   zed::tools::SubagentTool single(single_runner, agents);
+  auto reviewer_config = zed::subagents::ExplorerAgentConfig{};
+  reviewer_config.name = "reviewer";
+  reviewer_config.description = "Review evidence.";
+  reviewer_config.system_prompt = "Reviewer prompt.";
+  const auto multiple_agents = zed::subagents::configured_agents(
+      zed::providers::default_opencode_go_models(),
+      {zed::subagents::ExplorerAgentConfig{}, reviewer_config});
+  zed::tools::SubagentTool dynamic(single_runner, multiple_agents);
+  assert(dynamic.definition().input_schema_json.find("reviewer") !=
+         std::string::npos);
+  const auto reviewer_result =
+      dynamic.execute(subagent_call({{"purpose", "Review one area"},
+                                     {"agent", "reviewer"},
+                                     {"task", "review-one"}}),
+                      {});
+  assert(reviewer_result);
+  assert(reviewer_result.value().content.find("result:review-one") !=
+         std::string::npos);
   std::vector<std::string> progress;
   const auto single_result = single.execute_with_progress(
       subagent_call({{"purpose", "Inspect one area"},

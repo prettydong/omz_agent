@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace zed::app {
+
+inline constexpr std::string_view kConfigureWebPage =
+    R"ZEDA_WEB(@ZEDA_CONFIGURE_WEB_PAGE@)ZEDA_WEB";
+
+} // namespace zed::app

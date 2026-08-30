@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -690,6 +691,28 @@ int main() {
   assert(review_skill->description == "Review code carefully.");
   assert(skills.prompt_context("code-review").find("Check correctness") !=
          std::string::npos);
+
+  auto managed_skills = zed::skills::load_workspace_skills(root);
+  assert(managed_skills);
+  assert(managed_skills.value().size() == 1);
+  assert(managed_skills.value()[0].id == "review");
+  managed_skills.value()[0].enabled = false;
+  managed_skills.value().push_back({"domain", "domain", "Domain rules",
+                                    "Read the domain model first.", true});
+  assert(zed::skills::save_workspace_skills(root, managed_skills.value()));
+  assert(std::filesystem::is_regular_file(root / ".zed" / "skills-disabled" /
+                                          "review" / "SKILL.md"));
+  assert(std::filesystem::is_regular_file(root / ".zed" / "skills" / "domain" /
+                                          "SKILL.md"));
+  managed_skills.value().erase(managed_skills.value().begin() + 1);
+  assert(zed::skills::save_workspace_skills(root, managed_skills.value()));
+  std::error_code archive_error;
+  const auto archive_count = static_cast<std::size_t>(
+      std::distance(std::filesystem::directory_iterator(
+                        root / ".zed" / "skill-archive", archive_error),
+                    std::filesystem::directory_iterator()));
+  assert(!archive_error);
+  assert(archive_count == 1);
 
   zed::extensions::ExtensionRegistry extensions;
   assert(extensions.register_command({

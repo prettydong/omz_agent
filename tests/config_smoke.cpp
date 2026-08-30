@@ -4,6 +4,9 @@
 #include <fstream>
 #include <string>
 #include <unistd.h>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "zed/app/config.hpp"
 
@@ -30,6 +33,8 @@ int main() {
 
   clear_environment("OPENCODE_GO_API_KEY");
   set_environment("ZED_OPENCODE_AUTH_PATH", auth_path.c_str());
+  clear_environment("ZED_MODEL");
+  clear_environment("ZED_CONTEXT_MODEL");
   clear_environment("ZED_REASONING_EFFORT");
   clear_environment("ZED_OPENCODE_PATH");
   clear_environment("ZED_SESSION_PATH");
@@ -48,6 +53,13 @@ int main() {
   const auto stored_key = zed::app::load_runtime_config();
   assert(stored_key);
   assert(stored_key.value().opencode_go_api_key == "stored-key");
+
+  set_environment("ZED_MODEL", "gpt-5.6-luna");
+  const auto inherited_context_model = zed::app::load_runtime_config();
+  assert(inherited_context_model);
+  assert(inherited_context_model.value().main_model.model == "gpt-5.6-luna");
+  assert(inherited_context_model.value().context_model.model == "gpt-5.6-luna");
+  clear_environment("ZED_MODEL");
 
   {
     std::ofstream auth_file(auth_path);
@@ -86,13 +98,25 @@ int main() {
   assert(valid.value().session_path.extension() == ".jsonl");
   assert(valid.value().system_prompt_path ==
          valid.value().workspace / ".zed" / "zed_system_propmt.md");
+  assert(valid.value().explorer_system_prompt_path ==
+         valid.value().workspace / ".zed" / "explorer_system_prompt.md");
+  assert(valid.value().context_system_prompt_path ==
+         valid.value().workspace / ".zed" / "context_system_prompt.md");
   assert(std::filesystem::is_regular_file(valid.value().system_prompt_path));
+  assert(std::filesystem::is_regular_file(
+      valid.value().explorer_system_prompt_path));
+  assert(std::filesystem::is_regular_file(
+      valid.value().context_system_prompt_path));
   assert(valid.value().system_prompt.find("你的名字是 zeda") !=
          std::string::npos);
   assert(valid.value().system_prompt.find("通用 agent") != std::string::npos);
   assert(valid.value().system_prompt.find("Zed Huang 独立开发") !=
          std::string::npos);
   assert(valid.value().system_prompt.find("默认使用中文") != std::string::npos);
+  assert(valid.value().explorer.system_prompt.find("strictly read-only") !=
+         std::string::npos);
+  assert(valid.value().context_system_prompt.find("selected_ids") !=
+         std::string::npos);
 
   const auto system_prompt_path =
       config_workspace / ".zed" / "zed_system_propmt.md";
@@ -105,6 +129,20 @@ int main() {
   assert(custom_prompt);
   assert(custom_prompt.value().system_prompt ==
          "You are a custom agent.\n请保持冷静。\n");
+
+  auto prompts = zed::app::load_workspace_prompts(config_workspace);
+  assert(prompts);
+  prompts.value().explorer = "Custom Explorer prompt.";
+  prompts.value().context = "Custom context prompt.";
+  assert(zed::app::save_workspace_prompts(config_workspace, prompts.value()));
+  const auto custom_all_prompts = zed::app::load_runtime_config();
+  assert(custom_all_prompts);
+  assert(custom_all_prompts.value().explorer.system_prompt ==
+         "Custom Explorer prompt.");
+  assert(custom_all_prompts.value().context_system_prompt ==
+         "Custom context prompt.");
+  prompts.value().context = " \n";
+  assert(!zed::app::validate_workspace_prompts(prompts.value()));
 
   {
     std::ofstream prompt_file(system_prompt_path, std::ios::binary);
@@ -132,6 +170,78 @@ int main() {
   assert(worker_config);
   assert(worker_config.value().system_prompt.empty());
   assert(!std::filesystem::exists(system_prompt_path));
+
+  const auto workspace_settings =
+      zed::app::load_workspace_config(config_workspace);
+  assert(workspace_settings);
+  zed::app::WorkspacePrompts management_prompts{"Default Agent prompt.",
+                                                "Custom Explorer prompt.",
+                                                "Custom context prompt."};
+  auto management = zed::app::load_agent_management(
+      config_workspace, workspace_settings.value(), management_prompts);
+  assert(management);
+  assert(management.value().version == zed::app::kAgentManagementVersion);
+  assert(management.value().agents.front().automatic_context_compaction);
+  assert(management.value().agents.front().tools ==
+         std::vector<std::string>{"*"});
+  auto business = management.value().agents.front();
+  business.id = "business";
+  business.name = "Business Agent";
+  business.config.max_turns = 19;
+  business.automatic_context_compaction = false;
+  business.compaction_trigger_tokens = 1'200;
+  business.tools = {"read", "grep"};
+  business.system_prompt = "Business system prompt.";
+  management.value().agents.push_back(business);
+  management.value().active_agent = "business";
+  zed::subagents::ExplorerAgentConfig reviewer;
+  reviewer.name = "reviewer";
+  reviewer.description = "Review evidence.";
+  reviewer.system_prompt = "Reviewer system prompt.";
+  management.value().subagents.push_back(reviewer);
+  assert(zed::app::validate_agent_management(management.value()));
+  const auto encoded_management =
+      zed::app::serialize_agent_management_config(management.value());
+  const auto decoded_management =
+      zed::app::parse_agent_management_config(encoded_management);
+  assert(decoded_management);
+  assert(decoded_management.value().version ==
+         zed::app::kAgentManagementVersion);
+  assert(decoded_management.value().agents.size() == 2);
+  assert(!decoded_management.value().agents[1].automatic_context_compaction);
+  assert(decoded_management.value().agents[1].compaction_trigger_tokens ==
+         1'200);
+  assert(decoded_management.value().agents[1].tools ==
+         (std::vector<std::string>{"read", "grep"}));
+  assert(decoded_management.value().subagents.front().name == "reviewer");
+  auto legacy_management_json = nlohmann::json::parse(encoded_management);
+  legacy_management_json["version"] = 1;
+  for (auto &agent : legacy_management_json["agents"]) {
+    agent.erase("automatic_context_compaction");
+    agent.erase("compaction_trigger_tokens");
+    agent.erase("tools");
+  }
+  const auto migrated_management =
+      zed::app::parse_agent_management_config(legacy_management_json.dump());
+  assert(migrated_management);
+  assert(migrated_management.value().version ==
+         zed::app::kAgentManagementVersion);
+  assert(migrated_management.value().agents.front().tools ==
+         std::vector<std::string>{"*"});
+  assert(zed::app::save_agent_management(config_workspace, management.value()));
+  const auto managed_runtime = zed::app::load_runtime_config();
+  assert(managed_runtime);
+  assert(managed_runtime.value().max_turns == 19);
+  assert(!managed_runtime.value().context_limits.automatic_compaction);
+  assert(managed_runtime.value().agent_tools ==
+         (std::vector<std::string>{"read", "grep"}));
+  assert(managed_runtime.value().system_prompt == "Business system prompt.");
+  assert(managed_runtime.value().subagents.size() == 2);
+  assert(managed_runtime.value().subagents[1].name == "reviewer");
+
+  auto invalid_permissions = management.value();
+  invalid_permissions.agents.front().tools = {"*", "read"};
+  assert(!zed::app::validate_agent_management(invalid_permissions));
 
   set_environment("ZED_REASONING_EFFORT", "medium");
   const auto medium_reasoning = zed::app::load_runtime_config();
@@ -208,6 +318,8 @@ int main() {
   clear_environment("ZED_MAX_CONTEXT_TOKENS");
   clear_environment("ZED_RESERVED_OUTPUT_TOKENS");
   clear_environment("ZED_CONTEXT_TRIGGER_TOKENS");
+  clear_environment("ZED_MODEL");
+  clear_environment("ZED_CONTEXT_MODEL");
   clear_environment("ZED_REASONING_EFFORT");
   clear_environment("ZED_SESSION_PATH");
   clear_environment("ZED_WORKSPACE");

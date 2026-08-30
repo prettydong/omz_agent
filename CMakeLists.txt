@@ -45,17 +45,35 @@ configure_file(
     generated/zed/core/default_system_prompt.hpp
     @ONLY)
 
+set(ZEDA_CONFIGURE_WEB_PAGE_FILE
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/configure_web.html)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${ZEDA_CONFIGURE_WEB_PAGE_FILE})
+file(READ ${ZEDA_CONFIGURE_WEB_PAGE_FILE} ZEDA_CONFIGURE_WEB_PAGE)
+string(FIND "${ZEDA_CONFIGURE_WEB_PAGE}" ")ZEDA_WEB\""
+    ZEDA_CONFIGURE_WEB_DELIMITER)
+if (NOT ZEDA_CONFIGURE_WEB_DELIMITER EQUAL -1)
+    message(FATAL_ERROR
+        "The configure web page contains the reserved raw-string delimiter")
+endif()
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/zed/app)
+configure_file(
+    cmake/configure_web_page.hpp.in
+    generated/zed/app/configure_web_page.hpp
+    @ONLY)
+
+set(HTTPLIB_INSTALL OFF CACHE BOOL
+    "Do not install zeda's private cpp-httplib dependency" FORCE)
+FetchContent_Declare(
+    cpp_httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG v0.51.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(cpp_httplib)
+
 if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
     find_package(SQLite3 REQUIRED)
-    set(HTTPLIB_INSTALL OFF CACHE BOOL "Do not install zeda's private cpp-httplib dependency" FORCE)
-    FetchContent_Declare(
-        cpp_httplib
-        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-        GIT_TAG v0.51.0
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_MakeAvailable(cpp_httplib)
-
     FetchContent_Declare(
         marked_web
         URL https://registry.npmjs.org/marked/-/marked-18.0.11.tgz
@@ -79,6 +97,7 @@ endif()
 
 add_library(zed_core
     src/app/config.cpp
+    src/app/configure_web.cpp
     src/core/agent_loop.cpp
     src/core/context.cpp
     src/core/model_context_controller.cpp
@@ -98,10 +117,10 @@ add_library(zed_core
     src/subagents/subagent_runner.cpp
     src/subagents/worker.cpp
     src/subagents/worker_protocol.cpp
-    src/tools/basic_tools.cpp
-    src/tools/clangd_tool.cpp
-    src/tools/multi_bash_tool.cpp
-    src/tools/subagent_tool.cpp
+    src/ui/tools/basic_tools.cpp
+    src/ui/tools/clangd_tool.cpp
+    src/ui/tools/multi_bash_tool.cpp
+    src/ui/tools/subagent_tool.cpp
 )
 
 target_include_directories(zed_core
@@ -114,6 +133,7 @@ target_link_libraries(zed_core
     PUBLIC
         nlohmann_json::nlohmann_json
     PRIVATE
+        httplib::httplib
         ${CMAKE_DL_LIBS}
 )
 
@@ -257,6 +277,13 @@ if (BUILD_TESTING)
     target_link_libraries(zed_config_smoke PRIVATE zed_core)
     add_test(NAME zed_config_smoke COMMAND zed_config_smoke)
 
+    add_executable(zed_configure_web_smoke tests/configure_web_smoke.cpp)
+    target_link_libraries(zed_configure_web_smoke PRIVATE
+        zed_core
+        httplib::httplib
+    )
+    add_test(NAME zed_configure_web_smoke COMMAND zed_configure_web_smoke)
+
     add_executable(zed_markdown_smoke tests/markdown_smoke.cpp)
     target_link_libraries(zed_markdown_smoke PRIVATE zed_ui)
     add_test(NAME zed_markdown_smoke COMMAND zed_markdown_smoke)
@@ -316,6 +343,7 @@ if (BUILD_TESTING)
         zed_core_smoke
         zed_modules_smoke
         zed_config_smoke
+        zed_configure_web_smoke
         zed_markdown_smoke
         zed_quick_bash_smoke
         zed_session_smoke
@@ -344,6 +372,14 @@ if (BUILD_TESTING)
     add_test(NAME zeda_version COMMAND zeda --version)
     set_tests_properties(zeda_version PROPERTIES
         PASS_REGULAR_EXPRESSION "zeda ${PROJECT_VERSION}"
+    )
+
+    add_test(
+        NAME zeda_configure_web_command_smoke
+        COMMAND ${CMAKE_COMMAND}
+            "-DZEDA_EXECUTABLE=$<TARGET_FILE:zeda>"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/configure-web-smoke"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/configure_web_command_smoke.cmake
     )
 
     add_test(

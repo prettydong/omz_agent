@@ -1,0 +1,1005 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>zeda manager</title>
+  <style>
+    :root{
+      --bg:#e8e8e3;
+      --panel:#f1f1ed;
+      --field:#fdfdfb;
+      --ink:#141414;
+      --muted:#70706a;
+      --faint:#9a9a92;
+      --line:#c8c8c0;
+      --edge:#1b1b1b;
+      --hover:#e2e2da;
+      --sel:#1b1b1b;
+      --sel-ink:#f6f6f2;
+      --danger:#8b1b13;
+      --ok:#1d5b24;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0}
+    body{
+      background:var(--bg);color:var(--ink);overflow:hidden;
+      font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+      -webkit-font-smoothing:antialiased;
+    }
+
+    /* ---------- controls ---------- */
+    button,input,select,textarea{
+      border:1px solid var(--line);border-radius:0;background:var(--field);
+      color:var(--ink);font:inherit;outline:none
+    }
+    button{height:24px;padding:0 9px;cursor:pointer;white-space:nowrap}
+    button:hover:not(:disabled){background:var(--hover);border-color:var(--muted)}
+    button:active:not(:disabled){background:var(--sel);color:var(--sel-ink);border-color:var(--sel)}
+    button.primary{background:var(--sel);color:var(--sel-ink);border-color:var(--sel)}
+    button.primary:hover:not(:disabled){background:#333;border-color:#333}
+    button.danger{background:var(--danger);border-color:var(--danger);color:#fff}
+    button.danger:hover:not(:disabled){background:#a3221a;border-color:#a3221a;color:#fff}
+    button:disabled{color:var(--faint);border-color:var(--line);background:transparent;cursor:default}
+    button.primary:disabled{background:#c6c6be;border-color:#c6c6be;color:#f2f2ee}
+    :focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+    input,select{height:24px;padding:1px 6px;min-width:0}
+    textarea{padding:7px 8px;resize:none;line-height:1.5}
+    input:focus,select:focus,textarea:focus{border-color:var(--ink);box-shadow:inset 0 0 0 1px var(--ink)}
+    input:disabled,select:disabled,textarea:disabled{background:#ecece6;color:var(--muted)}
+    input[type=checkbox]{width:13px;height:13px;margin:0;accent-color:var(--ink);cursor:pointer;flex:none}
+    input.bad,textarea.bad{border-color:var(--danger);box-shadow:inset 0 0 0 1px var(--danger)}
+    ::placeholder{color:var(--faint)}
+
+    /* ---------- header ---------- */
+    header{
+      height:32px;display:flex;align-items:center;gap:10px;padding:0 8px;
+      background:var(--panel);border-bottom:1px solid var(--edge)
+    }
+    .brand{letter-spacing:.14em;font-weight:700;flex:none}
+    .brand em{font-style:normal;color:var(--faint);font-weight:400;margin-left:6px;letter-spacing:.1em}
+    #workspace{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+    .spacer{margin-left:auto}
+    #status{white-space:nowrap;color:var(--muted);max-width:40vw;overflow:hidden;text-overflow:ellipsis}
+    #status.error{color:var(--danger)}
+    #status.ok{color:var(--ok)}
+    #dirty{width:6px;height:6px;background:var(--danger);border-radius:50%;display:none;flex:none}
+    body.dirty #dirty{display:block}
+
+    /* ---------- shell ---------- */
+    main{height:calc(100vh - 32px);display:grid;grid-template-columns:236px minmax(0,1fr)}
+    .nav{
+      display:flex;flex-direction:column;min-width:0;min-height:0;
+      background:var(--panel);border-right:1px solid var(--edge)
+    }
+    .nav-search{padding:5px 6px;border-bottom:1px solid var(--line);display:flex}
+    .nav-search input{width:100%}
+    .nav-scroll{overflow:auto;flex:1;min-height:0;padding-bottom:8px}
+
+    .group-head{
+      position:sticky;top:0;z-index:1;height:24px;display:flex;align-items:center;gap:6px;
+      padding:0 4px 0 7px;background:var(--panel);border-bottom:1px solid var(--line);
+      font-weight:700;text-transform:uppercase;letter-spacing:.07em;font-size:10px
+    }
+    .group+.group .group-head{border-top:1px solid var(--line)}
+    .group-head .count{color:var(--faint);font-weight:400;letter-spacing:0}
+    .group-head button{
+      margin-left:auto;height:18px;width:20px;padding:0;line-height:1;font-size:13px;
+      border-color:transparent;background:transparent
+    }
+    .group-head button:hover{background:var(--sel);color:var(--sel-ink);border-color:var(--sel)}
+    .items{padding:3px 4px;display:flex;flex-direction:column;gap:1px}
+    .item{
+      display:flex;align-items:center;gap:6px;width:100%;height:auto;min-height:23px;
+      padding:2px 6px;text-align:left;border-color:transparent;background:transparent
+    }
+    .item:hover{background:var(--hover);border-color:transparent}
+    .item.active,.item.active:hover{background:var(--sel);border-color:var(--sel);color:var(--sel-ink)}
+    .item-main{flex:1;min-width:0;display:flex;flex-direction:column}
+    .item-id,.item-meta{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .item-meta{font-size:10px;color:var(--muted);line-height:1.3}
+    .item.active .item-meta{color:#b5b5ac}
+    .tag{
+      flex:none;font-size:9px;letter-spacing:.06em;padding:0 3px;line-height:13px;
+      border:1px solid currentColor;color:var(--muted)
+    }
+    .item.active .tag{color:#cfcfc6}
+    .tag.on{color:var(--ok)}
+    .item.active .tag.on{color:#9ccf9f}
+    .nav-empty{padding:4px 8px;color:var(--faint);font-size:10px}
+
+    /* ---------- editor ---------- */
+    .editor{min-width:0;min-height:0;overflow:hidden;background:var(--panel)}
+    .editor-section{height:100%;display:none;flex-direction:column;min-height:0}
+    .editor-section.active{display:flex}
+    .editor-head{
+      height:32px;display:flex;align-items:center;gap:8px;padding:0 8px;flex:none;
+      border-bottom:1px solid var(--edge)
+    }
+    .editor-head strong{text-transform:uppercase;letter-spacing:.08em}
+    .editor-head .actions{margin-left:auto;display:flex;gap:5px}
+
+    .form{flex:1;min-height:0;overflow:auto;padding:2px 10px 10px;display:flex;flex-direction:column}
+    .sec{
+      display:flex;align-items:center;gap:8px;margin:10px 0 5px;padding-bottom:3px;
+      border-bottom:1px solid var(--line);color:var(--muted);
+      font-size:10px;letter-spacing:.1em;text-transform:uppercase
+    }
+    .sec .aux{margin-left:auto;display:flex;align-items:center;gap:9px;letter-spacing:0;text-transform:none}
+    .sec .aux input[type=search]{height:20px;width:126px;font-size:11px}
+    .sec label{display:flex;align-items:center;gap:5px;cursor:pointer;letter-spacing:0;text-transform:none}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:4px 16px}
+    .f{display:grid;grid-template-columns:88px minmax(0,1fr);align-items:center;gap:8px;min-height:24px}
+    .f>label:first-child{color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+    .f>input,.f>select{width:100%}
+    .f.wide{grid-column:1/-1}
+    .inline{display:flex;align-items:center;gap:6px;min-width:0}
+    .inline>input[type=number]{flex:1;min-width:60px}
+    .inline label{display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap}
+    .compaction input[type=number]{flex:none;width:120px}
+    .unit{color:var(--faint);white-space:nowrap}
+    .readout{color:var(--muted)}
+    .readout b{font-weight:700;color:var(--ink)}
+    .readout.bad b{color:var(--danger)}
+
+    .tools{border:1px solid var(--line);background:var(--field);max-height:216px;overflow:auto}
+    .tool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(212px,1fr))}
+    .tool{display:flex;align-items:flex-start;gap:7px;padding:4px 7px;cursor:pointer;min-width:0}
+    .tool:hover{background:var(--hover)}
+    .tool:has(input:checked){background:#e6e6de}
+    .tool.off{display:none}
+    .tool>span{min-width:0}
+    .tool b{display:block;font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .tool small{display:block;color:var(--muted);font-size:10px;line-height:1.3;margin-top:1px}
+    .tools-empty{padding:6px 8px;color:var(--faint)}
+
+    .prompt{flex:1;display:flex;flex-direction:column;min-height:190px}
+    .prompt textarea{flex:1;width:100%}
+
+    .empty{flex:1;display:flex;align-items:center;justify-content:center;color:var(--faint);letter-spacing:.12em}
+
+    @media(max-width:880px){
+      body{overflow:auto}
+      main{height:auto;min-height:calc(100vh - 32px);grid-template-columns:1fr}
+      .nav{border-right:0;border-bottom:1px solid var(--edge)}
+      .nav-scroll{max-height:36vh}
+      .editor{min-height:72vh}
+      #workspace{display:none}
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="brand">ZEDA<em>MANAGER</em></span>
+    <span id="workspace"></span>
+    <span class="spacer"></span>
+    <span id="dirty"></span>
+    <span id="status">加载中</span>
+    <button id="save" class="primary" type="button" title="⌘S / Ctrl+S" disabled>保存</button>
+  </header>
+
+  <main>
+    <aside class="nav">
+      <div class="nav-search">
+        <input id="filter" type="search" placeholder="过滤资源  ⌘K" aria-label="过滤资源" autocomplete="off">
+      </div>
+      <div class="nav-scroll">
+        <section class="group">
+          <div class="group-head">Agents<span class="count" id="agent-count"></span>
+            <button id="add-agent" type="button" title="新增 Agent" aria-label="新增 Agent">+</button>
+          </div>
+          <div id="agent-list" class="items"></div>
+        </section>
+        <section class="group">
+          <div class="group-head">Sub Agents<span class="count" id="subagent-count"></span>
+            <button id="add-subagent" type="button" title="新增 Sub Agent" aria-label="新增 Sub Agent">+</button>
+          </div>
+          <div id="subagent-list" class="items"></div>
+        </section>
+        <section class="group">
+          <div class="group-head">Skills<span class="count" id="skill-count"></span>
+            <button id="add-skill" type="button" title="新增 Skill" aria-label="新增 Skill">+</button>
+          </div>
+          <div id="skill-list" class="items"></div>
+        </section>
+        <section class="group">
+          <div class="group-head">Workspace</div>
+          <div id="workspace-list" class="items"></div>
+        </section>
+      </div>
+    </aside>
+
+    <div class="editor">
+      <section id="agent-editor" class="editor-section">
+        <div class="editor-head">
+          <strong>Agent</strong><span id="agent-state" class="tag on" hidden>ACTIVE</span>
+          <div class="actions">
+            <button id="activate-agent" type="button">设为 Active</button>
+            <button id="remove-agent" type="button">移除</button>
+          </div>
+        </div>
+        <div class="form">
+          <div class="sec">基本</div>
+          <div class="grid">
+            <div class="f"><label for="agent-id">ID</label><input id="agent-id" autocomplete="off" spellcheck="false"></div>
+            <div class="f"><label for="agent-name">名称</label><input id="agent-name" autocomplete="off"></div>
+            <div class="f wide"><label for="agent-description">说明</label><input id="agent-description" autocomplete="off"></div>
+          </div>
+
+          <div class="sec">模型</div>
+          <div class="grid">
+            <div class="f"><label for="agent-model">模型</label><select id="agent-model"></select></div>
+            <div class="f"><label for="agent-reasoning">Reasoning</label><select id="agent-reasoning"></select></div>
+            <div class="f"><label for="agent-turns">最大回合</label><input id="agent-turns" type="number" min="1" max="512"></div>
+            <div class="f"><label for="agent-output">输出 Token</label><input id="agent-output" type="number" min="0"></div>
+            <div class="f"><label for="agent-temperature">Temperature</label><input id="agent-temperature" type="number" min="0" max="2" step="0.1"></div>
+          </div>
+
+          <div class="sec">上下文压缩</div>
+          <div class="inline compaction">
+            <label><input id="agent-compaction" type="checkbox">自动压缩</label>
+            <input id="agent-trigger" type="number" min="0" aria-label="压缩触发 Token">
+            <span class="unit">触发 Token（0 = 窗口 80%）</span>
+          </div>
+
+          <div class="sec">工具权限
+            <span class="aux">
+              <span class="readout"><b id="agent-tool-count">0/0</b></span>
+              <input id="agent-tool-filter" type="search" placeholder="过滤工具" aria-label="过滤工具" autocomplete="off">
+              <label><input id="agent-tools-all" type="checkbox">全部已注册</label>
+            </span>
+          </div>
+          <div class="tools"><div id="agent-tool-list" class="tool-grid"></div></div>
+
+          <div class="sec">System Prompt<span class="aux"><span class="readout" id="agent-prompt-size"></span></span></div>
+          <div class="prompt"><textarea id="agent-prompt" aria-label="Agent System Prompt" spellcheck="false"></textarea></div>
+        </div>
+      </section>
+
+      <section id="subagent-editor" class="editor-section">
+        <div class="editor-head">
+          <strong>Sub Agent</strong><span id="subagent-state" class="tag" hidden>BUILTIN</span>
+          <div class="actions"><button id="remove-subagent" type="button">移除</button></div>
+        </div>
+        <div class="form">
+          <div class="sec">基本</div>
+          <div class="grid">
+            <div class="f"><label for="subagent-id">ID</label><input id="subagent-id" autocomplete="off" spellcheck="false"></div>
+            <div class="f"><label for="subagent-enabled">状态</label><span class="inline"><label><input id="subagent-enabled" type="checkbox">启用</label></span></div>
+            <div class="f wide"><label for="subagent-description">说明</label><input id="subagent-description" autocomplete="off"></div>
+          </div>
+
+          <div class="sec">模型</div>
+          <div class="grid">
+            <div class="f"><label for="subagent-model">模型</label><select id="subagent-model"></select></div>
+            <div class="f"><label for="subagent-reasoning">Reasoning</label><select id="subagent-reasoning"></select></div>
+            <div class="f"><label for="subagent-turns">最大回合</label><input id="subagent-turns" type="number" min="1" max="512"></div>
+            <div class="f"><label for="subagent-output">输出 Token</label><input id="subagent-output" type="number" min="1"></div>
+          </div>
+
+          <div class="sec">System Prompt<span class="aux"><span class="readout" id="subagent-prompt-size"></span></span></div>
+          <div class="prompt"><textarea id="subagent-prompt" aria-label="Sub Agent System Prompt" spellcheck="false"></textarea></div>
+        </div>
+      </section>
+
+      <section id="skill-editor" class="editor-section">
+        <div class="editor-head">
+          <strong>Skill</strong><span id="skill-state" class="tag" hidden>OFF</span>
+          <div class="actions"><button id="remove-skill" type="button">移除</button></div>
+        </div>
+        <div class="form">
+          <div class="sec">基本</div>
+          <div class="grid">
+            <div class="f"><label for="skill-id">ID</label><input id="skill-id" autocomplete="off" spellcheck="false"></div>
+            <div class="f"><label for="skill-name">名称</label><input id="skill-name" autocomplete="off"></div>
+            <div class="f wide"><label for="skill-description">说明</label><input id="skill-description" autocomplete="off"></div>
+            <div class="f"><label for="skill-enabled">状态</label><span class="inline"><label><input id="skill-enabled" type="checkbox">启用</label></span></div>
+          </div>
+
+          <div class="sec">Instructions<span class="aux"><span class="readout" id="skill-instructions-size"></span></span></div>
+          <div class="prompt"><textarea id="skill-instructions" aria-label="Skill Instructions" spellcheck="false"></textarea></div>
+        </div>
+      </section>
+
+      <section id="context-editor" class="editor-section">
+        <div class="editor-head"><strong>Context Engine</strong></div>
+        <div class="form">
+          <div class="sec">预算</div>
+          <div class="grid">
+            <div class="f"><label for="context-model">模型</label><select id="context-model"></select></div>
+            <div class="f"><label for="context-max">窗口 Token</label><input id="context-max" type="number" min="1"></div>
+            <div class="f"><label for="context-reserved">预留输出</label><input id="context-reserved" type="number" min="0"></div>
+            <div class="f"><label for="context-output">摘要输出</label><input id="context-output" type="number" min="1"></div>
+            <div class="f wide"><label>可用预算</label><span class="readout" id="context-budget"></span></div>
+          </div>
+
+          <div class="sec">System Prompt<span class="aux"><span class="readout" id="context-prompt-size"></span></span></div>
+          <div class="prompt"><textarea id="context-prompt" aria-label="Context System Prompt" spellcheck="false"></textarea></div>
+        </div>
+      </section>
+
+      <section id="runtime-editor" class="editor-section">
+        <div class="editor-head"><strong>Sub Agent Runtime</strong></div>
+        <div class="form">
+          <div class="sec">执行限制</div>
+          <div class="grid">
+            <div class="f"><label for="subagent-concurrency">最大并发</label><input id="subagent-concurrency" type="number" min="1" max="8"></div>
+            <div class="f"><label for="subagent-timeout">总超时</label><span class="inline"><input id="subagent-timeout" type="number" min="1"><span class="unit">ms</span></span></div>
+            <div class="f"><label for="subagent-aggregate">聚合上限</label><span class="inline"><input id="subagent-aggregate" type="number" min="1"><span class="unit">bytes</span></span></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="empty-editor" class="editor-section active"><div class="empty">SELECT RESOURCE</div></section>
+    </div>
+  </main>
+
+  <script>
+    (() => {
+      const $ = id => document.getElementById(id);
+      const clone = value => JSON.parse(JSON.stringify(value));
+      const token = new URLSearchParams(location.search).get('token') || '';
+      const identifier = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+      const integer = id => Number.parseInt($(id).value, 10);
+      const decimal = id => Number.parseFloat($(id).value);
+
+      let models = [], availableTools = [], baseConfig;
+      let agents = [], subagents = [], skills = [], activeAgent = '';
+      let managementVersion = 2;
+      let selection = { type: 'agent', index: 0 };
+      let filter = '';
+      let dirty = false;
+      let loaded = false;
+
+      /* ---------------- transport ---------------- */
+      async function api(path, options = {}) {
+        const headers = new Headers(options.headers || {});
+        headers.set('X-Zeda-Config-Token', token);
+        const response = await fetch(path, { ...options, headers });
+        const body = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+        if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+        return body;
+      }
+
+      /* ---------------- status ---------------- */
+      function setStatus(text, tone = '') {
+        $('status').textContent = text;
+        $('status').className = tone;
+      }
+      function markDirty() {
+        if (!loaded || dirty) return;
+        dirty = true;
+        document.body.classList.add('dirty');
+        setStatus('未保存的修改');
+      }
+      function clearDirty() {
+        dirty = false;
+        document.body.classList.remove('dirty');
+      }
+
+      /* ---------------- option lists ---------------- */
+      function fillModels(select, selected) {
+        select.textContent = '';
+        for (const model of models) {
+          const option = document.createElement('option');
+          option.value = model.id;
+          option.textContent = `${model.name} // ${model.id}`;
+          select.append(option);
+        }
+        if (!models.some(model => model.id === selected)) {
+          const option = document.createElement('option');
+          option.value = selected;
+          option.textContent = `${selected} // UNAVAILABLE`;
+          select.prepend(option);
+        }
+        select.value = selected;
+      }
+      function fillReasoning(modelSelect, reasoningSelect, selected) {
+        const model = models.find(item => item.id === modelSelect.value);
+        const values = ['auto', ...(model?.reasoning || [])];
+        if (!values.includes(selected)) values.push(selected);
+        reasoningSelect.textContent = '';
+        for (const value of [...new Set(values)]) {
+          const option = document.createElement('option');
+          option.value = value;
+          option.textContent = value;
+          reasoningSelect.append(option);
+        }
+        reasoningSelect.value = selected;
+      }
+
+      /* ---------------- capture ---------------- */
+      function captureSelected() {
+        if (selection.type === 'agent') captureAgent();
+        else if (selection.type === 'subagent') captureSubagent();
+        else if (selection.type === 'skill') captureSkill();
+      }
+      function captureAgent() {
+        const item = agents[selection.index];
+        if (!item) return;
+        const old = item.id;
+        item.id = $('agent-id').value.trim();
+        item.name = $('agent-name').value.trim();
+        item.description = $('agent-description').value.trim();
+        item.model = $('agent-model').value;
+        item.reasoning = $('agent-reasoning').value;
+        item.max_turns = integer('agent-turns');
+        item.max_output_tokens = integer('agent-output');
+        item.temperature = decimal('agent-temperature');
+        item.automatic_context_compaction = $('agent-compaction').checked;
+        item.compaction_trigger_tokens = integer('agent-trigger');
+        item.tools = $('agent-tools-all').checked
+          ? ['*']
+          : [...document.querySelectorAll('#agent-tool-list input:checked')].map(input => input.value);
+        item.system_prompt = $('agent-prompt').value;
+        if (activeAgent === old) activeAgent = item.id;
+      }
+      function captureSubagent() {
+        const item = subagents[selection.index];
+        if (!item) return;
+        item.id = $('subagent-id').value.trim();
+        item.description = $('subagent-description').value.trim();
+        item.enabled = $('subagent-enabled').checked;
+        item.model = $('subagent-model').value;
+        item.reasoning = $('subagent-reasoning').value;
+        item.max_turns = integer('subagent-turns');
+        item.max_output_tokens = integer('subagent-output');
+        item.system_prompt = $('subagent-prompt').value;
+      }
+      function captureSkill() {
+        const item = skills[selection.index];
+        if (!item) return;
+        item.id = $('skill-id').value.trim();
+        item.name = $('skill-name').value.trim();
+        item.description = $('skill-description').value.trim();
+        item.enabled = $('skill-enabled').checked;
+        item.instructions = $('skill-instructions').value;
+      }
+
+      /* ---------------- navigation ---------------- */
+      function matches(item) {
+        if (!filter) return true;
+        return [item.id, item.name, item.description]
+          .filter(Boolean)
+          .some(text => String(text).toLowerCase().includes(filter));
+      }
+      function navItem({ id, meta, tag, tagOn, active, onSelect }) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = active ? 'item active' : 'item';
+        button.title = meta ? `${id} — ${meta}` : id;
+        const main = document.createElement('span');
+        main.className = 'item-main';
+        const title = document.createElement('span');
+        title.className = 'item-id';
+        title.textContent = id;
+        main.append(title);
+        if (meta) {
+          const detail = document.createElement('span');
+          detail.className = 'item-meta';
+          detail.textContent = meta;
+          main.append(detail);
+        }
+        button.append(main);
+        if (tag) {
+          const badge = document.createElement('span');
+          badge.className = tagOn ? 'tag on' : 'tag';
+          badge.textContent = tag;
+          button.append(badge);
+        }
+        button.addEventListener('click', onSelect);
+        return button;
+      }
+      function renderList(container, counter, items, type, describe) {
+        container.textContent = '';
+        let shown = 0;
+        items.forEach((item, index) => {
+          if (!matches(item)) return;
+          shown++;
+          container.append(navItem({
+            ...describe(item),
+            active: selection.type === type && selection.index === index,
+            onSelect: () => select(type, index),
+          }));
+        });
+        if (shown === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'nav-empty';
+          empty.textContent = items.length ? '无匹配项' : '空';
+          container.append(empty);
+        }
+        counter.textContent = filter ? `${shown}/${items.length}` : String(items.length);
+      }
+      const workspaceEntries = [
+        { type: 'context', id: 'Context Engine', meta: '窗口预算与摘要模型' },
+        { type: 'runtime', id: 'Sub Agent Runtime', meta: '并发 / 超时 / 输出上限' },
+      ];
+      function renderWorkspaceList() {
+        const container = $('workspace-list');
+        container.textContent = '';
+        for (const entry of workspaceEntries) {
+          container.append(navItem({
+            id: entry.id,
+            meta: entry.meta,
+            active: selection.type === entry.type,
+            onSelect: () => select(entry.type, 0),
+          }));
+        }
+      }
+
+      /* ---------------- editors ---------------- */
+      function applyToolFilter() {
+        const query = $('agent-tool-filter').value.trim().toLowerCase();
+        for (const tool of document.querySelectorAll('#agent-tool-list .tool')) {
+          tool.classList.toggle('off', query !== '' && !tool.dataset.search.includes(query));
+        }
+      }
+      function syncToolCount() {
+        const inputs = [...document.querySelectorAll('#agent-tool-list input')];
+        const selected = $('agent-tools-all').checked
+          ? inputs.length
+          : inputs.filter(input => input.checked).length;
+        $('agent-tool-count').textContent = `${selected}/${inputs.length}`;
+      }
+      function renderToolPermissions(item) {
+        const all = item.tools.includes('*');
+        const known = new Map(availableTools.map(tool => [tool.id, tool.description]));
+        for (const id of item.tools) if (id !== '*' && !known.has(id)) known.set(id, 'configured tool');
+        $('agent-tools-all').checked = all;
+        const container = $('agent-tool-list');
+        container.textContent = '';
+        for (const [id, description] of known) {
+          const label = document.createElement('label');
+          label.className = 'tool';
+          label.dataset.search = `${id} ${description}`.toLowerCase();
+          const input = document.createElement('input');
+          input.type = 'checkbox';
+          input.value = id;
+          input.checked = all || item.tools.includes(id);
+          input.disabled = all;
+          const text = document.createElement('span');
+          const name = document.createElement('b');
+          name.textContent = id;
+          const detail = document.createElement('small');
+          detail.textContent = description;
+          text.append(name, detail);
+          label.append(input, text);
+          container.append(label);
+        }
+        if (known.size === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'tools-empty';
+          empty.textContent = '当前没有已注册的 Tool';
+          container.append(empty);
+        }
+        applyToolFilter();
+        syncToolCount();
+      }
+      function renderAgent() {
+        const item = agents[selection.index];
+        if (!item) return;
+        $('agent-id').value = item.id;
+        $('agent-name').value = item.name;
+        $('agent-description').value = item.description;
+        fillModels($('agent-model'), item.model);
+        fillReasoning($('agent-model'), $('agent-reasoning'), item.reasoning);
+        $('agent-turns').value = item.max_turns;
+        $('agent-output').value = item.max_output_tokens;
+        $('agent-temperature').value = item.temperature;
+        $('agent-compaction').checked = item.automatic_context_compaction;
+        $('agent-trigger').value = item.compaction_trigger_tokens;
+        $('agent-trigger').disabled = !item.automatic_context_compaction;
+        $('agent-prompt').value = item.system_prompt;
+        $('agent-state').hidden = item.id !== activeAgent;
+        $('activate-agent').disabled = item.id === activeAgent;
+        $('remove-agent').disabled = agents.length === 1;
+        renderToolPermissions(item);
+      }
+      function renderSubagent() {
+        const item = subagents[selection.index];
+        if (!item) return;
+        $('subagent-id').value = item.id;
+        $('subagent-id').disabled = item.builtin;
+        $('subagent-description').value = item.description;
+        $('subagent-description').disabled = item.builtin;
+        $('subagent-enabled').checked = item.enabled;
+        fillModels($('subagent-model'), item.model);
+        fillReasoning($('subagent-model'), $('subagent-reasoning'), item.reasoning);
+        $('subagent-turns').value = item.max_turns;
+        $('subagent-output').value = item.max_output_tokens;
+        $('subagent-prompt').value = item.system_prompt;
+        $('subagent-state').hidden = !item.builtin;
+        $('remove-subagent').disabled = item.builtin;
+      }
+      function renderSkill() {
+        const item = skills[selection.index];
+        if (!item) return;
+        $('skill-id').value = item.id;
+        $('skill-name').value = item.name;
+        $('skill-description').value = item.description;
+        $('skill-enabled').checked = item.enabled;
+        $('skill-instructions').value = item.instructions;
+        $('skill-state').hidden = item.enabled;
+      }
+
+      const sizeTargets = [
+        ['agent-prompt', 'agent-prompt-size'],
+        ['subagent-prompt', 'subagent-prompt-size'],
+        ['skill-instructions', 'skill-instructions-size'],
+        ['context-prompt', 'context-prompt-size'],
+      ];
+      function syncSizes() {
+        for (const [source, target] of sizeTargets) {
+          const value = $(source).value;
+          $(target).textContent = `${value.length} 字符 · ${value ? value.split('\n').length : 0} 行`;
+        }
+      }
+      function syncBudget() {
+        const available = integer('context-max') - integer('context-reserved');
+        const readout = $('context-budget');
+        readout.classList.toggle('bad', !(Number.isFinite(available) && available > 0));
+        readout.textContent = '';
+        const value = document.createElement('b');
+        value.textContent = Number.isFinite(available) ? available.toLocaleString('en-US') : '—';
+        readout.append(value, document.createTextNode(' tokens'));
+      }
+
+      function render() {
+        renderList($('agent-list'), $('agent-count'), agents, 'agent', item => ({
+          id: item.id,
+          meta: item.name || item.description,
+          tag: item.id === activeAgent ? 'ACTIVE' : '',
+          tagOn: true,
+        }));
+        renderList($('subagent-list'), $('subagent-count'), subagents, 'subagent', item => ({
+          id: item.id,
+          meta: item.description,
+          tag: item.enabled ? '' : 'OFF',
+        }));
+        renderList($('skill-list'), $('skill-count'), skills, 'skill', item => ({
+          id: item.id,
+          meta: item.name || item.description,
+          tag: item.enabled ? '' : 'OFF',
+        }));
+        renderWorkspaceList();
+        resetConfirms();
+        for (const section of document.querySelectorAll('.editor-section')) section.classList.remove('active');
+        const section = $(selection.type + '-editor');
+        (section || $('empty-editor')).classList.add('active');
+        if (selection.type === 'agent') renderAgent();
+        else if (selection.type === 'subagent') renderSubagent();
+        else if (selection.type === 'skill') renderSkill();
+        syncSizes();
+        syncBudget();
+      }
+      function select(type, index) {
+        captureSelected();
+        selection = { type, index };
+        render();
+      }
+      function focusNew(id) {
+        const field = $(id);
+        field.focus();
+        field.select();
+      }
+
+      /* ---------------- destructive actions ---------------- */
+      const confirmResets = [];
+      function confirmable(id, action) {
+        const button = $(id);
+        const label = button.textContent;
+        let armed = false;
+        let timer = 0;
+        const reset = () => {
+          armed = false;
+          window.clearTimeout(timer);
+          button.textContent = label;
+          button.classList.remove('danger');
+        };
+        confirmResets.push(reset);
+        button.addEventListener('click', () => {
+          if (armed) {
+            reset();
+            action();
+            return;
+          }
+          armed = true;
+          button.textContent = '确认移除';
+          button.classList.add('danger');
+          timer = window.setTimeout(reset, 2800);
+        });
+      }
+      function resetConfirms() {
+        for (const reset of confirmResets) reset();
+      }
+
+      /* ---------------- mutations ---------------- */
+      const nextId = (prefix, items) => {
+        let index = 1;
+        while (items.some(item => item.id === `${prefix}-${index}`)) index++;
+        return `${prefix}-${index}`;
+      };
+      $('add-agent').addEventListener('click', () => {
+        captureSelected();
+        const source = agents[selection.type === 'agent' ? selection.index : 0] || agents[0];
+        agents.push({ ...clone(source), id: nextId('agent', agents), name: 'New Agent', description: '' });
+        selection = { type: 'agent', index: agents.length - 1 };
+        markDirty();
+        render();
+        focusNew('agent-id');
+      });
+      $('add-subagent').addEventListener('click', () => {
+        captureSelected();
+        const source = subagents[0];
+        subagents.push({ ...clone(source), id: nextId('subagent', subagents), description: '', builtin: false });
+        selection = { type: 'subagent', index: subagents.length - 1 };
+        markDirty();
+        render();
+        focusNew('subagent-id');
+      });
+      $('add-skill').addEventListener('click', () => {
+        captureSelected();
+        skills.push({
+          id: nextId('skill', skills),
+          name: 'New Skill',
+          description: '',
+          instructions: '# Instructions\n',
+          enabled: true,
+        });
+        selection = { type: 'skill', index: skills.length - 1 };
+        markDirty();
+        render();
+        focusNew('skill-id');
+      });
+      $('activate-agent').addEventListener('click', () => {
+        captureAgent();
+        activeAgent = agents[selection.index].id;
+        markDirty();
+        render();
+      });
+      confirmable('remove-agent', () => {
+        if (agents.length === 1) return;
+        const removed = agents.splice(selection.index, 1)[0];
+        if (removed.id === activeAgent) activeAgent = agents[0].id;
+        selection = { type: 'agent', index: Math.max(0, Math.min(selection.index, agents.length - 1)) };
+        markDirty();
+        render();
+      });
+      confirmable('remove-subagent', () => {
+        if (subagents[selection.index]?.builtin) return;
+        subagents.splice(selection.index, 1);
+        selection = { type: 'subagent', index: Math.max(0, Math.min(selection.index, subagents.length - 1)) };
+        markDirty();
+        render();
+      });
+      confirmable('remove-skill', () => {
+        skills.splice(selection.index, 1);
+        selection = skills.length
+          ? { type: 'skill', index: Math.max(0, Math.min(selection.index, skills.length - 1)) }
+          : { type: 'agent', index: 0 };
+        markDirty();
+        render();
+      });
+
+      /* ---------------- live wiring ---------------- */
+      $('agent-model').addEventListener('change', () => fillReasoning($('agent-model'), $('agent-reasoning'), 'auto'));
+      $('subagent-model').addEventListener('change', () => fillReasoning($('subagent-model'), $('subagent-reasoning'), 'auto'));
+      $('agent-compaction').addEventListener('change', () => {
+        $('agent-trigger').disabled = !$('agent-compaction').checked;
+      });
+      $('agent-tools-all').addEventListener('change', () => {
+        const all = $('agent-tools-all').checked;
+        for (const input of document.querySelectorAll('#agent-tool-list input')) {
+          input.disabled = all;
+          input.checked = all;
+        }
+        syncToolCount();
+      });
+      $('agent-tool-list').addEventListener('change', syncToolCount);
+      $('agent-tool-filter').addEventListener('input', applyToolFilter);
+      $('filter').addEventListener('input', () => {
+        filter = $('filter').value.trim().toLowerCase();
+        render();
+      });
+
+      const transient = new Set(['filter', 'agent-tool-filter']);
+      const idFields = new Set(['agent-id', 'subagent-id', 'skill-id']);
+      document.addEventListener('input', event => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement) || transient.has(target.id)) return;
+        markDirty();
+        if (idFields.has(target.id)) target.classList.toggle('bad', !identifier.test(target.value.trim()));
+        if (target.tagName === 'TEXTAREA') {
+          target.classList.toggle('bad', target.value.trim() === '');
+          syncSizes();
+        }
+        if (target.id === 'context-max' || target.id === 'context-reserved') syncBudget();
+      });
+      document.addEventListener('change', event => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement) || transient.has(target.id)) return;
+        if (target.tagName === 'SELECT' || target.getAttribute('type') === 'checkbox') markDirty();
+      });
+      window.addEventListener('beforeunload', event => {
+        if (!dirty) return;
+        event.preventDefault();
+        event.returnValue = '';
+      });
+      window.addEventListener('keydown', event => {
+        const key = event.key.toLowerCase();
+        if ((event.metaKey || event.ctrlKey) && key === 's') {
+          event.preventDefault();
+          save();
+          return;
+        }
+        if ((event.metaKey || event.ctrlKey) && key === 'k') {
+          event.preventDefault();
+          focusNew('filter');
+          return;
+        }
+        if (event.key === 'Escape') resetConfirms();
+      });
+
+      /* ---------------- validation & save ---------------- */
+      function focusError(message, type, index) {
+        const error = new Error(message);
+        error.focus = { type, index };
+        return error;
+      }
+      function validateIds(items, kind, type) {
+        const seen = new Set();
+        items.forEach((item, index) => {
+          if (!identifier.test(item.id)) {
+            throw focusError(`${kind} ID 只能使用小写字母、数字、-、_`, type, index);
+          }
+          if (seen.has(item.id)) throw focusError(`${kind} ID 重复：${item.id}`, type, index);
+          seen.add(item.id);
+        });
+      }
+      function validateText(items, read, message, type) {
+        const index = items.findIndex(item => read(item).trim() === '');
+        if (index >= 0) throw focusError(message, type, index);
+      }
+      function collect() {
+        captureSelected();
+        validateIds(agents, 'Agent', 'agent');
+        validateIds(subagents, 'Sub Agent', 'subagent');
+        validateIds(skills, 'Skill', 'skill');
+        if (!agents.some(item => item.id === activeAgent)) throw new Error('Active Agent 不存在');
+        if (subagents.filter(item => item.id === 'explorer').length !== 1) throw new Error('Explorer 配置无效');
+        validateText(agents, item => item.system_prompt, 'Agent System Prompt 不能为空', 'agent');
+        validateText(subagents, item => item.system_prompt, 'Sub Agent System Prompt 不能为空', 'subagent');
+        validateText(skills, item => item.instructions, 'Skill Instructions 不能为空', 'skill');
+        if ($('context-prompt').value.trim() === '') {
+          throw focusError('Context System Prompt 不能为空', 'context', 0);
+        }
+
+        const active = agents.find(item => item.id === activeAgent);
+        const explorer = subagents.find(item => item.id === 'explorer');
+        const config = clone(baseConfig);
+        config.agent = {
+          model: active.model,
+          reasoning: active.reasoning,
+          max_turns: active.max_turns,
+          max_output_tokens: active.max_output_tokens,
+          temperature: active.temperature,
+        };
+        config.subagents.explorer = {
+          enabled: explorer.enabled,
+          model: explorer.model,
+          reasoning: explorer.reasoning,
+          max_turns: explorer.max_turns,
+          max_output_tokens: explorer.max_output_tokens,
+        };
+        config.subagents.max_concurrency = integer('subagent-concurrency');
+        config.subagents.total_timeout_ms = integer('subagent-timeout');
+        config.subagents.max_aggregate_output_bytes = integer('subagent-aggregate');
+        config.context = {
+          model: $('context-model').value,
+          max_tokens: integer('context-max'),
+          reserved_output_tokens: integer('context-reserved'),
+          compaction_trigger_tokens: active.compaction_trigger_tokens,
+          max_output_tokens: integer('context-output'),
+        };
+        return {
+          config,
+          prompts: {
+            agent: active.system_prompt,
+            explorer: explorer.system_prompt,
+            context: $('context-prompt').value,
+          },
+          management: {
+            version: managementVersion,
+            active_agent: activeAgent,
+            agents: agents.map(({ id, name, description, model, reasoning, max_turns, max_output_tokens,
+              temperature, automatic_context_compaction, compaction_trigger_tokens, tools, system_prompt }) => ({
+              id, name, description, model, reasoning, max_turns, max_output_tokens, temperature,
+              automatic_context_compaction, compaction_trigger_tokens, tools, system_prompt,
+            })),
+            subagents: subagents.filter(item => !item.builtin).map(({ id, description, enabled, model,
+              reasoning, max_turns, max_output_tokens, system_prompt }) => ({
+              id, description, enabled, model, reasoning, max_turns, max_output_tokens, system_prompt,
+            })),
+          },
+          skills: skills.map(({ id, name, description, instructions, enabled }) => ({
+            id, name, description, instructions, enabled,
+          })),
+        };
+      }
+
+      let saving = false;
+      async function save() {
+        if (saving || $('save').disabled) return;
+        saving = true;
+        try {
+          const update = collect();
+          const available = update.config.context.max_tokens - update.config.context.reserved_output_tokens;
+          if (available <= 0 || update.config.context.compaction_trigger_tokens > available) {
+            throw focusError('Active Agent 上下文预算无效', 'context', 0);
+          }
+          $('save').disabled = true;
+          setStatus('保存中…');
+          await api('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(update),
+          });
+          clearDirty();
+          render();
+          setStatus('已保存 · 需要重启生效', 'ok');
+        } catch (error) {
+          if (error.focus) {
+            selection = error.focus;
+            render();
+          }
+          setStatus(error.message, 'error');
+        } finally {
+          saving = false;
+          $('save').disabled = false;
+        }
+      }
+      $('save').addEventListener('click', save);
+
+      /* ---------------- bootstrap ---------------- */
+      api('/api/config').then(payload => {
+        models = payload.models;
+        availableTools = payload.available_tools || [];
+        baseConfig = payload.config;
+        agents = clone(payload.management.agents);
+        managementVersion = payload.management.version;
+        activeAgent = payload.management.active_agent;
+        subagents = [
+          {
+            id: 'explorer',
+            description: 'Read-only workspace exploration and evidence gathering.',
+            enabled: payload.config.subagents.explorer.enabled,
+            model: payload.config.subagents.explorer.model,
+            reasoning: payload.config.subagents.explorer.reasoning,
+            max_turns: payload.config.subagents.explorer.max_turns,
+            max_output_tokens: payload.config.subagents.explorer.max_output_tokens,
+            system_prompt: payload.prompts.explorer,
+            builtin: true,
+          },
+          ...clone(payload.management.subagents).map(item => ({ ...item, builtin: false })),
+        ];
+        skills = clone(payload.skills);
+        $('workspace').textContent = payload.workspace;
+        $('workspace').title = payload.config_path || payload.workspace;
+        $('subagent-concurrency').value = payload.config.subagents.max_concurrency;
+        $('subagent-timeout').value = payload.config.subagents.total_timeout_ms;
+        $('subagent-aggregate').value = payload.config.subagents.max_aggregate_output_bytes;
+        fillModels($('context-model'), payload.config.context.model);
+        $('context-max').value = payload.config.context.max_tokens;
+        $('context-reserved').value = payload.config.context.reserved_output_tokens;
+        $('context-output').value = payload.config.context.max_output_tokens;
+        $('context-prompt').value = payload.prompts.context;
+        selection = { type: 'agent', index: 0 };
+        render();
+        loaded = true;
+        setStatus('就绪');
+        $('save').disabled = false;
+      }).catch(error => setStatus(error.message, 'error'));
+    })();
+  </script>
+</body>
+</html>

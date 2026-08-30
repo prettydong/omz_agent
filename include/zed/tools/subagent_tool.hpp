@@ -42,6 +42,7 @@ private:
   subagents::SubagentRunner &runner_;
   std::vector<subagents::AgentDefinition> agents_;
   SubagentToolConfig config_;
+  core::ToolDefinition definition_;
 };
 
 } // namespace zed::tools

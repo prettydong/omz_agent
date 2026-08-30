@@ -185,7 +185,7 @@ int run_explorer_worker(std::istream &input, std::ostream &output,
       return 0;
     }
     auto models = providers::default_opencode_go_models();
-    const auto agents = built_in_agents(models);
+    const auto agents = configured_agents(models, runtime.value().subagents);
     const auto *agent = find_agent(agents, request.value().agent);
     if (agent == nullptr) {
       write_event(output, {WorkerEventType::failed,
@@ -215,7 +215,7 @@ int run_explorer_worker(std::istream &input, std::ostream &output,
                    {},
                    {},
                    {},
-                   "Explorer fixed model disappeared from the catalog"});
+                   "Explorer configured model disappeared from the catalog"});
       return 0;
     }
 
@@ -253,13 +253,14 @@ int run_explorer_worker(std::istream &input, std::ostream &output,
     config.model_request.model = agent->model;
     config.model_request.temperature = 0.0;
     config.model_request.reasoning_effort = agent->reasoning_effort;
-    config.model_request.max_output_tokens =
-        std::min<std::size_t>(8'192, model_info->max_output_tokens == 0
-                                         ? 8'192
-                                         : model_info->max_output_tokens);
+    config.model_request.max_output_tokens = std::min<std::size_t>(
+        agent->max_output_tokens, model_info->max_output_tokens == 0
+                                      ? agent->max_output_tokens
+                                      : model_info->max_output_tokens);
     config.context_limits =
         model_context_limits(runtime.value().context_limits, *model_info);
-    config.max_turns = 12;
+    config.context_limits.automatic_compaction = true;
+    config.max_turns = agent->max_turns;
     config.system_prompt = agent->system_prompt;
 
     core::ModelUsage usage;

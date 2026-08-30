@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "zed/core/agent_loop.hpp"
+#include "zed/core/model_context_controller.hpp"
 
 namespace {
 
@@ -214,9 +215,71 @@ public:
   }
 };
 
+class ConfiguredContextModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &request,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    assert(request.model.model == "context-fixture");
+    assert(request.messages.front().content == "configured context prompt");
+    assert(request.max_output_tokens == 77);
+    assert(request.temperature == 0.0);
+    assert(request.reasoning_effort == ReasoningEffort::none);
+    return Result<AssistantResponse>::success({
+        R"({"selected_ids":["required"],"summarized_ids":[],"summary":"ok"})",
+        {},
+        FinishReason::stop,
+        {},
+    });
+  }
+};
+
 } // namespace
 
 int main() {
+  ConfiguredContextModel configured_context_model;
+  ModelBackedContextController configured_controller(
+      configured_context_model, {"test", "context-fixture"},
+      "configured context prompt", 77);
+  const auto context_decision = configured_controller.decide(
+      {"task",
+       {{"required",
+         {"message", Role::user, "content", {}, std::nullopt},
+         5,
+         true}},
+       {1'000, 100, 700}},
+      {});
+  assert(context_decision);
+  assert(context_decision.value().selected_ids ==
+         std::vector<MessageId>{"required"});
+
+  ApproximateTokenEstimator compaction_estimator;
+  BasicContextManager compaction_manager(compaction_estimator);
+  const std::vector<Message> compactable_messages{
+      {"context-item", Role::user, std::string(200, 'x'), {}, std::nullopt}};
+  const auto automatic_needed = compaction_manager.needs_compaction(
+      compactable_messages, {100, 10, 10, true});
+  assert(automatic_needed && automatic_needed.value());
+  const auto manual_needed = compaction_manager.needs_compaction(
+      compactable_messages, {100, 10, 10, false});
+  assert(manual_needed && !manual_needed.value());
+  const auto manual_window =
+      compaction_manager.build(compactable_messages, {100, 10, 10, false}, {});
+  assert(manual_window);
+  assert(!manual_window.value().was_compacted);
+
+  ToolRegistry denied_tools({"read"});
+  assert(denied_tools.register_tool(std::make_unique<EchoTool>()));
+  assert(denied_tools.definitions().empty());
+  assert(denied_tools.registered_definitions().size() == 1);
+  assert(!denied_tools.execute(
+      {"denied", "echo", R"({"purpose":"test permission"})"}, {}));
+  ToolRegistry permitted_tools({"echo"});
+  assert(permitted_tools.register_tool(std::make_unique<EchoTool>()));
+  assert(permitted_tools.definitions().size() == 1);
+  assert(permitted_tools.execute(
+      {"allowed", "echo", R"({"purpose":"test permission"})"}, {}));
+
   FakeModel model;
   ToolRegistry tools;
   assert(tools.register_tool(std::make_unique<EchoTool>()));

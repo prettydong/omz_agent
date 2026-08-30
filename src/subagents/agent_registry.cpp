@@ -7,8 +7,6 @@ namespace zed::subagents {
 
 namespace {
 
-constexpr std::string_view kExplorerModel = "muse-spark-1.2-contributor";
-
 constexpr std::string_view kExplorerSystemPrompt =
     "You are zeda's Explorer sub-agent. Investigate the requested question "
     "inside the current workspace and return a concise, evidence-based "
@@ -21,28 +19,51 @@ constexpr std::string_view kExplorerSystemPrompt =
 } // namespace
 
 std::vector<AgentDefinition>
-built_in_agents(const std::vector<providers::OpenCodeGoModelInfo> &models) {
-  const auto *model = providers::find_opencode_go_model(models, kExplorerModel);
-  const bool supports_low =
-      model != nullptr &&
-      providers::supports_reasoning_effort(*model, core::ReasoningEffort::low);
-  AgentDefinition explorer{
-      "explorer",
-      "Read-only workspace exploration and evidence gathering.",
-      {"opencode-go", std::string(kExplorerModel)},
-      core::ReasoningEffort::low,
-      std::string(kExplorerSystemPrompt),
-      {"read", "grep", "find", "ls", "lsp"},
-      model != nullptr && supports_low,
-      {},
-  };
-  if (model == nullptr) {
-    explorer.unavailable_reason =
-        "fixed model is not present in the OpenCode Go catalog";
-  } else if (!supports_low) {
-    explorer.unavailable_reason = "fixed model does not support low reasoning";
+built_in_agents(const std::vector<providers::OpenCodeGoModelInfo> &models,
+                const ExplorerAgentConfig &explorer_config) {
+  return configured_agents(models, {explorer_config});
+}
+
+std::vector<AgentDefinition>
+configured_agents(const std::vector<providers::OpenCodeGoModelInfo> &models,
+                  const std::vector<ExplorerAgentConfig> &agent_configs) {
+  std::vector<AgentDefinition> agents;
+  agents.reserve(agent_configs.size());
+  for (const auto &config : agent_configs) {
+    const auto *model =
+        providers::find_opencode_go_model(models, config.model.model);
+    const bool supports_reasoning =
+        model != nullptr &&
+        providers::supports_reasoning_effort(*model, config.reasoning_effort);
+    AgentDefinition agent{
+        config.name,
+        config.description,
+        config.model,
+        config.reasoning_effort,
+        config.system_prompt.empty() ? std::string(kExplorerSystemPrompt)
+                                     : config.system_prompt,
+        {"read", "grep", "find", "ls", "lsp"},
+        config.max_turns,
+        config.max_output_tokens,
+        config.enabled && model != nullptr && supports_reasoning,
+        {},
+    };
+    if (!config.enabled) {
+      agent.unavailable_reason = "disabled by workspace configuration";
+    } else if (model == nullptr) {
+      agent.unavailable_reason =
+          "configured model is not present in the OpenCode Go catalog";
+    } else if (!supports_reasoning) {
+      agent.unavailable_reason =
+          "configured model does not support the selected reasoning effort";
+    }
+    agents.push_back(std::move(agent));
   }
-  return {std::move(explorer)};
+  return agents;
+}
+
+std::string_view default_explorer_system_prompt() {
+  return kExplorerSystemPrompt;
 }
 
 const AgentDefinition *find_agent(const std::vector<AgentDefinition> &agents,
@@ -54,7 +75,7 @@ const AgentDefinition *find_agent(const std::vector<AgentDefinition> &agents,
 }
 
 std::string format_agents(const std::vector<AgentDefinition> &agents) {
-  std::string result = "built-in agents:\n";
+  std::string result = "configured subagents:\n";
   for (const auto &agent : agents) {
     result += "  " + agent.name + " — " + agent.description + "\n";
     result += "    model: " + agent.model.provider + "/" + agent.model.model +
@@ -67,7 +88,9 @@ std::string format_agents(const std::vector<AgentDefinition> &agents) {
         result += ", ";
       result += agent.tools[index];
     }
-    result += "\n    status: ";
+    result += "\n    limits: " + std::to_string(agent.max_turns) + " turns · " +
+              std::to_string(agent.max_output_tokens) +
+              " output tokens\n    status: ";
     result += agent.available
                   ? "available\n"
                   : "unavailable — " + agent.unavailable_reason + "\n";

@@ -1,6 +1,9 @@
 #include <cassert>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <unistd.h>
 
 #include "zed/app/config.hpp"
 
@@ -15,13 +18,37 @@ void clear_environment(const char *name) { assert(unsetenv(name) == 0); }
 } // namespace
 
 int main() {
+  const auto auth_path =
+      std::filesystem::temp_directory_path() /
+      ("zeda-config-smoke-auth-" + std::to_string(getpid()) + ".json");
+  std::filesystem::remove(auth_path);
+
   clear_environment("OPENCODE_GO_API_KEY");
+  set_environment("ZED_OPENCODE_AUTH_PATH", auth_path.c_str());
   clear_environment("ZED_REASONING_EFFORT");
   clear_environment("ZED_SESSION_PATH");
   clear_environment("ZED_QUICK_BASH");
   clear_environment("ZED_THEME");
+  clear_environment("ZED_CLANGD_PATH");
   const auto missing_key = zed::app::load_runtime_config();
   assert(!missing_key);
+
+  {
+    std::ofstream auth_file(auth_path);
+    assert(auth_file);
+    auth_file << R"({"opencode-go":{"type":"api","key":"stored-key"}})";
+  }
+  const auto stored_key = zed::app::load_runtime_config();
+  assert(stored_key);
+  assert(stored_key.value().opencode_go_api_key == "stored-key");
+
+  {
+    std::ofstream auth_file(auth_path);
+    assert(auth_file);
+    auth_file << "not-json";
+  }
+  const auto malformed_credentials = zed::app::load_runtime_config();
+  assert(!malformed_credentials);
 
   set_environment("OPENCODE_GO_API_KEY", "fixture-key");
   set_environment("ZED_OPENCODE_ENDPOINT", "http://127.0.0.1:9999/responses");
@@ -39,6 +66,7 @@ int main() {
   assert(valid.value().opencode_go_api_key == "fixture-key");
   assert(valid.value().opencode_endpoint == "http://127.0.0.1:9999/responses");
   assert(valid.value().opencode_request_timeout_ms == 2500);
+  assert(valid.value().clangd_path == "clangd");
   assert(valid.value().context_limits.max_context_tokens == 2048);
   assert(valid.value().context_limits.reserved_output_tokens == 256);
   assert(valid.value().context_limits.compaction_trigger_tokens == 1500);
@@ -93,6 +121,7 @@ int main() {
   assert(resumed_session.value().session_path ==
          "/tmp/zed-resumed-session.jsonl");
   clear_environment("ZED_SESSION_PATH");
+  clear_environment("ZED_CLANGD_PATH");
   clear_environment("ZED_QUICK_BASH");
   clear_environment("ZED_THEME");
 
@@ -102,6 +131,7 @@ int main() {
   assert(!invalid_budget);
 
   clear_environment("OPENCODE_GO_API_KEY");
+  clear_environment("ZED_OPENCODE_AUTH_PATH");
   clear_environment("ZED_OPENCODE_ENDPOINT");
   clear_environment("ZED_REQUEST_TIMEOUT_MS");
   clear_environment("ZED_MAX_CONTEXT_TOKENS");
@@ -109,5 +139,6 @@ int main() {
   clear_environment("ZED_CONTEXT_TRIGGER_TOKENS");
   clear_environment("ZED_REASONING_EFFORT");
   clear_environment("ZED_SESSION_PATH");
+  std::filesystem::remove(auth_path);
   return 0;
 }

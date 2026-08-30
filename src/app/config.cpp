@@ -1,10 +1,12 @@
 #include "zed/app/config.hpp"
 
-#include <atomic>
+#include "zed/session/session_catalog.hpp"
+
 #include <charconv>
-#include <chrono>
 #include <cstdlib>
-#include <unistd.h>
+#include <fstream>
+
+#include <nlohmann/json.hpp>
 
 namespace zed::app {
 
@@ -13,6 +15,75 @@ namespace {
 std::string environment_or(const char *name, std::string fallback = {}) {
   const char *value = std::getenv(name);
   return value == nullptr ? std::move(fallback) : std::string(value);
+}
+
+std::filesystem::path opencode_auth_path() {
+  const std::string configured = environment_or("ZED_OPENCODE_AUTH_PATH");
+  if (!configured.empty())
+    return configured;
+
+  const std::string data_home = environment_or("XDG_DATA_HOME");
+  if (!data_home.empty())
+    return std::filesystem::path(data_home) / "opencode" / "auth.json";
+
+  const std::string home = environment_or("HOME");
+  if (!home.empty())
+    return std::filesystem::path(home) / ".local" / "share" / "opencode" /
+           "auth.json";
+
+  return {};
+}
+
+core::Result<std::string> load_opencode_go_api_key() {
+  const std::string environment_key = environment_or("OPENCODE_GO_API_KEY");
+  if (!environment_key.empty())
+    return core::Result<std::string>::success(environment_key);
+
+  const std::filesystem::path auth_path = opencode_auth_path();
+  if (auth_path.empty()) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "OPENCODE_GO_API_KEY is not set and the OpenCode credential path "
+        "cannot be resolved",
+    });
+  }
+
+  std::ifstream input(auth_path);
+  if (!input) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "OPENCODE_GO_API_KEY is not set and the OpenCode Go credential "
+        "cannot be read from " +
+            auth_path.string(),
+    });
+  }
+
+  const nlohmann::json credentials =
+      nlohmann::json::parse(input, nullptr, false);
+  if (credentials.is_discarded() || !credentials.is_object()) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "cannot parse OpenCode credentials from " + auth_path.string(),
+    });
+  }
+
+  const auto provider = credentials.find("opencode-go");
+  if (provider == credentials.end() || !provider->is_object()) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "OpenCode Go credential is missing from " + auth_path.string(),
+    });
+  }
+
+  const auto key = provider->find("key");
+  if (key == provider->end() || !key->is_string() || key->empty()) {
+    return core::Result<std::string>::failure({
+        core::ErrorCode::invalid_argument,
+        "OpenCode Go credential has no API key in " + auth_path.string(),
+    });
+  }
+
+  return core::Result<std::string>::success(key->get<std::string>());
 }
 
 core::Result<std::size_t> size_environment(const char *name,
@@ -64,37 +135,32 @@ core::Result<bool> boolean_environment(const char *name, bool fallback) {
   });
 }
 
-std::filesystem::path new_session_path(const std::filesystem::path &workspace) {
-  static std::atomic_uint64_t sequence{0};
-  const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::system_clock::now().time_since_epoch());
-  const std::string filename = "session-" + std::to_string(now.count()) + "-" +
-                               std::to_string(getpid()) + "-" +
-                               std::to_string(++sequence) + ".jsonl";
-  return workspace / ".zed" / "sessions" / filename;
-}
-
 } // namespace
 
 core::Result<RuntimeConfig> load_runtime_config() {
   RuntimeConfig config;
-  config.opencode_go_api_key = environment_or("OPENCODE_GO_API_KEY");
-  if (config.opencode_go_api_key.empty()) {
-    return core::Result<RuntimeConfig>::failure({
-        core::ErrorCode::invalid_argument,
-        "OPENCODE_GO_API_KEY is not set",
-    });
-  }
+  const auto api_key = load_opencode_go_api_key();
+  if (!api_key)
+    return core::Result<RuntimeConfig>::failure(api_key.error());
+  config.opencode_go_api_key = api_key.value();
 
   config.opencode_endpoint = environment_or(
       "ZED_OPENCODE_ENDPOINT", "https://opencode.ai/zen/go/v1/responses");
+  config.clangd_path = environment_or("ZED_CLANGD_PATH", "clangd");
+  if (config.clangd_path.empty()) {
+    return core::Result<RuntimeConfig>::failure({
+        core::ErrorCode::invalid_argument,
+        "ZED_CLANGD_PATH cannot be empty",
+    });
+  }
 
   config.workspace =
       environment_or("ZED_WORKSPACE", std::filesystem::current_path().string());
   config.workspace = std::filesystem::weakly_canonical(config.workspace);
   const auto configured_session = environment_or("ZED_SESSION_PATH");
   config.session_path = configured_session.empty()
-                            ? new_session_path(config.workspace)
+                            ? zed::session::new_session_path(
+                                  config.workspace / ".zed" / "sessions")
                             : std::filesystem::path(configured_session);
 
   const std::string model =

@@ -26,8 +26,10 @@
 #include "zed/extensions/extension_registry.hpp"
 #include "zed/providers/opencode_go_model.hpp"
 #include "zed/session/jsonl_session_store.hpp"
+#include "zed/session/session_catalog.hpp"
 #include "zed/skills/skill_registry.hpp"
 #include "zed/tools/basic_tools.hpp"
+#include "zed/tools/multi_bash_tool.hpp"
 #include "zed/ui/terminal.hpp"
 
 namespace {
@@ -126,6 +128,25 @@ public:
   bool called{false};
 };
 
+class InvalidUtf8Tool final : public Tool {
+public:
+  [[nodiscard]] const ToolDefinition &definition() const override {
+    static const ToolDefinition definition{
+        "invalid_utf8",
+        "Return invalid UTF-8 for boundary testing.",
+        R"({"type":"object","properties":{}})",
+    };
+    return definition;
+  }
+
+  Result<ToolResult> execute(const ToolCall &call, CancellationToken) override {
+    std::string content = "before";
+    content.push_back(static_cast<char>(0xFF));
+    content += "after";
+    return Result<ToolResult>::success({call.id, std::move(content), false});
+  }
+};
+
 } // namespace
 
 int main() {
@@ -135,26 +156,210 @@ int main() {
   std::filesystem::remove_all(root, cleanup_error);
   std::filesystem::create_directories(root);
 
+  const auto metadata = [&](const std::filesystem::path &path,
+                            std::string title = {}) {
+    const auto id = path.stem().string();
+    return zed::session::SessionMetadata{
+        id,
+        title.empty() ? id : std::move(title),
+        root.string(),
+        "test-provider",
+        "test-model",
+    };
+  };
+
   zed::session::JsonlSessionStore session(root / "session.jsonl");
-  const Message original{
-      "user-1",     Role::user,
-      "你好，zed",  {call("call-1", "echo", R"({"text":"hello"})")},
+  assert(session.initialize(metadata(session.path(), "Primary session")));
+  const Message original_user{
+      "user-1", Role::user, "你好，zed", {}, std::nullopt};
+  const Message original_assistant{
+      "assistant-1",
+      Role::assistant,
+      {},
+      {call("call-1", "echo", R"({"text":"hello"})")},
       std::nullopt,
   };
-  assert(session.append(original));
+  const Message original_tool{"tool-1", Role::tool, "hello", {}, "call-1"};
+  const Message original_final{
+      "assistant-2", Role::assistant, "done", {}, std::nullopt};
+  assert(session.begin_turn("turn-1", original_user));
+  assert(session.append(original_assistant));
+  assert(session.append(original_tool));
+  assert(session.append(original_final));
+  assert(session.finish_turn("turn-1", SessionTurnOutcome::completed));
   const auto loaded = session.load();
   assert(loaded);
-  assert(loaded.value().size() == 1);
-  assert(loaded.value()[0].content == original.content);
-  assert(loaded.value()[0].tool_calls[0].arguments_json ==
-         original.tool_calls[0].arguments_json);
+  assert(loaded.value().size() == 4);
+  assert(loaded.value()[0].content == original_user.content);
+  assert(loaded.value()[1].tool_calls[0].arguments_json ==
+         original_assistant.tool_calls[0].arguments_json);
+  const auto initial_inspection = session.inspect();
+  assert(initial_inspection);
+  assert(initial_inspection.value().metadata.title == "Primary session");
+  assert(initial_inspection.value().turn_count == 1);
+  assert(initial_inspection.value().message_count == 4);
+  assert(!initial_inspection.value().has_interrupted_turn);
+
+  const auto invalid_utf8_session_path = root / "invalid-utf8.jsonl";
+  zed::session::JsonlSessionStore invalid_utf8_session(
+      invalid_utf8_session_path);
+  assert(invalid_utf8_session.initialize(metadata(invalid_utf8_session_path)));
+  std::string invalid_utf8_content = "invalid";
+  invalid_utf8_content.push_back(static_cast<char>(0xFF));
+  const auto rejected_invalid_utf8 = invalid_utf8_session.begin_turn(
+      "invalid-utf8-turn",
+      {"invalid-utf8", Role::user, invalid_utf8_content, {}, std::nullopt});
+  assert(!rejected_invalid_utf8);
+  assert(rejected_invalid_utf8.error().code == ErrorCode::session_error);
+  assert(rejected_invalid_utf8.error().message.find("serialize") !=
+         std::string::npos);
+  const auto invalid_utf8_history = invalid_utf8_session.load();
+  assert(invalid_utf8_history);
+  assert(invalid_utf8_history.value().empty());
+
+  const auto interrupted_session_path = root / "interrupted.jsonl";
+  zed::session::JsonlSessionStore interrupted_session(interrupted_session_path);
+  assert(interrupted_session.initialize(metadata(interrupted_session_path)));
+  assert(interrupted_session.begin_turn(
+      "interrupted-turn",
+      {"interrupted-user", Role::user, "run tool", {}, std::nullopt}));
+  assert(interrupted_session.append({
+      "interrupted-assistant",
+      Role::assistant,
+      {},
+      {call("interrupted-call", "echo", R"({"text":"hello"})")},
+      std::nullopt,
+  }));
   {
-    std::ofstream partial(session.path(), std::ios::app);
-    partial << R"({"version":1,"type":"message")";
+    std::ofstream partial(interrupted_session.path(), std::ios::app);
+    partial << R"({"version":2,"type":"message")";
   }
-  const auto recovered = session.load();
+  const auto interrupted_inspection = interrupted_session.inspect();
+  assert(interrupted_inspection);
+  assert(interrupted_inspection.value().has_interrupted_turn);
+  assert(interrupted_inspection.value().unresolved_tool_calls == 1);
+  const auto recovered = interrupted_session.recover_interrupted_turn();
   assert(recovered);
-  assert(recovered.value().size() == 1);
+  assert(recovered.value().recovered);
+  assert(recovered.value().turn_id == "interrupted-turn");
+  assert(recovered.value().synthesized_tool_results == 1);
+  const auto recovered_history = interrupted_session.load();
+  assert(recovered_history);
+  assert(recovered_history.value().size() == 3);
+  assert(recovered_history.value()[2].role == Role::tool);
+  assert(recovered_history.value()[2].is_error);
+  assert(recovered_history.value()[2].content.find("may or may not") !=
+         std::string::npos);
+
+  const auto unfinished_session_path = root / "unfinished.jsonl";
+  zed::session::JsonlSessionStore unfinished_session(unfinished_session_path);
+  assert(unfinished_session.initialize(metadata(unfinished_session_path)));
+  assert(unfinished_session.begin_turn(
+      "unfinished-turn",
+      {"unfinished-user", Role::user, "no response yet", {}, std::nullopt}));
+  const auto rejected_completion = unfinished_session.finish_turn(
+      "unfinished-turn", SessionTurnOutcome::completed);
+  assert(!rejected_completion);
+  assert(rejected_completion.error().message.find("terminal assistant") !=
+         std::string::npos);
+  const auto recovered_unfinished =
+      unfinished_session.recover_interrupted_turn();
+  assert(recovered_unfinished);
+  assert(recovered_unfinished.value().recovered);
+  const auto unfinished_history = unfinished_session.load();
+  assert(unfinished_history);
+  assert(unfinished_history.value().size() == 1);
+
+  const auto strict_v1_path = root / "strict-v1.jsonl";
+  {
+    std::ofstream strict_v1(strict_v1_path);
+    strict_v1 << R"({"version":1,"type":"message","id":"old"})" << '\n';
+  }
+  zed::session::JsonlSessionStore strict_v1(strict_v1_path);
+  const auto rejected_v1 = strict_v1.load();
+  assert(!rejected_v1);
+  assert(rejected_v1.error().message.find("Session v2") != std::string::npos ||
+         rejected_v1.error().message.find("version") != std::string::npos);
+
+  const auto sessions_root = root / "sessions";
+  const auto older_path = sessions_root / "session-older.jsonl";
+  const auto newer_path = sessions_root / "session-newer.jsonl";
+  {
+    zed::session::JsonlSessionStore older_session(older_path);
+    zed::session::JsonlSessionStore newer_session(newer_path);
+    assert(older_session.initialize(metadata(older_path, "Older")));
+    assert(newer_session.initialize(metadata(newer_path, "Newer")));
+    assert(older_session.begin_turn(
+        "older-turn",
+        {"older-user", Role::user, "older request", {}, std::nullopt}));
+    assert(older_session.finish_turn("older-turn", SessionTurnOutcome::failed,
+                                     "fixture failure"));
+    assert(newer_session.begin_turn(
+        "newer-turn",
+        {"newer-user", Role::user, "newer request", {}, std::nullopt}));
+    assert(newer_session.append(
+        {"newer-assistant", Role::assistant, "done", {}, std::nullopt}));
+    assert(
+        newer_session.finish_turn("newer-turn", SessionTurnOutcome::completed));
+  }
+  const auto catalog_time = std::filesystem::file_time_type::clock::now();
+  std::filesystem::last_write_time(older_path,
+                                   catalog_time - std::chrono::hours(1));
+  std::filesystem::last_write_time(newer_path, catalog_time);
+  const auto saved_sessions = zed::session::list_sessions(sessions_root);
+  assert(saved_sessions);
+  assert(saved_sessions.value().size() == 2);
+  assert(saved_sessions.value()[0].name == "session-newer");
+  assert(saved_sessions.value()[0].title == "Newer");
+  assert(saved_sessions.value()[0].turn_count == 1);
+  const auto selected_session =
+      zed::session::find_session(sessions_root, "session-older");
+  assert(selected_session);
+  assert(selected_session.value().path == older_path);
+  assert(zed::session::find_session(sessions_root, "Newer"));
+  assert(zed::session::find_session(sessions_root, "session-newer.jsonl"));
+  assert(!zed::session::find_session(sessions_root, "../session.jsonl"));
+
+  const auto switched = session.switch_to(selected_session.value().path);
+  assert(switched);
+  const auto switched_history = session.load();
+  assert(switched_history);
+  assert(switched_history.value().size() == 1);
+  assert(switched_history.value()[0].content == "older request");
+  assert(session.set_title("Renamed older"));
+  const auto renamed_info = session.inspect();
+  assert(renamed_info);
+  assert(renamed_info.value().metadata.title == "Renamed older");
+
+  const auto fork_path = zed::session::new_session_path(sessions_root);
+  assert(session.fork_to(fork_path, "Forked session"));
+  zed::session::JsonlSessionStore forked_session(fork_path);
+  const auto forked_info = forked_session.inspect();
+  assert(forked_info);
+  assert(forked_info.value().metadata.title == "Forked session");
+  assert(forked_info.value().metadata.parent_id ==
+         renamed_info.value().metadata.id);
+  const auto forked_history = forked_session.load();
+  assert(forked_history);
+  assert(forked_history.value().size() == switched_history.value().size());
+
+  const auto invalid_session_path = sessions_root / "invalid.jsonl";
+  {
+    std::ofstream invalid_session(invalid_session_path);
+    invalid_session << "{invalid json}\n";
+  }
+  const auto rejected_invalid = session.switch_to(invalid_session_path);
+  assert(!rejected_invalid);
+  assert(session.path() == selected_session.value().path);
+  const auto catalog_with_invalid = zed::session::list_sessions(sessions_root);
+  assert(catalog_with_invalid);
+  const auto invalid_entry = std::find_if(
+      catalog_with_invalid.value().begin(), catalog_with_invalid.value().end(),
+      [](const zed::session::SessionEntry &entry) {
+        return entry.name == "invalid";
+      });
+  assert(invalid_entry != catalog_with_invalid.value().end());
+  assert(!invalid_entry->valid);
 
   zed::core::ToolRegistry registry;
   require(static_cast<bool>(registry.register_tool(
@@ -163,10 +368,18 @@ int main() {
       std::make_unique<zed::tools::WriteFileTool>(root))));
   require(static_cast<bool>(
       registry.register_tool(std::make_unique<zed::tools::BashTool>(root))));
+  require(static_cast<bool>(registry.register_tool(
+      std::make_unique<zed::tools::MultiBashTool>(root))));
   require(static_cast<bool>(
       registry.register_tool(std::make_unique<zed::tools::GrepTool>(root))));
   require(static_cast<bool>(registry.register_tool(
+      std::make_unique<zed::tools::FindFilesTool>(root))));
+  require(static_cast<bool>(registry.register_tool(
+      std::make_unique<zed::tools::ListDirectoryTool>(root))));
+  require(static_cast<bool>(registry.register_tool(
       std::make_unique<zed::tools::EditFileTool>(root))));
+  require(static_cast<bool>(
+      registry.register_tool(std::make_unique<InvalidUtf8Tool>())));
 
   for (const auto &definition : registry.definitions()) {
     const auto schema = nlohmann::json::parse(definition.input_schema_json);
@@ -199,10 +412,96 @@ int main() {
       {});
   assert(edit);
 
+  std::filesystem::create_directories(root / "tree" / "docs");
+  std::filesystem::create_directories(root / "tree" / "src");
+  {
+    std::ofstream source(root / "tree" / "src" / "main.cpp");
+    source << "int main() {}\n";
+    std::ofstream header(root / "tree" / "src" / "helper.hpp");
+    header << "#pragma once\n";
+    std::ofstream documentation(root / "tree" / "docs" / "guide.md");
+    documentation << "guide\n";
+  }
+  const auto listed =
+      registry.execute(call("ls-1", "ls", R"({"path":"tree"})"), {});
+  assert(listed);
+  assert(listed.value().content == "docs/\nsrc/\n");
+
+  const auto found_source = registry.execute(
+      call("find-1", "find", R"({"pattern":"*.cpp","path":"tree"})"), {});
+  assert(found_source);
+  assert(found_source.value().content == "tree/src/main.cpp\n");
+  const auto found_relative = registry.execute(
+      call("find-2", "find", R"({"pattern":"src/*.hpp","path":"tree"})"), {});
+  assert(found_relative);
+  assert(found_relative.value().content == "tree/src/helper.hpp\n");
+
+  const auto truncated_find = registry.execute(
+      call("find-3", "find",
+           R"({"pattern":"*","path":"tree","max_output_bytes":4})"),
+      {});
+  assert(truncated_find);
+  assert(truncated_find.value().content.find("[results truncated]") !=
+         std::string::npos);
+  const auto truncated_list = registry.execute(
+      call("ls-2", "ls", R"({"path":"tree","max_entries":1})"), {});
+  assert(truncated_list);
+  assert(truncated_list.value().content.find("[results truncated]") !=
+         std::string::npos);
+  const auto invalid_list_limit = registry.execute(
+      call("ls-3", "ls", R"({"path":"tree","max_entries":0})"), {});
+  assert(!invalid_list_limit);
+  assert(invalid_list_limit.error().code == ErrorCode::invalid_argument);
+  const auto list_file =
+      registry.execute(call("ls-4", "ls", R"({"path":"hello.txt"})"), {});
+  assert(!list_file);
+  assert(list_file.error().code == ErrorCode::tool_error);
+  const auto find_traversal = registry.execute(
+      call("find-4", "find", R"({"pattern":"*","path":".."})"), {});
+  assert(!find_traversal);
+
+  zed::core::CancellationSource discovery_cancellation;
+  discovery_cancellation.cancel();
+  const auto cancelled_find = registry.execute(
+      call("find-5", "find", R"({"pattern":"*","path":"tree"})"),
+      discovery_cancellation.token());
+  assert(!cancelled_find);
+  assert(cancelled_find.error().code == ErrorCode::cancelled);
+
   const auto grep = registry.execute(
       call("grep-1", "grep", R"({"pattern":"zed","path":"."})"), {});
   assert(grep);
   assert(grep.value().content.find("hello.txt:1:") != std::string::npos);
+
+  std::filesystem::create_directories(root / ".git");
+  {
+    std::ofstream binary_index(root / ".git" / "index", std::ios::binary);
+    binary_index << "clangd";
+    binary_index.put(static_cast<char>(0xFF));
+  }
+  {
+    std::ofstream binary_file(root / "binary.dat", std::ios::binary);
+    binary_file << "clangd";
+    binary_file.put(static_cast<char>(0xFF));
+  }
+  {
+    std::ofstream source_file(root / "source.txt");
+    source_file << "clangd is configured\n";
+  }
+  const auto safe_grep = registry.execute(
+      call("grep-2", "grep", R"({"pattern":"clangd","path":"."})"), {});
+  assert(safe_grep);
+  assert(safe_grep.value().content.find("source.txt:1:") != std::string::npos);
+  assert(safe_grep.value().content.find(".git") == std::string::npos);
+  assert(safe_grep.value().content.find("binary.dat") == std::string::npos);
+
+  const auto sanitized_tool =
+      registry.execute(call("invalid-utf8-1", "invalid_utf8", R"({})"), {});
+  assert(sanitized_tool);
+  assert(sanitized_tool.value().content.find("before\xEF\xBF\xBD"
+                                             "after") != std::string::npos);
+  assert(sanitized_tool.value().content.find("replaced 1 invalid UTF-8 byte") !=
+         std::string::npos);
 
   const auto empty_write = registry.execute(
       call("write-2", "write", R"({"path":"empty.txt","content":""})"), {});
@@ -224,6 +523,21 @@ int main() {
   const auto symlink_read = registry.execute(
       call("read-3", "read", R"({"path":"outside-link.txt"})"), {});
   assert(!symlink_read);
+
+  const auto find_symlink = registry.execute(
+      call("find-6", "find", R"({"pattern":"outside-link.txt","path":"."})"),
+      {});
+  assert(find_symlink);
+  assert(find_symlink.value().content.empty());
+  const auto find_git = registry.execute(
+      call("find-7", "find", R"({"pattern":"index","path":"."})"), {});
+  assert(find_git);
+  assert(find_git.value().content.empty());
+  const auto listed_symlink =
+      registry.execute(call("ls-5", "ls", R"({"path":"."})"), {});
+  assert(listed_symlink);
+  assert(listed_symlink.value().content.find("outside-link.txt@") !=
+         std::string::npos);
   std::filesystem::remove(outside, cleanup_error);
 
   const auto overwrite_rejected = registry.execute(
@@ -238,6 +552,98 @@ int main() {
   assert(bash);
   assert(bash.value().content == "hello");
   assert(!bash.value().is_error);
+
+  const auto multi_bash = registry.execute(
+      call(
+          "multi-bash-1", "multi_bash",
+          R"({"commands":[{"command":"touch first-ready; while [ ! -f second-ready ]; do sleep 0.01; done; printf first"},{"command":"touch second-ready; while [ ! -f first-ready ]; do sleep 0.01; done; printf second"}],"max_concurrency":2})"),
+      {});
+  assert(multi_bash);
+  assert(!multi_bash.value().is_error);
+  assert(multi_bash.value().content.starts_with("summary: 1=ok 2=ok"));
+  assert(multi_bash.value().content.find("[1]\nfirst") != std::string::npos);
+  assert(multi_bash.value().content.find("[2]\nsecond") != std::string::npos);
+
+  const auto partly_failed_multi_bash = registry.execute(
+      call("multi-bash-2", "multi_bash",
+           R"({"commands":[{"command":"printf okay"},{"command":"exit 7"}]})"),
+      {});
+  assert(partly_failed_multi_bash);
+  assert(partly_failed_multi_bash.value().is_error);
+  assert(partly_failed_multi_bash.value().content.starts_with(
+      "summary: 1=ok 2=error"));
+  assert(partly_failed_multi_bash.value().content.find("[exit code 7]") !=
+         std::string::npos);
+
+  const auto invalid_multi_bash =
+      registry.execute(call("multi-bash-3", "multi_bash",
+                            R"({"commands":[{"command":"printf only-one"}]})"),
+                       {});
+  assert(!invalid_multi_bash);
+  assert(invalid_multi_bash.error().code == ErrorCode::invalid_argument);
+
+  const auto truncated_multi_bash = registry.execute(
+      call(
+          "multi-bash-4", "multi_bash",
+          R"({"commands":[{"command":"printf 123456789"},{"command":"printf abcdefghi"}],"max_output_bytes":24})"),
+      {});
+  assert(truncated_multi_bash);
+  assert(truncated_multi_bash.value().content.find(
+             "[multi_bash output truncated]") != std::string::npos);
+
+  const auto timed_out_multi_bash = registry.execute(
+      call(
+          "multi-bash-5", "multi_bash",
+          R"({"commands":[{"command":"sleep 1","timeout_ms":50},{"command":"printf companion"}]})"),
+      {});
+  assert(timed_out_multi_bash);
+  assert(timed_out_multi_bash.value().is_error);
+  assert(timed_out_multi_bash.value().content.starts_with(
+      "summary: 1=error 2=ok"));
+  assert(timed_out_multi_bash.value().content.find("[command timed out]") !=
+         std::string::npos);
+
+  {
+    std::ofstream blocked_command(root / "not-executable");
+    blocked_command << "#!/bin/sh\nprintf should-not-run";
+  }
+  std::filesystem::permissions(root / "not-executable",
+                               std::filesystem::perms::owner_exec |
+                                   std::filesystem::perms::group_exec |
+                                   std::filesystem::perms::others_exec,
+                               std::filesystem::perm_options::remove);
+  const auto permission_failed_multi_bash = registry.execute(
+      call(
+          "multi-bash-6", "multi_bash",
+          R"({"commands":[{"command":"./not-executable"},{"command":"printf companion"}]})"),
+      {});
+  assert(permission_failed_multi_bash);
+  assert(permission_failed_multi_bash.value().is_error);
+  assert(permission_failed_multi_bash.value().content.starts_with(
+      "summary: 1=error 2=ok"));
+
+  const auto traversal_multi_bash = registry.execute(
+      call(
+          "multi-bash-7", "multi_bash",
+          R"({"commands":[{"command":"pwd","working_dir":".."},{"command":"pwd"}]})"),
+      {});
+  assert(!traversal_multi_bash);
+  assert(traversal_multi_bash.error().code == ErrorCode::invalid_argument);
+
+  zed::core::CancellationSource multi_bash_cancellation;
+  std::optional<zed::core::Result<zed::core::ToolResult>> cancelled_multi_bash;
+  std::thread cancellable_multi_bash([&]() {
+    cancelled_multi_bash = registry.execute(
+        call("multi-bash-8", "multi_bash",
+             R"({"commands":[{"command":"sleep 5"},{"command":"sleep 5"}]})"),
+        multi_bash_cancellation.token());
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  multi_bash_cancellation.cancel();
+  cancellable_multi_bash.join();
+  assert(cancelled_multi_bash.has_value());
+  assert(!cancelled_multi_bash.value());
+  assert(cancelled_multi_bash->error().code == ErrorCode::cancelled);
 
   const auto truncated_bash = registry.execute(
       call("bash-2", "bash",
@@ -312,14 +718,17 @@ int main() {
   std::stringstream terminal_output;
   zed::ui::TerminalRenderer renderer(terminal_output, {false});
   renderer.banner("/tmp/workspace", "muse-spark-1.2-contributor", "0.1.0",
-                  "session-fixture", true);
+                  zed::core::ReasoningEffort::low);
   renderer.render({zed::core::AgentEventType::assistant_delta, "hello", {}});
   renderer.render({zed::core::AgentEventType::agent_end, "", {}});
-  assert(terminal_output.str().find("zeda") != std::string::npos);
-  assert(terminal_output.str().find("0.1.0") != std::string::npos);
-  assert(terminal_output.str().find("session-fixture") != std::string::npos);
-  assert(terminal_output.str().find("quick bash: on") != std::string::npos);
-  assert(terminal_output.str().find("theme: light") != std::string::npos);
+  assert(terminal_output.str().find(
+             "zeda 0.1.0\nmodel: muse-spark-1.2-contributor · "
+             "reasoning: low\nworkspace: /tmp/workspace\n") !=
+         std::string::npos);
+  assert(terminal_output.str().find("zeda 0.1.0") != std::string::npos);
+  assert(terminal_output.str().find("session") == std::string::npos);
+  assert(terminal_output.str().find("quick bash") == std::string::npos);
+  assert(terminal_output.str().find("theme") == std::string::npos);
   assert(terminal_output.str().find("hello") != std::string::npos);
 
   std::stringstream terminal_input("first line\n");

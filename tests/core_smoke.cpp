@@ -182,6 +182,26 @@ public:
   }
 };
 
+class AdditionalSystemContextModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &request,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    assert(request.messages.size() == 2);
+    assert(request.messages[0].role == Role::system);
+    assert(request.messages[0].content.find("active skill instructions") !=
+           std::string::npos);
+    assert(request.messages[1].role == Role::user);
+    assert(request.messages[1].content == "exact user input");
+    return Result<AssistantResponse>::success({
+        "done",
+        {},
+        FinishReason::stop,
+        {},
+    });
+  }
+};
+
 } // namespace
 
 int main() {
@@ -221,6 +241,17 @@ int main() {
   assert(observed_usage.size() == 2);
   assert(observed_usage[0].input_tokens == 10);
   assert(observed_usage[1].output_tokens == 4);
+  assert(observed_usage[0].output_tokens_per_second > 0.0);
+  assert(observed_usage[1].output_tokens_per_second > 0.0);
+  assert(observed_usage[0].context_breakdown.has_value());
+  assert(observed_usage[0].context_breakdown->total_tokens() ==
+         observed_usage[0].input_tokens);
+  assert(observed_usage[0].context_breakdown->system_tokens > 0);
+  assert(observed_usage[0].context_breakdown->tool_definition_tokens > 0);
+  assert(observed_usage[1].context_breakdown.has_value());
+  assert(observed_usage[1].context_breakdown->total_tokens() ==
+         observed_usage[1].input_tokens);
+  assert(observed_usage[1].context_breakdown->tool_tokens > 0);
   assert(observed_tool_purposes.size() == 1);
   assert(observed_tool_purposes[0] == "Verify the echo workflow");
 
@@ -307,5 +338,20 @@ int main() {
   const auto incomplete_history = incomplete_session.load();
   assert(incomplete_history);
   assert(incomplete_history.value().size() == 1);
+
+  AdditionalSystemContextModel additional_context_model;
+  ToolRegistry additional_context_tools;
+  InMemorySessionStore additional_context_session;
+  BasicContextManager additional_context_manager(estimator);
+  AgentLoop additional_context_loop(
+      additional_context_model, additional_context_tools,
+      additional_context_session, additional_context_manager, config);
+  const auto additional_context_result = additional_context_loop.run(
+      "exact user input", {}, {}, "active skill instructions");
+  assert(additional_context_result);
+  const auto additional_context_history = additional_context_session.load();
+  assert(additional_context_history);
+  assert(additional_context_history.value().size() == 2);
+  assert(additional_context_history.value()[0].content == "exact user input");
   return 0;
 }

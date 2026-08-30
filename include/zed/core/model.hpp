@@ -81,10 +81,26 @@ struct ModelCapabilities {
   bool prompt_caching{false};
 };
 
+struct ContextTokenBreakdown {
+  TokenCount system_tokens{};
+  TokenCount user_tokens{};
+  TokenCount assistant_tokens{};
+  TokenCount tool_tokens{};
+  TokenCount tool_definition_tokens{};
+  TokenCount other_tokens{};
+
+  [[nodiscard]] TokenCount total_tokens() const {
+    return system_tokens + user_tokens + assistant_tokens + tool_tokens +
+           tool_definition_tokens + other_tokens;
+  }
+};
+
 struct ModelUsage {
   TokenCount input_tokens{};
   TokenCount cached_input_tokens{};
   TokenCount output_tokens{};
+  double output_tokens_per_second{};
+  std::optional<ContextTokenBreakdown> context_breakdown;
 };
 
 struct ModelDelta {

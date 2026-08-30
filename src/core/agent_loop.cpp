@@ -3,8 +3,11 @@
 #include "zed/core/tool_registry.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <numeric>
 #include <string_view>
 #include <unordered_set>
 
@@ -31,9 +34,79 @@ constexpr std::string_view kDeferredActionCorrection =
 
 constexpr std::size_t kMaxDeferredActionRetries = 1;
 
+TokenCount estimated_tokens(std::size_t bytes) {
+  return static_cast<TokenCount>((bytes + 3) / 4);
+}
+
+TokenCount estimated_message_tokens(const Message &message) {
+  std::size_t bytes = message.content.size() + message.id.size() + 8;
+  for (const auto &call : message.tool_calls) {
+    bytes += call.id.size() + call.name.size() + call.arguments_json.size();
+  }
+  return estimated_tokens(bytes);
+}
+
+ContextTokenBreakdown context_breakdown_for(const ModelRequest &request,
+                                            TokenCount exact_total) {
+  std::array<TokenCount, 5> estimated{};
+  for (const auto &message : request.messages) {
+    const auto tokens = estimated_message_tokens(message);
+    switch (message.role) {
+    case Role::system:
+      estimated[0] += tokens;
+      break;
+    case Role::user:
+      estimated[1] += tokens;
+      break;
+    case Role::assistant:
+      estimated[2] += tokens;
+      break;
+    case Role::tool:
+      estimated[3] += tokens;
+      break;
+    }
+  }
+  for (const auto &definition : request.tools) {
+    estimated[4] += estimated_tokens(definition.name.size() +
+                                     definition.description.size() +
+                                     definition.input_schema_json.size() + 24);
+  }
+
+  const auto estimated_total =
+      std::accumulate(estimated.begin(), estimated.end(), TokenCount{});
+  std::array<TokenCount, 5> reconciled = estimated;
+  if (estimated_total > exact_total && estimated_total > 0) {
+    for (std::size_t index = 0; index < reconciled.size(); ++index) {
+      const auto share = static_cast<long double>(estimated[index]) /
+                         static_cast<long double>(estimated_total);
+      reconciled[index] = static_cast<TokenCount>(
+          share * static_cast<long double>(exact_total));
+    }
+  }
+  auto categorized_total =
+      std::accumulate(reconciled.begin(), reconciled.end(), TokenCount{});
+  for (std::size_t index = 0; index < reconciled.size(); ++index) {
+    if (estimated[index] > 0 && reconciled[index] == 0 &&
+        categorized_total < exact_total) {
+      reconciled[index] = 1;
+      ++categorized_total;
+    }
+  }
+  const auto other_tokens = exact_total > categorized_total
+                                ? exact_total - categorized_total
+                                : TokenCount{};
+  return {reconciled[0], reconciled[1], reconciled[2],
+          reconciled[3], reconciled[4], other_tokens};
+}
+
 std::string next_id(const char *prefix) {
   static std::atomic_uint64_t sequence{0};
-  return std::string(prefix) + "-" + std::to_string(++sequence);
+  static const auto process_nonce =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  return std::string(prefix) + "-" + std::to_string(process_nonce) + "-" +
+         std::to_string(++sequence);
 }
 
 Error cancelled_error() {
@@ -165,7 +238,8 @@ ReasoningEffort AgentLoop::reasoning_effort() const {
 
 Result<std::string> AgentLoop::run(std::string user_input,
                                    CancellationToken cancellation,
-                                   AgentEventCallback on_event) {
+                                   AgentEventCallback on_event,
+                                   std::string additional_system_prompt) {
   if (user_input.empty()) {
     return Result<std::string>::failure({
         ErrorCode::invalid_argument,
@@ -187,20 +261,49 @@ Result<std::string> AgentLoop::run(std::string user_input,
 
   emit({AgentEventType::agent_start, {}, std::nullopt, std::nullopt}, on_event);
 
+  const auto turn_id = next_id("turn");
   Message user_message{
       next_id("user"), Role::user, std::move(user_input), {}, std::nullopt,
   };
-  const auto append_user = session_.append(user_message);
-  if (!append_user) {
-    emit({AgentEventType::error, append_user.error().message, std::nullopt,
+  const auto begin_turn = session_.begin_turn(turn_id, user_message);
+  if (!begin_turn) {
+    emit({AgentEventType::error, begin_turn.error().message, std::nullopt,
           std::nullopt},
          on_event);
-    return Result<std::string>::failure(append_user.error());
+    return Result<std::string>::failure(begin_turn.error());
   }
   emit({AgentEventType::user_message, user_message.content, std::nullopt,
         std::nullopt},
        on_event);
 
+  auto result =
+      run_active_turn(cancellation, on_event, additional_system_prompt);
+  const auto outcome = result ? SessionTurnOutcome::completed
+                       : result.error().code == ErrorCode::cancelled
+                           ? SessionTurnOutcome::cancelled
+                           : SessionTurnOutcome::failed;
+  const auto detail =
+      result ? std::string_view{} : std::string_view(result.error().message);
+  const auto finish_turn = session_.finish_turn(turn_id, outcome, detail);
+  if (!finish_turn) {
+    emit({AgentEventType::error, finish_turn.error().message, std::nullopt,
+          std::nullopt},
+         on_event);
+    return Result<std::string>::failure(finish_turn.error());
+  }
+
+  if (result) {
+    emit(
+        {AgentEventType::agent_end, result.value(), std::nullopt, std::nullopt},
+        on_event);
+  }
+  return result;
+}
+
+Result<std::string>
+AgentLoop::run_active_turn(CancellationToken cancellation,
+                           AgentEventCallback on_event,
+                           const std::string &additional_system_prompt) {
   std::size_t deferred_action_retries = 0;
   for (std::size_t turn = 0; turn < config_.max_turns; ++turn) {
     if (cancellation.is_cancelled()) {
@@ -221,6 +324,10 @@ Result<std::string> AgentLoop::run(std::string user_input,
     std::vector<Message> context_messages;
     context_messages.reserve(history.value().size() + 1);
     std::string system_prompt = config_.system_prompt;
+    if (!additional_system_prompt.empty()) {
+      system_prompt += "\n\n";
+      system_prompt += additional_system_prompt;
+    }
     if (deferred_action_retries > 0) {
       system_prompt += "\n\n";
       system_prompt += kDeferredActionCorrection;
@@ -246,7 +353,8 @@ Result<std::string> AgentLoop::run(std::string user_input,
     request.messages = window.value().messages;
     request.tools = tools_.definitions();
 
-    const auto response = model_.complete(
+    const auto model_started_at = std::chrono::steady_clock::now();
+    auto response = model_.complete(
         request,
         [&](const ModelDelta &delta) {
           emit({AgentEventType::assistant_delta, delta.text, std::nullopt,
@@ -254,12 +362,23 @@ Result<std::string> AgentLoop::run(std::string user_input,
                on_event);
         },
         cancellation);
+    const auto model_elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      model_started_at)
+            .count();
     if (!response) {
       emit({AgentEventType::error, response.error().message, std::nullopt,
             std::nullopt},
            on_event);
       return Result<std::string>::failure(response.error());
     }
+    if (response.value().usage.output_tokens > 0 && model_elapsed > 0.0) {
+      response.value().usage.output_tokens_per_second =
+          static_cast<double>(response.value().usage.output_tokens) /
+          model_elapsed;
+    }
+    response.value().usage.context_breakdown =
+        context_breakdown_for(request, response.value().usage.input_tokens);
 
     if (cancellation.is_cancelled()) {
       const auto error = cancelled_error();
@@ -320,9 +439,6 @@ Result<std::string> AgentLoop::run(std::string user_input,
          on_event);
 
     if (response.value().tool_calls.empty()) {
-      emit({AgentEventType::agent_end, response.value().content, std::nullopt,
-            std::nullopt},
-           on_event);
       return Result<std::string>::success(response.value().content);
     }
 
@@ -352,8 +468,9 @@ Result<std::string> AgentLoop::run(std::string user_input,
       }
 
       Message tool_message{
-          next_id("tool"),          Role::tool, tool_result.content, {},
-          tool_result.tool_call_id,
+          next_id("tool"),          Role::tool,
+          tool_result.content,      {},
+          tool_result.tool_call_id, tool_result.is_error,
       };
       const auto append_tool = session_.append(tool_message);
       if (!append_tool) {

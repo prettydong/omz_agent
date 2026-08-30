@@ -8,10 +8,11 @@ namespace zed::core {
 using TokenCount = std::size_t;
 using MessageId = std::string;
 using ToolCallId = std::string;
+using TurnId = std::string;
 
 struct ModelRef {
-    std::string provider;
-    std::string model;
+  std::string provider;
+  std::string model;
 };
 
-}  // namespace zed::core
+} // namespace zed::core

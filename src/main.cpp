@@ -1,9 +1,13 @@
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "zed/app/config.hpp"
@@ -11,15 +15,41 @@
 #include "zed/core/model_context_controller.hpp"
 #include "zed/extensions/extension_registry.hpp"
 #include "zed/extensions/quick_bash_input.hpp"
+#include "zed/lsp/clangd_client.hpp"
+#include "zed/plugins/plugin_manager.hpp"
 #include "zed/providers/opencode_go_model.hpp"
 #include "zed/session/jsonl_session_store.hpp"
+#include "zed/session/session_catalog.hpp"
 #include "zed/skills/skill_registry.hpp"
 #include "zed/tools/basic_tools.hpp"
+#include "zed/tools/clangd_tool.hpp"
+#include "zed/tools/multi_bash_tool.hpp"
 #include "zed/ui/terminal.hpp"
 
 namespace {
 
 constexpr std::string_view kVersion = ZEDA_VERSION;
+
+std::string trim_ascii_whitespace(std::string_view value) {
+  const auto visible = [](unsigned char character) {
+    return std::isspace(character) == 0;
+  };
+  const auto begin = std::find_if(value.begin(), value.end(), visible);
+  const auto end = std::find_if(value.rbegin(), value.rend(), visible).base();
+  if (begin >= end)
+    return {};
+  return std::string(begin, end);
+}
+
+std::pair<std::string, std::string>
+split_first_argument(std::string_view arguments) {
+  const auto trimmed = trim_ascii_whitespace(arguments);
+  const auto separator = trimmed.find_first_of(" \t\r\n");
+  if (separator == std::string::npos)
+    return {trimmed, {}};
+  return {trimmed.substr(0, separator),
+          trim_ascii_whitespace(trimmed.substr(separator + 1))};
+}
 
 void print_usage(std::ostream &output) {
   output << "Usage: zeda [--help] [--version]\n"
@@ -55,8 +85,11 @@ int main(int argc, char *argv[]) {
     return 2;
   }
   const auto &runtime_config = runtime.value();
-  const std::string session_name = runtime_config.session_path.stem().string();
-
+  zed::lsp::ClangdClient clangd({
+      runtime_config.workspace,
+      runtime_config.clangd_path,
+      zed::lsp::discover_compile_commands_directory(runtime_config.workspace),
+  });
   zed::providers::OpenCodeGoModel model({
       runtime_config.opencode_go_api_key,
       runtime_config.opencode_endpoint,
@@ -67,22 +100,57 @@ int main(int argc, char *argv[]) {
   zed::core::ApproximateTokenEstimator estimator;
   zed::core::BasicContextManager context(estimator, &context_controller);
   zed::session::JsonlSessionStore session(runtime_config.session_path);
+  const auto session_directory = runtime_config.workspace / ".zed" / "sessions";
+  const auto session_metadata = [&](const std::filesystem::path &path,
+                                    std::string title = {}) {
+    const auto id = path.stem().string();
+    return zed::session::SessionMetadata{
+        id,
+        title.empty() ? id : std::move(title),
+        runtime_config.workspace.string(),
+        runtime_config.main_model.provider,
+        runtime_config.main_model.model,
+    };
+  };
+  const auto initialized =
+      session.initialize(session_metadata(runtime_config.session_path));
+  if (!initialized) {
+    std::cerr << initialized.error().message << "\n";
+    return 3;
+  }
+  const auto startup_recovery = session.recover_interrupted_turn();
+  if (!startup_recovery) {
+    std::cerr << startup_recovery.error().message << "\n";
+    return 3;
+  }
 
   zed::core::ToolRegistry tools;
   if (!tools.register_tool(std::make_unique<zed::tools::ReadFileTool>(
           runtime_config.workspace, runtime_config.tool_limits)))
     return 3;
   if (!tools.register_tool(std::make_unique<zed::tools::WriteFileTool>(
-          runtime_config.workspace, runtime_config.tool_limits)))
+          runtime_config.workspace, runtime_config.tool_limits, &clangd)))
     return 3;
   if (!tools.register_tool(std::make_unique<zed::tools::BashTool>(
+          runtime_config.workspace, runtime_config.tool_limits)))
+    return 3;
+  if (!tools.register_tool(std::make_unique<zed::tools::MultiBashTool>(
           runtime_config.workspace, runtime_config.tool_limits)))
     return 3;
   if (!tools.register_tool(std::make_unique<zed::tools::GrepTool>(
           runtime_config.workspace, runtime_config.tool_limits)))
     return 3;
-  if (!tools.register_tool(std::make_unique<zed::tools::EditFileTool>(
+  if (!tools.register_tool(std::make_unique<zed::tools::FindFilesTool>(
           runtime_config.workspace, runtime_config.tool_limits)))
+    return 3;
+  if (!tools.register_tool(std::make_unique<zed::tools::ListDirectoryTool>(
+          runtime_config.workspace, runtime_config.tool_limits)))
+    return 3;
+  if (!tools.register_tool(std::make_unique<zed::tools::EditFileTool>(
+          runtime_config.workspace, runtime_config.tool_limits, &clangd)))
+    return 3;
+  if (!tools.register_tool(std::make_unique<zed::tools::ClangdTool>(
+          runtime_config.workspace, clangd, runtime_config.tool_limits)))
     return 3;
 
   zed::extensions::QuickBashInput quick_bash(tools,
@@ -110,6 +178,10 @@ int main(int argc, char *argv[]) {
 
   zed::core::AgentLoop loop(model, tools, session, context, loop_config);
   zed::extensions::ExtensionRegistry extensions;
+  zed::plugins::PluginManager plugins(
+      {runtime_config.workspace, zed::plugins::default_plugin_search_paths(),
+       runtime_config.main_model, active_reasoning_effort},
+      extensions, tools, model, clangd);
   const auto register_command = [&](zed::extensions::Command command) {
     const auto result = extensions.register_command(std::move(command));
     if (!result)
@@ -121,6 +193,26 @@ int main(int argc, char *argv[]) {
   skill_options.reserve(skills.all().size());
   for (const auto &skill : skills.all()) {
     skill_options.push_back({skill.name, skill.description});
+  }
+  std::vector<zed::extensions::CommandOption> session_options;
+  session_options.push_back({"list", "List Session v2 files."});
+  session_options.push_back({"new", "Create and open a new Session."});
+  session_options.push_back({"open", "Open a saved Session."});
+  session_options.push_back({"rename", "Rename the active Session."});
+  session_options.push_back({"fork", "Fork the active Session."});
+  const auto discovered_sessions =
+      zed::session::list_sessions(session_directory);
+  if (!discovered_sessions) {
+    std::cerr << "session discovery warning: "
+              << discovered_sessions.error().message << "\n";
+  } else {
+    session_options.reserve(session_options.size() +
+                            discovered_sessions.value().size());
+    for (const auto &entry : discovered_sessions.value()) {
+      if (entry.valid) {
+        session_options.push_back({entry.name, "Open Session: " + entry.title});
+      }
+    }
   }
   if (!register_command({
           "help",
@@ -274,16 +366,168 @@ int main(int argc, char *argv[]) {
     return 3;
   if (!register_command({
           "session",
-          "Show the active session.",
+          "Manage Session v2: /session [list|new|open|rename|fork].",
+          [&](std::string_view arguments) {
+            const auto [action, remainder] = split_first_argument(arguments);
+            const auto open_session = [&](std::string_view identifier) {
+              if (identifier.empty()) {
+                return zed::core::Result<std::string>::failure({
+                    zed::core::ErrorCode::invalid_argument,
+                    "usage: /session open <id-or-title>",
+                });
+              }
+              const auto selected =
+                  zed::session::find_session(session_directory, identifier);
+              if (!selected)
+                return zed::core::Result<std::string>::failure(
+                    selected.error());
+              const auto switched = session.switch_to(selected.value().path);
+              if (!switched)
+                return zed::core::Result<std::string>::failure(
+                    switched.error());
+              std::string result = "opened session: " + selected.value().title +
+                                   " [" + selected.value().name + "]\n";
+              if (switched.value().recovered) {
+                result +=
+                    "recovered interrupted turn: " + switched.value().turn_id +
+                    "\n";
+              }
+              return zed::core::Result<std::string>::success(std::move(result));
+            };
+
+            if (action == "new") {
+              const auto path =
+                  zed::session::new_session_path(session_directory);
+              {
+                zed::session::JsonlSessionStore created(path);
+                const auto initialized =
+                    created.initialize(session_metadata(path, remainder));
+                if (!initialized) {
+                  return zed::core::Result<std::string>::failure(
+                      initialized.error());
+                }
+              }
+              const auto switched = session.switch_to(path);
+              if (!switched)
+                return zed::core::Result<std::string>::failure(
+                    switched.error());
+              const auto info = session.inspect();
+              if (!info)
+                return zed::core::Result<std::string>::failure(info.error());
+              return zed::core::Result<std::string>::success(
+                  "created session: " + info.value().metadata.title + " [" +
+                  info.value().metadata.id + "]\n");
+            }
+            if (action == "rename") {
+              if (remainder.empty()) {
+                return zed::core::Result<std::string>::failure({
+                    zed::core::ErrorCode::invalid_argument,
+                    "usage: /session rename <title>",
+                });
+              }
+              const auto renamed = session.set_title(remainder);
+              if (!renamed)
+                return zed::core::Result<std::string>::failure(renamed.error());
+              return zed::core::Result<std::string>::success(
+                  "renamed session: " + remainder + "\n");
+            }
+            if (action == "fork") {
+              const auto path =
+                  zed::session::new_session_path(session_directory);
+              const auto forked = session.fork_to(path, remainder);
+              if (!forked)
+                return zed::core::Result<std::string>::failure(forked.error());
+              const auto switched = session.switch_to(path);
+              if (!switched)
+                return zed::core::Result<std::string>::failure(
+                    switched.error());
+              const auto info = session.inspect();
+              if (!info)
+                return zed::core::Result<std::string>::failure(info.error());
+              return zed::core::Result<std::string>::success(
+                  "forked session: " + info.value().metadata.title + " [" +
+                  info.value().metadata.id + "]\n");
+            }
+            if (action == "open")
+              return open_session(remainder);
+            if (!action.empty() && action != "list")
+              return open_session(trim_ascii_whitespace(arguments));
+            if (action == "list" && !remainder.empty()) {
+              return zed::core::Result<std::string>::failure({
+                  zed::core::ErrorCode::invalid_argument,
+                  "usage: /session list",
+              });
+            }
+
+            const auto sessions =
+                zed::session::list_sessions(session_directory);
+            if (!sessions)
+              return zed::core::Result<std::string>::failure(sessions.error());
+            const auto active_info = session.inspect();
+            if (!active_info)
+              return zed::core::Result<std::string>::failure(
+                  active_info.error());
+
+            std::string result =
+                "active: " + active_info.value().metadata.title + " [" +
+                active_info.value().metadata.id + "]\n";
+            result += "path: " + session.path().string() + "\n";
+            result +=
+                "turns: " + std::to_string(active_info.value().turn_count) +
+                ", messages: " +
+                std::to_string(active_info.value().message_count) + "\n";
+            if (sessions.value().empty()) {
+              result += "saved sessions: none\n";
+            } else {
+              result += "saved sessions:\n";
+              for (const auto &entry : sessions.value()) {
+                const bool active = entry.path.lexically_normal() ==
+                                    session.path().lexically_normal();
+                result += active ? "  * " : "    ";
+                if (!entry.valid) {
+                  result += entry.name + " [not Session v2]\n";
+                  continue;
+                }
+                result += entry.title + " [" + entry.name + "] — " +
+                          std::to_string(entry.turn_count) + " turns";
+                if (entry.interrupted)
+                  result += " — interrupted";
+                result += "\n";
+              }
+            }
+            result += "usage: /session new [title] | open <id-or-title> | "
+                      "rename <title> | fork [title]\n";
+            return zed::core::Result<std::string>::success(std::move(result));
+          },
+          std::move(session_options),
+      }))
+    return 3;
+  if (!register_command({
+          "plugins",
+          "Show discovered external plugins.",
           [&](std::string_view) {
             return zed::core::Result<std::string>::success(
-                runtime_config.session_path.string() + "\n");
+                plugins.status_report());
           },
       }))
     return 3;
+  const auto plugin_discovery = plugins.discover_and_load();
+  if (!plugin_discovery) {
+    std::cerr << "plugin discovery warning: "
+              << plugin_discovery.error().message << "\n";
+  }
+  for (const auto &status : plugins.statuses()) {
+    if (!status.loaded) {
+      std::cerr << "plugin warning: " << status.detail << " ("
+                << status.manifest_path.string() << ")\n";
+    }
+  }
   const auto command_handler = [&](std::string_view name,
-                                   std::string_view arguments) {
-    return extensions.execute(name, arguments);
+                                   std::string_view arguments,
+                                   zed::core::CancellationToken cancellation,
+                                   zed::core::AgentEventCallback on_event) {
+    return extensions.execute(name, arguments, cancellation,
+                              std::move(on_event));
   };
   const auto submit_handler = [&](std::string prompt,
                                   zed::core::CancellationToken cancellation,
@@ -312,10 +556,8 @@ int main(int argc, char *argv[]) {
     }
 
     const auto skill_context = skills.prompt_context(active_skill);
-    if (!skill_context.empty()) {
-      prompt = skill_context + "\n\nUser request:\n" + prompt;
-    }
-    return loop.run(std::move(prompt), cancellation, std::move(on_event));
+    return loop.run(std::move(prompt), cancellation, std::move(on_event),
+                    skill_context);
   };
   const auto initial_activity = [&](std::string_view input) {
     const auto quick_command = quick_bash.classify(input);
@@ -335,14 +577,22 @@ int main(int argc, char *argv[]) {
         {command.name, command.description, std::move(options)});
   }
   command_hints.push_back({"exit", "Quit zeda.", {}});
+  const auto active_session_label = [&] {
+    const auto info = session.inspect();
+    if (!info)
+      return session.path().stem().string();
+    return info.value().metadata.title + " [" + info.value().metadata.id + "]" +
+           (info.value().has_interrupted_turn ? " — interrupted" : "");
+  };
 
   if (isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0) {
     zed::ui::TerminalApplication application(
         runtime_config.workspace.string(), runtime_config.main_model.model,
-        std::string(kVersion), active_reasoning_effort, active_theme,
-        [&] { return quick_bash.enabled(); }, initial_activity,
-        std::move(command_hints), session_name, submit_handler,
-        command_handler);
+        std::string(kVersion), runtime_config.context_limits.max_context_tokens,
+        active_reasoning_effort, active_theme,
+        [&] { return quick_bash.enabled(); }, active_session_label,
+        [&] { return session.load(); }, initial_activity,
+        std::move(command_hints), submit_handler, command_handler);
     const auto result = application.run();
     if (!result) {
       std::cerr << result.error().message << "\n";
@@ -354,8 +604,8 @@ int main(int argc, char *argv[]) {
   zed::ui::TerminalRenderer renderer(
       std::cout, {isatty(STDOUT_FILENO) != 0, active_theme});
   renderer.banner(runtime_config.workspace.string(),
-                  runtime_config.main_model.model, kVersion, session_name,
-                  quick_bash.enabled());
+                  runtime_config.main_model.model, kVersion,
+                  active_reasoning_effort);
   zed::ui::TerminalInput input_reader(std::cin);
 
   while (true) {

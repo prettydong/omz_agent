@@ -397,7 +397,10 @@ ftxui::Element render_markdown(std::string_view markdown,
 
   for (std::size_t index = 0; index < lines.size();) {
     if (is_blank(lines[index])) {
-      ++index;
+      while (index < lines.size() && is_blank(lines[index]))
+        ++index;
+      if (!blocks.empty() && index < lines.size())
+        blocks.push_back(ftxui::separatorEmpty());
       continue;
     }
 

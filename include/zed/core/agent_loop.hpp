@@ -26,12 +26,16 @@ public:
 
   Result<std::string> run(std::string user_input,
                           CancellationToken cancellation = {},
-                          AgentEventCallback on_event = {});
+                          AgentEventCallback on_event = {},
+                          std::string additional_system_prompt = {});
 
   void set_reasoning_effort(ReasoningEffort effort);
   [[nodiscard]] ReasoningEffort reasoning_effort() const;
 
 private:
+  Result<std::string>
+  run_active_turn(CancellationToken cancellation, AgentEventCallback on_event,
+                  const std::string &additional_system_prompt);
   void emit(const AgentEvent &event, const AgentEventCallback &callback) const;
 
   Model &model_;

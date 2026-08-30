@@ -14,6 +14,7 @@ namespace zed::app {
 struct RuntimeConfig {
   std::string opencode_go_api_key;
   std::string opencode_endpoint;
+  std::string clangd_path{"clangd"};
   std::size_t opencode_request_timeout_ms{120'000};
   std::filesystem::path workspace;
   std::filesystem::path session_path;

@@ -1,10 +1,18 @@
 #include "zed/ui/terminal.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
 #include <limits>
+#include <memory>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -15,11 +23,81 @@
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/mouse.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/dom/node.hpp>
 #include <ftxui/screen/screen.hpp>
 
 namespace zed::ui {
 
 namespace {
+
+class LayoutBoxCapture final : public ftxui::Node {
+public:
+  LayoutBoxCapture(ftxui::Element child, ftxui::Box &captured_box)
+      : Node(ftxui::unpack(std::move(child))), captured_box_(captured_box) {}
+
+  void SetBox(ftxui::Box box) override {
+    captured_box_ = box;
+    Node::SetBox(box);
+    children_[0]->SetBox(box);
+  }
+
+private:
+  ftxui::Box &captured_box_;
+};
+
+class BlockCursorOverride final : public ftxui::Node {
+public:
+  explicit BlockCursorOverride(ftxui::Element child)
+      : Node(ftxui::unpack(std::move(child))) {}
+
+  void ComputeRequirement() override {
+    Node::ComputeRequirement();
+    if (requirement_.focused.enabled) {
+      requirement_.focused.cursor_shape = ftxui::Screen::Cursor::BlockBlinking;
+    }
+  }
+
+  void SetBox(ftxui::Box box) override {
+    Node::SetBox(box);
+    children_[0]->SetBox(box);
+  }
+};
+
+class FullWidthBoundaryGuard final : public ftxui::Node {
+public:
+  FullWidthBoundaryGuard(ftxui::Element child, ftxui::Color background_color)
+      : Node(ftxui::unpack(std::move(child))),
+        background_color_(background_color) {}
+
+  void SetBox(ftxui::Box box) override {
+    Node::SetBox(box);
+    children_[0]->SetBox(box);
+  }
+
+  void Render(ftxui::Screen &screen) override {
+    const int preceding_column = box_.x_min - 1;
+    if (preceding_column >= 0 && preceding_column < screen.dimx()) {
+      const int first_row = std::max(0, box_.y_min);
+      const int last_row = std::min(screen.dimy() - 1, box_.y_max);
+      for (int row = first_row; row <= last_row; ++row) {
+        auto &cell = screen.CellAt(preceding_column, row);
+        cell = ftxui::Cell{};
+        cell.character = " ";
+        cell.background_color = background_color_;
+      }
+    }
+    Node::Render(screen);
+  }
+
+private:
+  ftxui::Color background_color_;
+};
+
+ftxui::Element guard_full_width_boundary(ftxui::Element child,
+                                         ftxui::Color background_color) {
+  return std::make_shared<FullWidthBoundaryGuard>(std::move(child),
+                                                  background_color);
+}
 
 std::string render_element(ftxui::Element element) {
   const auto width = ftxui::Dimension::Fit(element);
@@ -32,6 +110,60 @@ std::string render_element(ftxui::Element element) {
 bool is_command_whitespace(char character) {
   return character == ' ' || character == '\t' || character == '\r' ||
          character == '\n';
+}
+
+std::string encode_base64(std::string_view input) {
+  constexpr std::array<char, 64> kAlphabet{
+      'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+      'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+      'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+      'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+      '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/',
+  };
+  const auto alphabet_at = [&](std::uint32_t index) {
+    return kAlphabet[static_cast<std::size_t>(index)];
+  };
+
+  std::string encoded;
+  encoded.reserve(((input.size() + 2) / 3) * 4);
+  std::size_t index = 0;
+  while (index + 3 <= input.size()) {
+    const auto value =
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(input[index]))
+         << 16U) |
+        (static_cast<std::uint32_t>(
+             static_cast<unsigned char>(input[index + 1]))
+         << 8U) |
+        static_cast<std::uint32_t>(
+            static_cast<unsigned char>(input[index + 2]));
+    encoded.push_back(alphabet_at((value >> 18U) & 0x3FU));
+    encoded.push_back(alphabet_at((value >> 12U) & 0x3FU));
+    encoded.push_back(alphabet_at((value >> 6U) & 0x3FU));
+    encoded.push_back(alphabet_at(value & 0x3FU));
+    index += 3;
+  }
+
+  const auto remaining = input.size() - index;
+  if (remaining == 1) {
+    const auto value =
+        static_cast<std::uint32_t>(static_cast<unsigned char>(input[index]))
+        << 16U;
+    encoded.push_back(alphabet_at((value >> 18U) & 0x3FU));
+    encoded.push_back(alphabet_at((value >> 12U) & 0x3FU));
+    encoded += "==";
+  } else if (remaining == 2) {
+    const auto value =
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(input[index]))
+         << 16U) |
+        (static_cast<std::uint32_t>(
+             static_cast<unsigned char>(input[index + 1]))
+         << 8U);
+    encoded.push_back(alphabet_at((value >> 18U) & 0x3FU));
+    encoded.push_back(alphabet_at((value >> 12U) & 0x3FU));
+    encoded.push_back(alphabet_at((value >> 6U) & 0x3FU));
+    encoded.push_back('=');
+  }
+  return encoded;
 }
 
 std::string compact_token_count(core::TokenCount count) {
@@ -56,10 +188,63 @@ std::string compact_token_count(core::TokenCount count) {
   return formatted;
 }
 
+std::string context_percentage(core::TokenCount context_tokens,
+                               core::TokenCount max_context_tokens) {
+  const auto percentage = static_cast<double>(context_tokens) /
+                          static_cast<double>(max_context_tokens) * 100.0;
+  std::ostringstream formatted;
+  formatted << std::fixed << std::setprecision(0) << percentage << '%';
+  return formatted.str();
+}
+
+std::string token_rate(double output_tokens_per_second) {
+  std::ostringstream formatted;
+  formatted << std::fixed << std::setprecision(1) << output_tokens_per_second
+            << " tok/s";
+  return formatted.str();
+}
+
+std::string context_share(core::TokenCount tokens,
+                          core::TokenCount context_tokens) {
+  if (context_tokens == 0)
+    return "0.0%";
+  const auto percentage =
+      static_cast<double>(tokens) / static_cast<double>(context_tokens) * 100.0;
+  std::ostringstream formatted;
+  formatted << std::fixed << std::setprecision(1) << percentage << '%';
+  return formatted.str();
+}
+
+ftxui::Element context_breakdown_row(std::string label, core::TokenCount tokens,
+                                     core::TokenCount context_tokens,
+                                     const TerminalTheme &theme) {
+  const auto ratio =
+      context_tokens == 0
+          ? 0.0F
+          : static_cast<float>(tokens) / static_cast<float>(context_tokens);
+  return ftxui::hbox({
+      ftxui::text(std::move(label)) | ftxui::bold | ftxui::color(theme.text) |
+          ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 19),
+      ftxui::gauge(ratio) | ftxui::color(theme.secondary) |
+          ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 14),
+      ftxui::text("  " + compact_token_count(tokens)) | ftxui::bold |
+          ftxui::color(theme.primary) |
+          ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 9),
+      ftxui::text(context_share(tokens, context_tokens)) | ftxui::bold |
+          ftxui::color(theme.secondary),
+  });
+}
+
 std::size_t box_rows(const ftxui::Box &box) {
   if (box.y_max < box.y_min)
     return 0;
   return static_cast<std::size_t>(box.y_max - box.y_min) + 1;
+}
+
+std::size_t layout_box_rows(const ftxui::Box &box) {
+  if (box.y_max <= box.y_min)
+    return 0;
+  return static_cast<std::size_t>(box.y_max - box.y_min);
 }
 
 std::size_t maximum_scroll_offset(std::size_t content_rows,
@@ -75,15 +260,27 @@ std::string_view trim_command_whitespace(std::string_view value) {
   return value;
 }
 
+ftxui::Element render_three_line_user_surface(ftxui::Element content,
+                                              const TerminalTheme &theme) {
+  return ftxui::vbox({
+             ftxui::separatorEmpty(),
+             std::move(content),
+             ftxui::separatorEmpty(),
+         }) |
+         ftxui::bgcolor(theme.input_background);
+}
+
 ftxui::Element render_message(const TerminalMessage &message,
                               const TerminalTheme &theme) {
   switch (message.kind) {
-  case TerminalMessageKind::user:
-    return ftxui::hbox({
+  case TerminalMessageKind::user: {
+    auto content = ftxui::hbox({
         ftxui::text("› ") | ftxui::bold | ftxui::color(theme.primary),
         ftxui::paragraph(message.content) | ftxui::bold |
             ftxui::color(theme.text) | ftxui::xflex,
     });
+    return render_three_line_user_surface(std::move(content), theme);
+  }
   case TerminalMessageKind::assistant:
     return ftxui::hbox({
         ftxui::text("• ") | ftxui::bold | ftxui::color(theme.success),
@@ -135,7 +332,7 @@ ftxui::Element render_message(const TerminalMessage &message,
             ftxui::text("▾ ") | ftxui::color(color),
             ftxui::paragraph(message.label) | ftxui::bold |
                 ftxui::color(color) | ftxui::xflex,
-            ftxui::text(" · click to collapse") |
+            ftxui::text(" · " + std::string(state) + " · click to collapse") |
                 ftxui::color(theme.text_muted),
         }),
         ftxui::hbox({
@@ -243,6 +440,12 @@ ftxui::Element render_activity(TerminalActivity activity,
 
 } // namespace
 
+ftxui::Decorator capture_layout_box(ftxui::Box &box) {
+  return [&box](ftxui::Element child) {
+    return std::make_shared<LayoutBoxCapture>(std::move(child), box);
+  };
+}
+
 TerminalCommand parse_terminal_command(std::string_view line) {
   line = trim_command_whitespace(line);
   if (!line.empty() && line.front() == '/')
@@ -320,6 +523,10 @@ std::string complete_terminal_command(
   return suggestions[index].completion;
 }
 
+bool is_terminal_command_completion_event(const ftxui::Event &event) {
+  return event == ftxui::Event::Return || event == ftxui::Event::Tab;
+}
+
 std::string terminal_activity_label(TerminalActivity activity,
                                     core::ReasoningEffort reasoning_effort) {
   switch (activity) {
@@ -327,22 +534,142 @@ std::string terminal_activity_label(TerminalActivity activity,
     return "idle";
   case TerminalActivity::thinking:
     return std::string(core::reasoning_effort_name(reasoning_effort)) +
-           " thinking";
+           " think";
   case TerminalActivity::action:
-    return "action";
+    return "tool";
   case TerminalActivity::stream:
-    return "stream";
+    return "reply";
   case TerminalActivity::cancelling:
-    return "cancelling";
+    return "cancel";
   }
   return "idle";
 }
 
-std::string terminal_token_summary(const TerminalTokenMetrics &metrics) {
-  return "ctx " + compact_token_count(metrics.context_tokens) + " · ↑ " +
-         compact_token_count(metrics.input_tokens) + " · ↓ " +
-         compact_token_count(metrics.output_tokens) + " → " +
-         compact_token_count(metrics.all_tokens());
+std::string terminal_token_summary(const TerminalTokenMetrics &metrics,
+                                   core::TokenCount max_context_tokens) {
+  auto summary = terminal_context_summary(metrics, max_context_tokens);
+  summary += " ↑" + compact_token_count(metrics.input_tokens) + " ↓" +
+             compact_token_count(metrics.output_tokens) + " Σ" +
+             compact_token_count(metrics.all_tokens());
+  if (metrics.output_tokens_per_second > 0.0 &&
+      std::isfinite(metrics.output_tokens_per_second)) {
+    summary += " " + token_rate(metrics.output_tokens_per_second);
+  }
+  return summary;
+}
+
+std::string terminal_context_summary(const TerminalTokenMetrics &metrics,
+                                     core::TokenCount max_context_tokens) {
+  auto summary = "ctx:" + compact_token_count(metrics.context_tokens);
+  if (max_context_tokens > 0) {
+    summary += " (" +
+               context_percentage(metrics.context_tokens, max_context_tokens) +
+               ")";
+  }
+  return summary;
+}
+
+ftxui::Element
+render_terminal_context_analysis(const TerminalTokenMetrics &metrics,
+                                 core::TokenCount max_context_tokens,
+                                 const TerminalTheme &theme) {
+  ftxui::Elements rows{
+      ftxui::hbox({
+          ftxui::text("Context analysis") | ftxui::bold |
+              ftxui::color(theme.secondary),
+          ftxui::filler(),
+          ftxui::text("LATEST REQUEST") | ftxui::bold |
+              ftxui::color(theme.primary),
+      }),
+      ftxui::separator(),
+      ftxui::hbox({
+          ftxui::text("Used  ") | ftxui::bold | ftxui::color(theme.primary),
+          ftxui::text(compact_token_count(metrics.context_tokens)) |
+              ftxui::bold | ftxui::color(theme.secondary),
+          max_context_tokens > 0
+              ? ftxui::text(" / " + compact_token_count(max_context_tokens) +
+                            "  (" +
+                            context_percentage(metrics.context_tokens,
+                                               max_context_tokens) +
+                            ")")
+              : ftxui::text("") | ftxui::color(theme.text),
+      }),
+  };
+  if (max_context_tokens > 0) {
+    const auto remaining = max_context_tokens > metrics.context_tokens
+                               ? max_context_tokens - metrics.context_tokens
+                               : core::TokenCount{};
+    rows.push_back(ftxui::hbox({
+        ftxui::text("Free  ") | ftxui::bold | ftxui::color(theme.primary),
+        ftxui::text(compact_token_count(remaining)) | ftxui::bold |
+            ftxui::color(theme.success),
+    }));
+  }
+  if (metrics.cached_context_tokens > 0) {
+    rows.push_back(ftxui::hbox({
+        ftxui::text("Cached  ") | ftxui::bold | ftxui::color(theme.primary),
+        ftxui::text(compact_token_count(metrics.cached_context_tokens)) |
+            ftxui::bold | ftxui::color(theme.accent),
+        ftxui::text("  (" +
+                    context_share(metrics.cached_context_tokens,
+                                  metrics.context_tokens) +
+                    ")") |
+            ftxui::bold | ftxui::color(theme.accent),
+    }));
+  }
+  rows.push_back(ftxui::separatorEmpty());
+  rows.push_back(ftxui::text("Estimated composition") | ftxui::bold |
+                 ftxui::color(theme.primary));
+  if (!metrics.context_breakdown.has_value()) {
+    rows.push_back(ftxui::text("Send a message to collect context details.") |
+                   ftxui::color(theme.text_muted));
+  } else {
+    const auto &breakdown = *metrics.context_breakdown;
+    rows.push_back(context_breakdown_row("System instructions",
+                                         breakdown.system_tokens,
+                                         metrics.context_tokens, theme));
+    rows.push_back(context_breakdown_row("User messages", breakdown.user_tokens,
+                                         metrics.context_tokens, theme));
+    rows.push_back(context_breakdown_row("Assistant messages",
+                                         breakdown.assistant_tokens,
+                                         metrics.context_tokens, theme));
+    rows.push_back(context_breakdown_row("Tool calls / results",
+                                         breakdown.tool_tokens,
+                                         metrics.context_tokens, theme));
+    rows.push_back(context_breakdown_row("Tool definitions",
+                                         breakdown.tool_definition_tokens,
+                                         metrics.context_tokens, theme));
+    rows.push_back(context_breakdown_row("Other / protocol",
+                                         breakdown.other_tokens,
+                                         metrics.context_tokens, theme));
+  }
+  rows.push_back(ftxui::separatorEmpty());
+  rows.push_back(
+      ftxui::text("Total is exact; categories are estimated. · Esc closes") |
+      ftxui::color(theme.text_muted));
+  return ftxui::vbox(std::move(rows)) |
+         ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 58) |
+         ftxui::color(theme.text) | ftxui::bgcolor(theme.input_background) |
+         ftxui::borderStyled(ftxui::ROUNDED, theme.secondary) |
+         ftxui::selectionStyleReset | ftxui::clear_under;
+}
+
+ftxui::Element render_terminal_context_overlay(
+    ftxui::Element page, const TerminalTokenMetrics &metrics,
+    core::TokenCount max_context_tokens, const TerminalTheme &theme) {
+  auto analysis = guard_full_width_boundary(
+      render_terminal_context_analysis(metrics, max_context_tokens, theme),
+      theme.background);
+  return ftxui::dbox({
+      std::move(page) | ftxui::dim,
+      std::move(analysis) | ftxui::center,
+  });
+}
+
+std::string terminal_clipboard_sequence(std::string_view text) {
+  if (text.empty())
+    return {};
+  return "\x1b]52;c;" + encode_base64(text) + "\x07";
 }
 
 void TerminalScrollState::scroll_up(std::size_t content_rows,
@@ -395,19 +722,6 @@ int TerminalScrollState::focus_row(std::size_t content_rows,
 
 bool TerminalScrollState::follows_latest() const { return follows_latest_; }
 
-bool TerminalWheelScrollFilter::accept(TerminalScrollDirection direction,
-                                       Clock::time_point event_time) {
-  constexpr auto kWheelBurstIdleTime = std::chrono::milliseconds(120);
-  const bool direction_changed =
-      last_direction_.has_value() && *last_direction_ != direction;
-  const bool burst_ended =
-      !last_event_time_.has_value() || event_time < *last_event_time_ ||
-      event_time - *last_event_time_ >= kWheelBurstIdleTime;
-  last_direction_ = direction;
-  last_event_time_ = event_time;
-  return direction_changed || burst_ended;
-}
-
 void TerminalPromptHistory::remember(std::string prompt) {
   if (!prompt.empty())
     prompts_.push_back(std::move(prompt));
@@ -456,7 +770,7 @@ void TerminalTranscript::begin_request(std::string user_input,
   if (initial_activity == TerminalActivity::action) {
     active_direct_command_ =
         append_message({TerminalMessageKind::command, std::move(user_input),
-                        "running…", true, false, false});
+                        "running…", true, true, false});
   } else {
     append_message({TerminalMessageKind::user, {}, std::move(user_input)});
   }
@@ -486,6 +800,13 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
       token_metrics_.context_tokens = event.model_usage->input_tokens;
       token_metrics_.input_tokens += event.model_usage->input_tokens;
       token_metrics_.output_tokens += event.model_usage->output_tokens;
+      token_metrics_.cached_context_tokens =
+          event.model_usage->cached_input_tokens;
+      token_metrics_.context_breakdown = event.model_usage->context_breakdown;
+      if (event.model_usage->output_tokens_per_second > 0.0) {
+        token_metrics_.output_tokens_per_second =
+            event.model_usage->output_tokens_per_second;
+      }
     }
     if (active_assistant_.has_value()) {
       if (!event.text.empty()) {
@@ -559,7 +880,7 @@ void TerminalTranscript::complete_request(
   if (active_direct_command_.has_value()) {
     auto &message = messages_[*active_direct_command_];
     if (result) {
-      if (message.content == "running…")
+      if (!result.value().empty() || message.content == "running…")
         message.content = result.value();
     } else {
       message.content = result.error().message;
@@ -582,10 +903,52 @@ void TerminalTranscript::append_command(
     std::string command, const core::Result<std::string> &result) {
   if (result) {
     append_message({TerminalMessageKind::command, std::move(command),
-                    result.value(), true, false, false});
+                    result.value(), true, true, false});
   } else {
     append_message({TerminalMessageKind::command, std::move(command),
-                    result.error().message, true, false, true});
+                    result.error().message, true, true, true});
+  }
+}
+
+void TerminalTranscript::restore(const std::vector<core::Message> &history) {
+  messages_.clear();
+  active_assistant_.reset();
+  active_tool_.reset();
+  active_direct_command_.reset();
+  request_ended_ = true;
+  request_error_seen_ = false;
+  activity_ = TerminalActivity::idle;
+  token_metrics_ = {};
+
+  std::unordered_map<core::ToolCallId, std::string> tool_names;
+  for (const auto &message : history) {
+    switch (message.role) {
+    case core::Role::system:
+      break;
+    case core::Role::user:
+      append_message(
+          {TerminalMessageKind::user, {}, message.content, false, true, false});
+      break;
+    case core::Role::assistant:
+      if (!message.content.empty()) {
+        append_message({TerminalMessageKind::assistant, "zeda", message.content,
+                        false, true, false});
+      }
+      for (const auto &call : message.tool_calls)
+        tool_names[call.id] = call.name;
+      break;
+    case core::Role::tool: {
+      std::string label = "tool";
+      if (message.tool_call_id.has_value()) {
+        const auto name = tool_names.find(*message.tool_call_id);
+        if (name != tool_names.end())
+          label = name->second;
+      }
+      append_message({TerminalMessageKind::tool, std::move(label),
+                      message.content, true, false, message.is_error});
+      break;
+    }
+    }
   }
 }
 
@@ -622,41 +985,42 @@ render_terminal_messages(const std::vector<TerminalMessage> &messages,
   return render_messages(messages, theme);
 }
 
-ftxui::Element
-render_terminal_welcome(std::string_view workspace, std::string_view model,
-                        std::string_view version, std::string_view session,
-                        core::ReasoningEffort reasoning_effort,
-                        bool quick_bash_enabled, ThemeKind theme_kind) {
+ftxui::Element render_terminal_input(ftxui::InputState state,
+                                     const TerminalTheme &theme) {
+  state.element |=
+      ftxui::color(state.is_placeholder ? theme.text_muted : theme.text);
+  state.element |= ftxui::bgcolor(theme.input_background);
+  if (state.focused) {
+    state.element =
+        std::make_shared<BlockCursorOverride>(std::move(state.element));
+  }
+  return state.element;
+}
+
+ftxui::Element render_terminal_welcome(std::string_view workspace,
+                                       std::string_view model,
+                                       std::string_view version,
+                                       core::ReasoningEffort reasoning_effort,
+                                       ThemeKind theme_kind) {
   const auto &theme = terminal_theme(theme_kind);
-  const auto metadata = [&](std::string label, std::string value) {
-    return ftxui::hbox({
-        ftxui::text(std::move(label)) | ftxui::color(theme.text_muted),
-        ftxui::text(std::move(value)) | ftxui::color(theme.text),
-    });
-  };
   return ftxui::vbox({
              ftxui::hbox({
                  ftxui::text(">_ ") | ftxui::color(theme.text_muted),
                  ftxui::text("zeda " + std::string(version)) | ftxui::bold |
                      ftxui::color(theme.primary),
              }),
-             ftxui::text("A predictable C++ coding agent for this workspace.") |
-                 ftxui::color(theme.text_muted),
-             ftxui::separatorEmpty(),
-             metadata("model:      ", std::string(model)),
-             metadata("reasoning:  ", std::string(core::reasoning_effort_name(
-                                          reasoning_effort))),
-             metadata("quick bash: ", quick_bash_enabled ? "on" : "off"),
-             metadata("theme:      ", std::string(theme_name(theme_kind))),
-             metadata("directory:  ", std::string(workspace)),
-             metadata("session:    ", std::string(session)),
-             metadata("tools:      ", "read · write · edit · grep · bash"),
-             ftxui::separatorEmpty(),
-             ftxui::text("Enter sends · Esc interrupts · mouse wheel scrolls") |
-                 ftxui::color(theme.text_muted),
-             ftxui::text("Commands: /help · /theme <light|monaka> · "
-                         "/quick-bash <on|off> · /reasoning <level>") |
-                 ftxui::color(theme.text_muted),
+             ftxui::hbox({
+                 ftxui::text("model: ") | ftxui::color(theme.text_muted),
+                 ftxui::text(std::string(model)) | ftxui::color(theme.text),
+                 ftxui::text(" · reasoning: ") | ftxui::color(theme.text_muted),
+                 ftxui::text(std::string(
+                     core::reasoning_effort_name(reasoning_effort))) |
+                     ftxui::color(theme.text),
+             }),
+             ftxui::hbox({
+                 ftxui::text("workspace: ") | ftxui::color(theme.text_muted),
+                 ftxui::text(std::string(workspace)) | ftxui::color(theme.text),
+             }),
          }) |
          ftxui::bgcolor(theme.background_panel) |
          ftxui::borderStyled(ftxui::ROUNDED, theme.border);
@@ -668,21 +1032,13 @@ TerminalRenderer::TerminalRenderer(std::ostream &output,
 
 void TerminalRenderer::banner(std::string_view workspace,
                               std::string_view model, std::string_view version,
-                              std::string_view session,
-                              bool quick_bash_enabled) {
+                              core::ReasoningEffort reasoning_effort) {
   output_ << render_text("zeda " + std::string(version), Tone::title) << "\n"
-          << render_text("workspace: " + std::string(workspace)) << "\n"
-          << render_text("model: " + std::string(model)) << "\n"
-          << render_text("session: " + std::string(session)) << "\n"
-          << render_text(std::string("quick bash: ") +
-                         (quick_bash_enabled ? "on" : "off"))
+          << render_text(
+                 "model: " + std::string(model) + " · reasoning: " +
+                 std::string(core::reasoning_effort_name(reasoning_effort)))
           << "\n"
-          << render_text("theme: " + std::string(theme_name(options_.theme)))
-          << "\n"
-          << render_text("commands: /help /theme <light|monaka> /reasoning "
-                         "<level> /session /skills /quick-bash <on|off> "
-                         "/skill <name> /exit")
-          << "\n\n";
+          << render_text("workspace: " + std::string(workspace)) << "\n";
 }
 
 void TerminalRenderer::prompt() {
@@ -788,17 +1144,21 @@ core::Result<std::string> TerminalInput::read_line() {
 
 TerminalApplication::TerminalApplication(
     std::string workspace, std::string model, std::string version,
+    core::TokenCount max_context_tokens,
     core::ReasoningEffort &reasoning_effort, ThemeKind &theme_kind,
-    QuickBashState quick_bash_enabled, InitialActivity initial_activity,
-    std::vector<TerminalCommandHint> command_hints, std::string session,
-    SubmitHandler submit, CommandHandler command)
+    QuickBashState quick_bash_enabled, SessionNameState session_name,
+    SessionLoader session_loader, InitialActivity initial_activity,
+    std::vector<TerminalCommandHint> command_hints, SubmitHandler submit,
+    CommandHandler command)
     : workspace_(std::move(workspace)), model_(std::move(model)),
-      version_(std::move(version)), reasoning_effort_(reasoning_effort),
-      theme_kind_(theme_kind),
+      version_(std::move(version)), max_context_tokens_(max_context_tokens),
+      reasoning_effort_(reasoning_effort), theme_kind_(theme_kind),
       quick_bash_enabled_(std::move(quick_bash_enabled)),
+      session_name_(std::move(session_name)),
+      session_loader_(std::move(session_loader)),
       initial_activity_(std::move(initial_activity)),
-      command_hints_(std::move(command_hints)), session_(std::move(session)),
-      submit_(std::move(submit)), command_(std::move(command)) {}
+      command_hints_(std::move(command_hints)), submit_(std::move(submit)),
+      command_(std::move(command)) {}
 
 TerminalApplication::~TerminalApplication() {
   if (active_cancellation_ != nullptr)
@@ -808,15 +1168,28 @@ TerminalApplication::~TerminalApplication() {
 }
 
 core::Result<void> TerminalApplication::run() {
-  if (!submit_ || !command_ || !quick_bash_enabled_ || !initial_activity_) {
+  if (!submit_ || !command_ || !quick_bash_enabled_ || !session_name_ ||
+      !session_loader_ || !initial_activity_) {
     return core::Result<void>::failure({
         core::ErrorCode::invalid_argument,
         "terminal application handlers are not configured",
     });
   }
+  const auto restored = reload_session();
+  if (!restored)
+    return restored;
 
   app_ = std::make_unique<ftxui::App>(ftxui::App::FullscreenAlternateScreen());
   app_->ForceHandleCtrlC(false);
+  app_->SelectionChange([this] {
+    const auto selection = app_->GetSelection();
+    if (!selection.empty())
+      selected_text_ = selection;
+    if (!selection_copy_pending_ || selected_text_.empty())
+      return;
+    selection_copy_pending_ = false;
+    copy_selection(selected_text_);
+  });
 
   ftxui::InputOption input_options;
   input_options.placeholder = "Ask zeda to do anything";
@@ -828,48 +1201,43 @@ core::Result<void> TerminalApplication::run() {
   };
   input_options.on_enter = [this] { submit_line(); };
   input_options.transform = [this](ftxui::InputState state) {
-    const auto &theme = terminal_theme(theme_kind_);
-    state.element |=
-        ftxui::color(state.is_placeholder ? theme.text_muted : theme.text);
-    state.element |= ftxui::bgcolor(theme.input_background);
-    if (state.hovered)
-      state.element |= ftxui::underlined;
-    return state.element;
+    return render_terminal_input(std::move(state), terminal_theme(theme_kind_));
   };
   input_component_ = ftxui::Input(&input_, input_options);
 
   auto root = ftxui::Renderer(input_component_, [this] {
     const auto &theme = terminal_theme(theme_kind_);
     const auto activity = transcript_.activity();
+    const auto now = std::chrono::steady_clock::now();
+    const bool copy_status_visible = !copy_status_.empty();
     if (activity != TerminalActivity::idle) {
       ftxui::animation::RequestAnimationFrame();
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch());
+        now.time_since_epoch());
     const auto spinner_frame = static_cast<std::size_t>(elapsed.count() / 80);
     auto content = ftxui::vbox({
-        render_terminal_welcome(workspace_, model_, version_, session_,
-                                reasoning_effort_, quick_bash_enabled_(),
+        render_terminal_welcome(workspace_, model_, version_, reasoning_effort_,
                                 theme_kind_),
         ftxui::separatorEmpty(),
         render_messages(transcript_.messages(), theme, &message_boxes_),
     });
-    content |= ftxui::reflect(scroll_content_box_);
+    content |= capture_layout_box(scroll_content_box_);
     if (scroll_state_.follows_latest()) {
       content |= ftxui::focusPositionRelative(0.0F, 1.0F);
     } else {
       content |= ftxui::focusPosition(
-          0, scroll_state_.focus_row(box_rows(scroll_content_box_),
+          0, scroll_state_.focus_row(layout_box_rows(scroll_content_box_),
                                      box_rows(scroll_viewport_box_)));
     }
     auto body = content | ftxui::vscroll_indicator | ftxui::yframe |
                 ftxui::flex | ftxui::reflect(scroll_viewport_box_);
-    auto composer =
+    auto composer = render_three_line_user_surface(
         ftxui::hbox({
             ftxui::text("› ") | ftxui::bold | ftxui::color(theme.primary),
             input_component_->Render() | ftxui::flex,
-        }) |
-        ftxui::bgcolor(theme.input_background);
+        }),
+        theme);
     const auto command_suggestions =
         terminal_command_suggestions(input_, command_hints_);
     const auto *command_help = terminal_command_help(input_, command_hints_);
@@ -910,8 +1278,8 @@ core::Result<void> TerminalApplication::run() {
     if (visible_suggestions > 0) {
       suggestion_rows.push_back(
           ftxui::text(command_suggestions.front().option
-                          ? "options · ↑/↓ select · tab complete"
-                          : "commands · ↑/↓ select · tab complete") |
+                          ? "options · ↑/↓ select · enter/tab complete"
+                          : "commands · ↑/↓ select · enter/tab complete") |
           ftxui::color(theme.text_muted));
     }
     for (std::size_t offset = 0; offset < visible_suggestions; ++offset) {
@@ -932,27 +1300,73 @@ core::Result<void> TerminalApplication::run() {
     auto suggestions = ftxui::vbox(std::move(suggestion_rows));
     const bool command_guide_visible =
         command_help != nullptr || !command_suggestions.empty();
-    auto footer = ftxui::hbox({
+    ftxui::Elements footer_elements{
         render_activity(activity, reasoning_effort_, spinner_frame, theme),
         ftxui::filler(),
-        ftxui::text(terminal_token_summary(transcript_.token_metrics())) |
-            ftxui::color(theme.text_muted),
-        ftxui::text(command_suggestions.empty() ? " · ? for shortcuts"
-                                                : " · tab completes") |
-            ftxui::color(theme.text_muted),
-    });
+    };
+    if (copy_status_visible) {
+      footer_elements.push_back(
+          ftxui::text(copy_status_) |
+          ftxui::color(copy_status_error_ ? theme.error : theme.success));
+      footer_elements.push_back(ftxui::text("  ") |
+                                ftxui::color(theme.text_muted));
+    }
+    const auto token_metrics = transcript_.token_metrics();
+    const auto context_summary =
+        terminal_context_summary(token_metrics, max_context_tokens_);
+    auto token_summary =
+        terminal_token_summary(token_metrics, max_context_tokens_);
+    token_summary.erase(0, context_summary.size());
+    footer_elements.push_back(ftxui::text(context_summary) | ftxui::bold |
+                              ftxui::color(theme.secondary) |
+                              ftxui::bgcolor(theme.input_background) |
+                              ftxui::reflect(context_footer_box_));
+    footer_elements.push_back(ftxui::text(std::move(token_summary)) |
+                              ftxui::color(theme.text_muted));
+    if (!command_suggestions.empty()) {
+      footer_elements.push_back(ftxui::text("  enter/tab complete") |
+                                ftxui::color(theme.text_muted));
+    }
+    auto footer = ftxui::hbox(std::move(footer_elements));
     ftxui::Elements layout{body, ftxui::separatorEmpty()};
     if (command_guide_visible) {
       layout.push_back(std::move(suggestions));
     }
     layout.push_back(std::move(composer));
     layout.push_back(std::move(footer));
-    return ftxui::vbox(std::move(layout)) | ftxui::color(theme.text) |
-           ftxui::bgcolor(theme.background) |
-           ftxui::selectionForegroundColor(theme.text) |
-           ftxui::selectionBackgroundColor(theme.background_element);
+    auto page = ftxui::vbox(std::move(layout)) | ftxui::color(theme.text) |
+                ftxui::bgcolor(theme.background) |
+                ftxui::selectionForegroundColor(theme.text) |
+                ftxui::selectionBackgroundColor(theme.background_element);
+    if (!context_analysis_visible_)
+      return page;
+    return render_terminal_context_overlay(std::move(page), token_metrics,
+                                           max_context_tokens_, theme);
   });
   root |= ftxui::CatchEvent([this](ftxui::Event event) {
+    if (event != ftxui::Event::Custom && !copy_status_.empty()) {
+      copy_status_.clear();
+      copy_status_error_ = false;
+    }
+    if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left) {
+      const auto &mouse = event.mouse();
+      if (mouse.motion == ftxui::Mouse::Pressed &&
+          context_footer_box_.Contain(mouse.x, mouse.y)) {
+        context_footer_pressed_ = true;
+        return true;
+      }
+      if (mouse.motion == ftxui::Mouse::Released &&
+          std::exchange(context_footer_pressed_, false)) {
+        if (context_footer_box_.Contain(mouse.x, mouse.y))
+          context_analysis_visible_ = !context_analysis_visible_;
+        return true;
+      }
+    }
+    if (context_analysis_visible_) {
+      if (event == ftxui::Event::Escape)
+        context_analysis_visible_ = false;
+      return event != ftxui::Event::Custom;
+    }
     const auto command_suggestions =
         terminal_command_suggestions(input_, command_hints_);
     if (!busy_ && !command_suggestions.empty()) {
@@ -967,7 +1381,7 @@ core::Result<void> TerminalApplication::run() {
             command_suggestions.size();
         return true;
       }
-      if (event == ftxui::Event::Tab) {
+      if (is_terminal_command_completion_event(event)) {
         input_ = complete_terminal_command(input_, command_hints_,
                                            selected_command_suggestion_);
         input_cursor_position_ = static_cast<int>(input_.size());
@@ -986,32 +1400,63 @@ core::Result<void> TerminalApplication::run() {
       }
       return true;
     }
-    if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left &&
-        event.mouse().motion == ftxui::Mouse::Pressed) {
-      const auto &messages = transcript_.messages();
-      const auto box_count = std::min(messages.size(), message_boxes_.size());
-      for (std::size_t index = 0; index < box_count; ++index) {
-        if (messages[index].collapsible &&
-            message_boxes_[index].Contain(event.mouse().x, event.mouse().y)) {
-          return transcript_.toggle_message_expansion(index);
+    if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left) {
+      const auto &mouse = event.mouse();
+      if (mouse.motion == ftxui::Mouse::Pressed) {
+        mouse_selection_pressed_ =
+            scroll_viewport_box_.Contain(mouse.x, mouse.y);
+        mouse_selection_dragged_ = false;
+        mouse_press_x_ = mouse.x;
+        mouse_press_y_ = mouse.y;
+        selection_copy_pending_ = false;
+        selected_text_.clear();
+        pressed_collapsible_message_.reset();
+        if (mouse_selection_pressed_) {
+          const auto &messages = transcript_.messages();
+          const auto box_count =
+              std::min(messages.size(), message_boxes_.size());
+          for (std::size_t index = 0; index < box_count; ++index) {
+            if (messages[index].collapsible &&
+                message_boxes_[index].Contain(mouse.x, mouse.y)) {
+              pressed_collapsible_message_ = index;
+              break;
+            }
+          }
+        }
+      } else if (mouse.motion == ftxui::Mouse::Moved &&
+                 mouse_selection_pressed_) {
+        mouse_selection_dragged_ = mouse_selection_dragged_ ||
+                                   mouse.x != mouse_press_x_ ||
+                                   mouse.y != mouse_press_y_;
+      } else if (mouse.motion == ftxui::Mouse::Released &&
+                 mouse_selection_pressed_) {
+        mouse_selection_pressed_ = false;
+        const bool dragged = std::exchange(mouse_selection_dragged_, false);
+        const auto clicked_message =
+            std::exchange(pressed_collapsible_message_, std::nullopt);
+        if (dragged) {
+          if (selected_text_.empty()) {
+            selection_copy_pending_ = true;
+          } else {
+            copy_selection(selected_text_);
+          }
+          return false;
+        }
+        if (clicked_message.has_value() &&
+            *clicked_message < message_boxes_.size() &&
+            message_boxes_[*clicked_message].Contain(mouse.x, mouse.y)) {
+          return transcript_.toggle_message_expansion(*clicked_message);
         }
       }
     }
     if (event.is_mouse() && event.mouse().motion == ftxui::Mouse::Pressed &&
         (event.mouse().button == ftxui::Mouse::WheelUp ||
          event.mouse().button == ftxui::Mouse::WheelDown)) {
-      const auto direction = event.mouse().button == ftxui::Mouse::WheelUp
-                                 ? TerminalScrollDirection::up
-                                 : TerminalScrollDirection::down;
-      if (!wheel_scroll_filter_.accept(direction,
-                                       std::chrono::steady_clock::now())) {
-        return true;
-      }
-      if (direction == TerminalScrollDirection::up) {
-        scroll_state_.scroll_up(box_rows(scroll_content_box_),
+      if (event.mouse().button == ftxui::Mouse::WheelUp) {
+        scroll_state_.scroll_up(layout_box_rows(scroll_content_box_),
                                 box_rows(scroll_viewport_box_));
       } else {
-        scroll_state_.scroll_down(box_rows(scroll_content_box_),
+        scroll_state_.scroll_down(layout_box_rows(scroll_content_box_),
                                   box_rows(scroll_viewport_box_));
       }
       return true;
@@ -1038,6 +1483,24 @@ core::Result<void> TerminalApplication::run() {
   return core::Result<void>::success();
 }
 
+core::Result<void> TerminalApplication::reload_session() {
+  const auto history = session_loader_();
+  if (!history) {
+    return core::Result<void>::failure({
+        core::ErrorCode::session_error,
+        "cannot restore terminal session: " + history.error().message,
+    });
+  }
+  transcript_.restore(history.value());
+  return core::Result<void>::success();
+}
+
+void TerminalApplication::copy_selection(std::string_view selection) {
+  std::cout << terminal_clipboard_sequence(selection) << std::flush;
+  copy_status_error_ = !std::cout.good();
+  copy_status_ = copy_status_error_ ? "copy failed" : "selection copied";
+}
+
 void TerminalApplication::submit_line() {
   if (input_.empty() || busy_)
     return;
@@ -1051,12 +1514,35 @@ void TerminalApplication::submit_line() {
       app_->Exit();
       return;
     }
-    const auto result = command_(command.name, command.arguments);
+    if (worker_.joinable())
+      worker_.join();
+    busy_ = true;
     scroll_state_.follow_latest();
     const std::string display =
         "/" + command.name +
         (command.arguments.empty() ? std::string{} : " " + command.arguments);
-    transcript_.append_command(display, result);
+    transcript_.begin_request(display, TerminalActivity::action);
+    active_cancellation_ = std::make_shared<core::CancellationSource>();
+    const auto cancellation = active_cancellation_;
+    worker_ = std::thread([this, command, cancellation] {
+      const auto post_event = [this](core::AgentEvent event) {
+        app_->Post([this, event = std::move(event)] {
+          transcript_.append_event(event);
+        });
+      };
+      auto result = command_(command.name, command.arguments,
+                             cancellation->token(), post_event);
+      app_->Post([this, command, result = std::move(result)]() mutable {
+        if (result && command.name == "session" && !command.arguments.empty()) {
+          const auto restored = reload_session();
+          if (!restored)
+            result = core::Result<std::string>::failure(restored.error());
+        }
+        transcript_.complete_request(result);
+        busy_ = false;
+        active_cancellation_.reset();
+      });
+    });
     return;
   }
 

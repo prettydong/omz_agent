@@ -1,5 +1,7 @@
 #include "zed/core/tool_registry.hpp"
 
+#include "zed/core/utf8.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <string_view>
@@ -177,7 +179,19 @@ Result<ToolResult> ToolRegistry::execute(const ToolCall &call,
     target = iterator->get();
   }
 
-  return target->execute(call, cancellation);
+  auto execution = target->execute(call, cancellation);
+  if (!execution)
+    return execution;
+
+  auto result = std::move(execution.value());
+  auto sanitized = sanitize_utf8(result.content);
+  if (sanitized.replacement_count > 0) {
+    sanitized.text += "\n[warning: replaced " +
+                      std::to_string(sanitized.replacement_count) +
+                      " invalid UTF-8 byte(s) in tool output]";
+  }
+  result.content = std::move(sanitized.text);
+  return Result<ToolResult>::success(std::move(result));
 }
 
 } // namespace zed::core

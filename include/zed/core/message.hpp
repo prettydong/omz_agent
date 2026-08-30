@@ -9,24 +9,25 @@
 namespace zed::core {
 
 enum class Role {
-    system,
-    user,
-    assistant,
-    tool,
+  system,
+  user,
+  assistant,
+  tool,
 };
 
 struct ToolCall {
-    ToolCallId id;
-    std::string name;
-    std::string arguments_json;
+  ToolCallId id;
+  std::string name;
+  std::string arguments_json;
 };
 
 struct Message {
-    MessageId id;
-    Role role{Role::user};
-    std::string content;
-    std::vector<ToolCall> tool_calls;
-    std::optional<ToolCallId> tool_call_id;
+  MessageId id;
+  Role role{Role::user};
+  std::string content;
+  std::vector<ToolCall> tool_calls;
+  std::optional<ToolCallId> tool_call_id;
+  bool is_error{false};
 };
 
-}  // namespace zed::core
+} // namespace zed::core

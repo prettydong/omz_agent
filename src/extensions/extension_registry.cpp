@@ -6,7 +6,8 @@
 namespace zed::extensions {
 
 core::Result<void> ExtensionRegistry::register_command(Command command) {
-  if (command.name.empty() || !command.execute) {
+  if (command.name.empty() ||
+      (!command.execute && !command.execute_with_events)) {
     return core::Result<void>::failure({
         core::ErrorCode::invalid_argument,
         "extension command needs a name and handler",
@@ -49,8 +50,9 @@ core::Result<void> ExtensionRegistry::register_command(Command command) {
 }
 
 core::Result<std::string>
-ExtensionRegistry::execute(std::string_view name,
-                           std::string_view arguments) const {
+ExtensionRegistry::execute(std::string_view name, std::string_view arguments,
+                           core::CancellationToken cancellation,
+                           core::AgentEventCallback on_event) const {
   const auto iterator = std::find_if(
       commands_.begin(), commands_.end(),
       [&](const Command &command) { return command.name == name; });
@@ -60,6 +62,9 @@ ExtensionRegistry::execute(std::string_view name,
         "extension command not found: " + std::string(name),
     });
   }
+  if (iterator->execute_with_events)
+    return iterator->execute_with_events(arguments, cancellation,
+                                         std::move(on_event));
   return iterator->execute(arguments);
 }
 

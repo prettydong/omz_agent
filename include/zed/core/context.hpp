@@ -18,6 +18,10 @@ struct ContextLimits {
   bool automatic_compaction{true};
 };
 
+[[nodiscard]] ContextLimits
+cap_context_limits(ContextLimits configured,
+                   TokenCount model_max_context_tokens);
+
 struct ContextUsage {
   TokenCount input_tokens{};
   TokenCount available_tokens{};

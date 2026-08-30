@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "zed/app/config.hpp"
+#include "zed/support/atomic_file.hpp"
 
 namespace {
 
@@ -26,6 +28,26 @@ int main() {
       ("zeda-config-smoke-workspace-" + std::to_string(getpid()));
   std::filesystem::remove_all(config_workspace);
   std::filesystem::create_directories(config_workspace);
+  const auto atomic_path = config_workspace / "atomic" / "settings.json";
+  assert(zed::support::write_private_file_atomically(atomic_path, "first",
+                                                     "test settings"));
+  assert(zed::support::write_private_file_atomically(atomic_path, "second",
+                                                     "test settings"));
+  {
+    std::ifstream saved(atomic_path, std::ios::binary);
+    assert(saved);
+    assert(std::string(std::istreambuf_iterator<char>(saved), {}) == "second");
+  }
+  const auto symlink_target = config_workspace / "atomic-target.json";
+  {
+    std::ofstream target(symlink_target);
+    assert(target);
+    target << "unchanged";
+  }
+  const auto symlink_path = config_workspace / "atomic-link.json";
+  std::filesystem::create_symlink(symlink_target, symlink_path);
+  assert(!zed::support::write_private_file_atomically(symlink_path, "replaced",
+                                                      "test settings"));
   const auto auth_path =
       std::filesystem::temp_directory_path() /
       ("zeda-config-smoke-auth-" + std::to_string(getpid()) + ".json");

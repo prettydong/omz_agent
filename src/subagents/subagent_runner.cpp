@@ -1,6 +1,8 @@
 #include "zed/subagents/subagent_runner.hpp"
 
 #include "zed/subagents/worker_protocol.hpp"
+#include "zed/support/child_process.hpp"
+#include "zed/support/unique_fd.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,7 +19,6 @@
 #include <string_view>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -26,38 +27,7 @@ namespace zed::subagents {
 namespace {
 
 using core::ErrorCode;
-
-class UniqueFd {
-public:
-  UniqueFd() = default;
-  explicit UniqueFd(int descriptor) : descriptor_(descriptor) {}
-  ~UniqueFd() { reset(); }
-
-  UniqueFd(const UniqueFd &) = delete;
-  UniqueFd &operator=(const UniqueFd &) = delete;
-
-  UniqueFd(UniqueFd &&other) noexcept
-      : descriptor_(std::exchange(other.descriptor_, -1)) {}
-  UniqueFd &operator=(UniqueFd &&other) noexcept {
-    if (this != &other) {
-      reset();
-      descriptor_ = std::exchange(other.descriptor_, -1);
-    }
-    return *this;
-  }
-
-  [[nodiscard]] int get() const { return descriptor_; }
-  [[nodiscard]] bool valid() const { return descriptor_ >= 0; }
-
-  void reset(int descriptor = -1) {
-    if (descriptor_ >= 0)
-      close(descriptor_);
-    descriptor_ = descriptor;
-  }
-
-private:
-  int descriptor_{-1};
-};
+using support::UniqueFd;
 
 void close_pair(int (&descriptors)[2]) {
   for (int &descriptor : descriptors) {
@@ -88,40 +58,6 @@ bool write_all(int descriptor, std::string_view content) {
     return false;
   }
   return true;
-}
-
-bool process_exited(pid_t child, int &status) {
-  while (true) {
-    const auto waited = waitpid(child, &status, WNOHANG);
-    if (waited == child)
-      return true;
-    if (waited == 0)
-      return false;
-    if (waited < 0 && errno == EINTR)
-      continue;
-    return waited < 0 && errno == ECHILD;
-  }
-}
-
-void terminate_process(pid_t child, std::chrono::milliseconds grace,
-                       bool &reaped, int &status) {
-  if (reaped)
-    return;
-  if (kill(-child, SIGTERM) != 0)
-    static_cast<void>(kill(child, SIGTERM));
-  const auto deadline = std::chrono::steady_clock::now() + grace;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (process_exited(child, status)) {
-      reaped = true;
-      return;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  if (kill(-child, SIGKILL) != 0)
-    static_cast<void>(kill(child, SIGKILL));
-  while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
-  }
-  reaped = true;
 }
 
 std::string lowercase_ascii(std::string value) {
@@ -175,8 +111,10 @@ spawn_worker(const ProcessSubagentRunnerConfig &config) {
   int input_pipe[2]{-1, -1};
   int output_pipe[2]{-1, -1};
   int error_pipe[2]{-1, -1};
-  if (pipe(input_pipe) != 0 || pipe(output_pipe) != 0 ||
-      pipe(error_pipe) != 0) {
+  auto spawn_lock = support::lock_process_spawn();
+  if (!support::create_cloexec_pipe(input_pipe) ||
+      !support::create_cloexec_pipe(output_pipe) ||
+      !support::create_cloexec_pipe(error_pipe)) {
     close_pair(input_pipe);
     close_pair(output_pipe);
     close_pair(error_pipe);
@@ -214,6 +152,8 @@ spawn_worker(const ProcessSubagentRunnerConfig &config) {
     execvp(arguments[0], arguments.data());
     _exit(127);
   }
+
+  spawn_lock.unlock();
 
   static_cast<void>(setpgid(child, child));
   close(input_pipe[0]);
@@ -272,7 +212,8 @@ ProcessSubagentRunner::run(const SubagentTask &task,
   bool reaped = false;
   int status = 0;
   const auto cleanup = [&] {
-    terminate_process(worker.pid, config_.termination_grace, reaped, status);
+    support::terminate_process_group(worker.pid, config_.termination_grace,
+                                     reaped, status);
   };
 
   auto request = serialize_worker_request({task.agent, task.task});
@@ -413,7 +354,7 @@ ProcessSubagentRunner::run(const SubagentTask &task,
       handle_line(line);
     }
 
-    if (!reaped && process_exited(worker.pid, status))
+    if (!reaped && support::try_reap_child(worker.pid, status))
       reaped = true;
     if (reaped && output_eof && error_eof)
       break;

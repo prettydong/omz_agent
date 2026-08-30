@@ -2,10 +2,12 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 
 #include "zed/core/session_store.hpp"
+#include "zed/support/unique_fd.hpp"
 
 namespace zed::session {
 
@@ -61,11 +63,16 @@ public:
   [[nodiscard]] const std::filesystem::path &path() const { return path_; }
 
 private:
+  struct CachedSession;
+
   core::Result<void> acquire_write_lock();
+  core::Result<void> refresh_cache(bool allow_trailing_partial_record) const;
+  void mark_cache_current() const;
   void release_write_lock();
 
   std::filesystem::path path_;
-  int lock_fd_{-1};
+  support::UniqueFd lock_fd_;
+  mutable std::unique_ptr<CachedSession> cache_;
 };
 
 } // namespace zed::session

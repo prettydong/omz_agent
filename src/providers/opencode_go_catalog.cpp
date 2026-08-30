@@ -1,14 +1,14 @@
 #include "zed/providers/opencode_go_catalog.hpp"
 
+#include "zed/support/child_process.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
-#include <csignal>
 #include <fcntl.h>
 #include <poll.h>
 #include <string>
 #include <sys/wait.h>
-#include <thread>
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
@@ -20,27 +20,6 @@ namespace {
 using Json = nlohmann::json;
 
 constexpr std::size_t kMaxCatalogBytes = 4 * 1024 * 1024;
-
-void terminate_catalog_process(pid_t child, int *status) {
-  int local_status = 0;
-  int *target_status = status == nullptr ? &local_status : status;
-  if (kill(-child, SIGTERM) != 0)
-    static_cast<void>(kill(child, SIGTERM));
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-  while (std::chrono::steady_clock::now() < deadline) {
-    const auto waited = waitpid(child, target_status, WNOHANG);
-    if (waited == child || (waited < 0 && errno == ECHILD))
-      return;
-    if (waited < 0 && errno != EINTR)
-      return;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  if (kill(-child, SIGKILL) != 0)
-    static_cast<void>(kill(child, SIGKILL));
-  while (waitpid(child, target_status, 0) < 0 && errno == EINTR) {
-  }
-}
 
 std::string_view trim_ascii(std::string_view value) {
   while (!value.empty() && (value.front() == ' ' || value.front() == '\t' ||
@@ -82,8 +61,9 @@ capture_catalog(std::string_view executable, std::size_t timeout_ms,
     });
   }
 
+  auto spawn_lock = support::lock_process_spawn();
   int output_pipe[2];
-  if (pipe(output_pipe) != 0) {
+  if (!support::create_cloexec_pipe(output_pipe)) {
     return core::Result<std::string>::failure({
         core::ErrorCode::internal,
         "cannot create OpenCode model discovery pipe",
@@ -121,11 +101,19 @@ capture_catalog(std::string_view executable, std::size_t timeout_ms,
     _exit(127);
   }
 
+  spawn_lock.unlock();
+
   setpgid(child, child);
   close(output_pipe[1]);
+  bool child_finished = false;
+  int status = 0;
+  const auto terminate_child = [&] {
+    support::terminate_process_group(child, std::chrono::milliseconds(250),
+                                     child_finished, status);
+  };
   const int flags = fcntl(output_pipe[0], F_GETFL, 0);
   if (flags < 0 || fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK) < 0) {
-    terminate_catalog_process(child, nullptr);
+    terminate_child();
     close(output_pipe[0]);
     return core::Result<std::string>::failure({
         core::ErrorCode::internal,
@@ -135,12 +123,10 @@ capture_catalog(std::string_view executable, std::size_t timeout_ms,
 
   std::string output;
   bool pipe_closed = false;
-  bool child_finished = false;
-  int status = 0;
   const auto started_at = std::chrono::steady_clock::now();
   while (!pipe_closed || !child_finished) {
     if (cancellation.is_cancelled()) {
-      terminate_catalog_process(child, &status);
+      terminate_child();
       close(output_pipe[0]);
       return core::Result<std::string>::failure({
           core::ErrorCode::cancelled,
@@ -151,7 +137,7 @@ capture_catalog(std::string_view executable, std::size_t timeout_ms,
                              std::chrono::steady_clock::now() - started_at)
                              .count();
     if (elapsed >= static_cast<long long>(timeout_ms)) {
-      terminate_catalog_process(child, &status);
+      terminate_child();
       close(output_pipe[0]);
       return core::Result<std::string>::failure({
           core::ErrorCode::timeout,
@@ -162,7 +148,7 @@ capture_catalog(std::string_view executable, std::size_t timeout_ms,
     pollfd descriptor{output_pipe[0], POLLIN | POLLHUP, 0};
     const int poll_result = poll(&descriptor, 1, 50);
     if (poll_result < 0 && errno != EINTR) {
-      terminate_catalog_process(child, &status);
+      terminate_child();
       close(output_pipe[0]);
       return core::Result<std::string>::failure({
           core::ErrorCode::internal,
@@ -176,7 +162,7 @@ capture_catalog(std::string_view executable, std::size_t timeout_ms,
         if (count > 0) {
           output.append(buffer, static_cast<std::size_t>(count));
           if (output.size() > kMaxCatalogBytes) {
-            terminate_catalog_process(child, &status);
+            terminate_child();
             close(output_pipe[0]);
             return core::Result<std::string>::failure({
                 core::ErrorCode::internal,
@@ -198,9 +184,7 @@ capture_catalog(std::string_view executable, std::size_t timeout_ms,
       }
     }
 
-    const pid_t waited = waitpid(child, &status, WNOHANG);
-    if (waited == child)
-      child_finished = true;
+    child_finished = support::try_reap_child(child, status);
   }
   close(output_pipe[0]);
 

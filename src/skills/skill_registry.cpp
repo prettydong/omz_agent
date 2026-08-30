@@ -1,18 +1,14 @@
 #include "zed/skills/skill_registry.hpp"
 
 #include "zed/core/utf8.hpp"
+#include "zed/support/atomic_file.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
-#include <cerrno>
 #include <chrono>
-#include <cstring>
-#include <fcntl.h>
 #include <fstream>
 #include <sstream>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace zed::skills {
 
@@ -54,90 +50,6 @@ bool valid_metadata(std::string_view value, std::size_t maximum,
   return std::none_of(value.begin(), value.end(), [](unsigned char character) {
     return character < 0x20 || character == 0x7f;
   });
-}
-
-core::Result<void> write_skill_file(const std::filesystem::path &path,
-                                    std::string_view content) {
-  const auto directory = path.parent_path();
-  std::error_code error;
-  std::filesystem::create_directories(directory, error);
-  if (error) {
-    return core::Result<void>::failure({
-        core::ErrorCode::invalid_argument,
-        "cannot create skill directory " + directory.string() + ": " +
-            error.message(),
-    });
-  }
-  const auto directory_status =
-      std::filesystem::symlink_status(directory, error);
-  if (error || std::filesystem::is_symlink(directory_status) ||
-      !std::filesystem::is_directory(directory_status)) {
-    return core::Result<void>::failure({
-        core::ErrorCode::invalid_argument,
-        "skill directory must be a regular directory: " + directory.string(),
-    });
-  }
-  const auto existing = std::filesystem::symlink_status(path, error);
-  if (!error && (std::filesystem::is_symlink(existing) ||
-                 !std::filesystem::is_regular_file(existing))) {
-    return core::Result<void>::failure({
-        core::ErrorCode::invalid_argument,
-        "skill file must be a regular file: " + path.string(),
-    });
-  }
-  if (error != std::errc::no_such_file_or_directory && error) {
-    return core::Result<void>::failure({
-        core::ErrorCode::invalid_argument,
-        "cannot inspect skill file " + path.string() + ": " + error.message(),
-    });
-  }
-
-  static std::atomic<unsigned long> sequence{0};
-  const auto temporary = path.string() + ".tmp." + std::to_string(getpid()) +
-                         "." + std::to_string(sequence.fetch_add(1));
-  const int descriptor =
-      open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-  if (descriptor < 0) {
-    return core::Result<void>::failure(
-        {core::ErrorCode::internal, "cannot create temporary skill file: " +
-                                        std::string(std::strerror(errno))});
-  }
-  std::size_t offset = 0;
-  while (offset < content.size()) {
-    const auto written =
-        write(descriptor, content.data() + offset, content.size() - offset);
-    if (written > 0) {
-      offset += static_cast<std::size_t>(written);
-      continue;
-    }
-    if (written < 0 && errno == EINTR)
-      continue;
-    const auto message = std::string(std::strerror(errno));
-    close(descriptor);
-    std::filesystem::remove(temporary, error);
-    return core::Result<void>::failure(
-        {core::ErrorCode::internal,
-         "cannot write temporary skill file: " + message});
-  }
-  const int sync_result = fsync(descriptor);
-  const int sync_error = errno;
-  const int close_result = close(descriptor);
-  if (sync_result != 0 || close_result != 0) {
-    const auto message =
-        std::string(std::strerror(sync_result != 0 ? sync_error : errno));
-    std::filesystem::remove(temporary, error);
-    return core::Result<void>::failure(
-        {core::ErrorCode::internal,
-         "cannot flush temporary skill file: " + message});
-  }
-  if (rename(temporary.c_str(), path.c_str()) != 0) {
-    const auto message = std::string(std::strerror(errno));
-    std::filesystem::remove(temporary, error);
-    return core::Result<void>::failure(
-        {core::ErrorCode::internal, "cannot replace skill file: " + message});
-  }
-  static_cast<void>(chmod(path.c_str(), 0600));
-  return core::Result<void>::success();
 }
 
 std::string serialize_skill(const ManagedSkill &skill) {
@@ -451,8 +363,8 @@ save_workspace_skills(const std::filesystem::path &workspace,
         });
       }
     }
-    const auto saved = write_skill_file(desired_directory / "SKILL.md",
-                                        serialize_skill(skill));
+    const auto saved = support::write_private_file_atomically(
+        desired_directory / "SKILL.md", serialize_skill(skill), "skill file");
     if (!saved)
       return saved;
   }

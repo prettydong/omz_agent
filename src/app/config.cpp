@@ -4,22 +4,17 @@
 #include "zed/core/model_context_controller.hpp"
 #include "zed/core/utf8.hpp"
 #include "zed/session/session_catalog.hpp"
+#include "zed/support/atomic_file.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
-#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
-#include <fcntl.h>
 #include <fstream>
 #include <iterator>
 #include <span>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <nlohmann/json.hpp>
 
@@ -273,108 +268,6 @@ core::Result<void> validate_workspace_config(const WorkspaceConfig &config) {
   return core::Result<void>::success();
 }
 
-core::Result<void> write_file_atomically(const std::filesystem::path &path,
-                                         std::string_view content,
-                                         std::string_view description) {
-  const auto directory = path.parent_path();
-  std::error_code filesystem_error;
-  std::filesystem::create_directories(directory, filesystem_error);
-  if (filesystem_error) {
-    return core::Result<void>::failure({
-        core::ErrorCode::invalid_argument,
-        "cannot create " + std::string(description) + " directory " +
-            directory.string() + ": " + filesystem_error.message(),
-    });
-  }
-  const auto directory_status =
-      std::filesystem::symlink_status(directory, filesystem_error);
-  if (filesystem_error || std::filesystem::is_symlink(directory_status) ||
-      !std::filesystem::is_directory(directory_status)) {
-    return core::Result<void>::failure({
-        core::ErrorCode::invalid_argument,
-        std::string(description) +
-            " directory must be a regular directory, not a symlink: " +
-            directory.string(),
-    });
-  }
-  const auto existing = std::filesystem::symlink_status(path, filesystem_error);
-  if (!filesystem_error && (std::filesystem::is_symlink(existing) ||
-                            !std::filesystem::is_regular_file(existing))) {
-    return core::Result<void>::failure({
-        core::ErrorCode::invalid_argument,
-        std::string(description) +
-            " path must be a regular file, not a symlink: " + path.string(),
-    });
-  }
-  if (filesystem_error != std::errc::no_such_file_or_directory &&
-      filesystem_error) {
-    return core::Result<void>::failure({
-        core::ErrorCode::invalid_argument,
-        "cannot inspect " + std::string(description) + " " + path.string() +
-            ": " + filesystem_error.message(),
-    });
-  }
-
-  static std::atomic<unsigned long> sequence{0};
-  const auto temporary = path.string() + ".tmp." + std::to_string(getpid()) +
-                         "." + std::to_string(sequence.fetch_add(1));
-  const int descriptor =
-      open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-  if (descriptor < 0) {
-    return core::Result<void>::failure({
-        core::ErrorCode::internal,
-        "cannot create temporary " + std::string(description) + ": " +
-            std::string(std::strerror(errno)),
-    });
-  }
-  std::size_t offset = 0;
-  while (offset < content.size()) {
-    const auto written =
-        write(descriptor, content.data() + offset, content.size() - offset);
-    if (written > 0) {
-      offset += static_cast<std::size_t>(written);
-      continue;
-    }
-    if (written < 0 && errno == EINTR)
-      continue;
-    const auto message = std::string(std::strerror(errno));
-    close(descriptor);
-    std::filesystem::remove(temporary, filesystem_error);
-    return core::Result<void>::failure({
-        core::ErrorCode::internal,
-        "cannot write temporary " + std::string(description) + ": " + message,
-    });
-  }
-  const int sync_result = fsync(descriptor);
-  const int sync_error = errno;
-  const int close_result = close(descriptor);
-  if (sync_result != 0 || close_result != 0) {
-    const auto message =
-        std::string(std::strerror(sync_result != 0 ? sync_error : errno));
-    std::filesystem::remove(temporary, filesystem_error);
-    return core::Result<void>::failure({
-        core::ErrorCode::internal,
-        "cannot flush temporary " + std::string(description) + ": " + message,
-    });
-  }
-  if (rename(temporary.c_str(), path.c_str()) != 0) {
-    const auto message = std::string(std::strerror(errno));
-    std::filesystem::remove(temporary, filesystem_error);
-    return core::Result<void>::failure({
-        core::ErrorCode::internal,
-        "cannot replace " + std::string(description) + ": " + message,
-    });
-  }
-  static_cast<void>(chmod(path.c_str(), 0600));
-  const int directory_descriptor =
-      open(directory.c_str(), O_RDONLY | O_CLOEXEC);
-  if (directory_descriptor >= 0) {
-    static_cast<void>(fsync(directory_descriptor));
-    close(directory_descriptor);
-  }
-  return core::Result<void>::success();
-}
-
 std::string environment_or(const char *name, std::string fallback = {}) {
   const char *value = std::getenv(name);
   return value == nullptr ? std::move(fallback) : std::string(value);
@@ -510,8 +403,8 @@ load_or_install_prompt(const std::filesystem::path &path,
   const auto status = std::filesystem::symlink_status(path, status_error);
   if (status_error == std::errc::no_such_file_or_directory ||
       (!status_error && !std::filesystem::exists(status))) {
-    const auto installed =
-        write_file_atomically(path, default_prompt, description);
+    const auto installed = support::write_private_file_atomically(
+        path, default_prompt, description);
     if (!installed)
       return core::Result<std::string>::failure(installed.error());
     return core::Result<std::string>::success(std::string(default_prompt));
@@ -1120,9 +1013,9 @@ core::Result<void> save_workspace_config(const std::filesystem::path &workspace,
   const auto valid = validate_workspace_config(config);
   if (!valid)
     return valid;
-  return write_file_atomically(workspace_config_path(workspace),
-                               serialize_workspace_config(config),
-                               "workspace configuration");
+  return support::write_private_file_atomically(
+      workspace_config_path(workspace), serialize_workspace_config(config),
+      "workspace configuration");
 }
 
 core::Result<WorkspacePrompts>
@@ -1174,18 +1067,19 @@ save_workspace_prompts(const std::filesystem::path &workspace,
   const auto valid = validate_workspace_prompts(prompts);
   if (!valid)
     return valid;
-  const auto saved_agent =
-      write_file_atomically(workspace / kSystemPromptRelativePath,
-                            prompts.agent, "main Agent system prompt");
+  const auto saved_agent = support::write_private_file_atomically(
+      workspace / kSystemPromptRelativePath, prompts.agent,
+      "main Agent system prompt");
   if (!saved_agent)
     return saved_agent;
-  const auto saved_explorer =
-      write_file_atomically(workspace / kExplorerSystemPromptRelativePath,
-                            prompts.explorer, "Explorer system prompt");
+  const auto saved_explorer = support::write_private_file_atomically(
+      workspace / kExplorerSystemPromptRelativePath, prompts.explorer,
+      "Explorer system prompt");
   if (!saved_explorer)
     return saved_explorer;
-  return write_file_atomically(workspace / kContextSystemPromptRelativePath,
-                               prompts.context, "context system prompt");
+  return support::write_private_file_atomically(
+      workspace / kContextSystemPromptRelativePath, prompts.context,
+      "context system prompt");
 }
 
 core::Result<void>
@@ -1326,9 +1220,10 @@ save_agent_management(const std::filesystem::path &workspace,
   const auto valid = validate_agent_management(management);
   if (!valid)
     return valid;
-  return write_file_atomically(agent_management_path(workspace),
-                               serialize_agent_management_config(management),
-                               "agent management configuration");
+  return support::write_private_file_atomically(
+      agent_management_path(workspace),
+      serialize_agent_management_config(management),
+      "agent management configuration");
 }
 
 core::Result<RuntimeConfig>

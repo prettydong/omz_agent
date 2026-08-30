@@ -460,6 +460,20 @@ TerminalCommand parse_terminal_command(std::string_view line) {
   return {std::string(line.substr(0, name_length)), std::string(arguments)};
 }
 
+bool terminal_command_reloads_session(std::string_view name,
+                                      std::string_view arguments) {
+  if (name != "session")
+    return false;
+  arguments = trim_command_whitespace(arguments);
+  if (arguments.empty())
+    return false;
+  const auto separator =
+      std::find_if(arguments.begin(), arguments.end(), is_command_whitespace);
+  const auto subcommand = arguments.substr(
+      0, static_cast<std::size_t>(std::distance(arguments.begin(), separator)));
+  return subcommand != "list" && subcommand != "rename";
+}
+
 std::vector<TerminalCommandSuggestion> terminal_command_suggestions(
     std::string_view input,
     const std::vector<TerminalCommandHint> &available_commands) {
@@ -1308,6 +1322,23 @@ core::Result<void> TerminalApplication::run() {
   if (!restored)
     return restored;
 
+  configure_app();
+  auto root =
+      ftxui::Renderer(input_component_, [this] { return render_page(); });
+  root |= ftxui::CatchEvent(
+      [this](ftxui::Event event) { return handle_event(std::move(event)); });
+
+  app_->Loop(root);
+  if (active_cancellation_ != nullptr)
+    active_cancellation_->cancel();
+  if (worker_.joinable())
+    worker_.join();
+  input_component_.reset();
+  app_.reset();
+  return core::Result<void>::success();
+}
+
+void TerminalApplication::configure_app() {
   app_ = std::make_unique<ftxui::App>(ftxui::App::FullscreenAlternateScreen());
   app_->ForceHandleCtrlC(false);
   app_->SelectionChange([this] {
@@ -1333,231 +1364,217 @@ core::Result<void> TerminalApplication::run() {
     return render_terminal_input(std::move(state), terminal_theme(theme_kind_));
   };
   input_component_ = ftxui::Input(&input_, input_options);
+}
 
-  auto root = ftxui::Renderer(input_component_, [this] {
-    const auto &theme = terminal_theme(theme_kind_);
-    const auto activity = transcript_.activity();
-    const auto now = std::chrono::steady_clock::now();
-    const bool copy_status_visible = !copy_status_.empty();
-    if (activity != TerminalActivity::idle) {
-      ftxui::animation::RequestAnimationFrame();
-    }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch());
-    const auto spinner_frame = static_cast<std::size_t>(elapsed.count() / 80);
-    auto content = ftxui::vbox({
-        render_terminal_welcome(workspace_, model_, version_, startup_,
-                                reasoning_effort_, theme_kind_),
-        ftxui::separatorEmpty(),
-        render_messages(transcript_.messages(), theme, &message_boxes_),
-    });
-    content |= capture_layout_box(scroll_content_box_);
-    if (scroll_state_.follows_latest()) {
-      content |= ftxui::focusPositionRelative(0.0F, 1.0F);
-    } else {
-      content |= ftxui::focusPosition(
-          0, scroll_state_.focus_row(layout_box_rows(scroll_content_box_),
-                                     box_rows(scroll_viewport_box_)));
-    }
-    auto body = content | ftxui::vscroll_indicator | ftxui::yframe |
-                ftxui::flex | ftxui::reflect(scroll_viewport_box_);
-    auto composer = render_three_line_user_surface(
-        ftxui::hbox({
-            ftxui::text("› ") | ftxui::bold | ftxui::color(theme.primary),
-            input_component_->Render() | ftxui::flex,
-        }),
-        theme);
-    const auto command_suggestions =
-        terminal_command_suggestions(input_, command_hints_);
-    const auto *command_help = terminal_command_help(input_, command_hints_);
-    if (selected_command_suggestion_ >= command_suggestions.size()) {
-      selected_command_suggestion_ = 0;
-    }
-    auto suggestions = render_terminal_command_guide(
-        input_, command_hints_, selected_command_suggestion_, theme);
-    const bool command_guide_visible =
-        command_help != nullptr || !command_suggestions.empty();
-    ftxui::Elements footer_elements{
-        render_activity(activity, reasoning_effort_, spinner_frame, theme),
-        ftxui::filler(),
-    };
-    if (copy_status_visible) {
-      footer_elements.push_back(
-          ftxui::text(copy_status_) |
-          ftxui::color(copy_status_error_ ? theme.error : theme.success));
-      footer_elements.push_back(ftxui::text("  ") |
-                                ftxui::color(theme.text_muted));
-    }
-    const auto token_metrics = transcript_.token_metrics();
-    const auto context_summary =
-        terminal_context_summary(token_metrics, max_context_tokens_);
-    auto token_summary =
-        terminal_token_summary(token_metrics, max_context_tokens_);
-    token_summary.erase(0, context_summary.size());
-    footer_elements.push_back(ftxui::text(context_summary) | ftxui::bold |
-                              ftxui::color(theme.secondary) |
-                              ftxui::bgcolor(theme.input_background) |
-                              ftxui::reflect(context_footer_box_));
-    footer_elements.push_back(ftxui::text(std::move(token_summary)) |
+ftxui::Element TerminalApplication::render_page() {
+  const auto &theme = terminal_theme(theme_kind_);
+  const auto activity = transcript_.activity();
+  const auto now = std::chrono::steady_clock::now();
+  const bool copy_status_visible = !copy_status_.empty();
+  if (activity != TerminalActivity::idle)
+    ftxui::animation::RequestAnimationFrame();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now.time_since_epoch());
+  const auto spinner_frame = static_cast<std::size_t>(elapsed.count() / 80);
+  auto content = ftxui::vbox({
+      render_terminal_welcome(workspace_, model_, version_, startup_,
+                              reasoning_effort_, theme_kind_),
+      ftxui::separatorEmpty(),
+      render_messages(transcript_.messages(), theme, &message_boxes_),
+  });
+  content |= capture_layout_box(scroll_content_box_);
+  if (scroll_state_.follows_latest()) {
+    content |= ftxui::focusPositionRelative(0.0F, 1.0F);
+  } else {
+    content |= ftxui::focusPosition(
+        0, scroll_state_.focus_row(layout_box_rows(scroll_content_box_),
+                                   box_rows(scroll_viewport_box_)));
+  }
+  auto body = content | ftxui::vscroll_indicator | ftxui::yframe | ftxui::flex |
+              ftxui::reflect(scroll_viewport_box_);
+  auto composer = render_three_line_user_surface(
+      ftxui::hbox({
+          ftxui::text("› ") | ftxui::bold | ftxui::color(theme.primary),
+          input_component_->Render() | ftxui::flex,
+      }),
+      theme);
+  const auto command_suggestions =
+      terminal_command_suggestions(input_, command_hints_);
+  const auto *command_help = terminal_command_help(input_, command_hints_);
+  if (selected_command_suggestion_ >= command_suggestions.size())
+    selected_command_suggestion_ = 0;
+  auto suggestions = render_terminal_command_guide(
+      input_, command_hints_, selected_command_suggestion_, theme);
+  const bool command_guide_visible =
+      command_help != nullptr || !command_suggestions.empty();
+  ftxui::Elements footer_elements{
+      render_activity(activity, reasoning_effort_, spinner_frame, theme),
+      ftxui::filler(),
+  };
+  if (copy_status_visible) {
+    footer_elements.push_back(
+        ftxui::text(copy_status_) |
+        ftxui::color(copy_status_error_ ? theme.error : theme.success));
+    footer_elements.push_back(ftxui::text("  ") |
                               ftxui::color(theme.text_muted));
-    if (!command_suggestions.empty()) {
-      footer_elements.push_back(ftxui::text("  enter/tab complete") |
-                                ftxui::color(theme.text_muted));
-    }
-    auto footer = ftxui::hbox(std::move(footer_elements));
-    ftxui::Elements layout{body, ftxui::separatorEmpty()};
-    if (command_guide_visible) {
-      layout.push_back(std::move(suggestions));
-    }
-    layout.push_back(std::move(composer));
-    layout.push_back(std::move(footer));
-    auto page = ftxui::vbox(std::move(layout)) | ftxui::color(theme.text) |
-                ftxui::bgcolor(theme.background) |
-                ftxui::selectionForegroundColor(theme.text) |
-                ftxui::selectionBackgroundColor(theme.background_element);
-    if (!context_analysis_visible_)
-      return page;
-    return render_terminal_context_overlay(std::move(page), token_metrics,
-                                           max_context_tokens_, theme);
-  });
-  root |= ftxui::CatchEvent([this](ftxui::Event event) {
-    if (event != ftxui::Event::Custom && !copy_status_.empty()) {
-      copy_status_.clear();
-      copy_status_error_ = false;
-    }
-    if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left) {
-      const auto &mouse = event.mouse();
-      if (mouse.motion == ftxui::Mouse::Pressed &&
-          context_footer_box_.Contain(mouse.x, mouse.y)) {
-        context_footer_pressed_ = true;
-        return true;
-      }
-      if (mouse.motion == ftxui::Mouse::Released &&
-          std::exchange(context_footer_pressed_, false)) {
-        if (context_footer_box_.Contain(mouse.x, mouse.y))
-          context_analysis_visible_ = !context_analysis_visible_;
-        return true;
-      }
-    }
-    if (context_analysis_visible_) {
-      if (event == ftxui::Event::Escape)
-        context_analysis_visible_ = false;
-      return event != ftxui::Event::Custom;
-    }
-    const auto command_suggestions =
-        terminal_command_suggestions(input_, command_hints_);
-    if (!busy_ && !command_suggestions.empty()) {
-      if (event == ftxui::Event::ArrowDown) {
-        selected_command_suggestion_ =
-            (selected_command_suggestion_ + 1) % command_suggestions.size();
-        return true;
-      }
-      if (event == ftxui::Event::ArrowUp) {
-        selected_command_suggestion_ =
-            (selected_command_suggestion_ + command_suggestions.size() - 1) %
-            command_suggestions.size();
-        return true;
-      }
-      if (is_terminal_command_completion_event(event)) {
-        input_ = complete_terminal_command(input_, command_hints_,
-                                           selected_command_suggestion_);
-        input_cursor_position_ = static_cast<int>(input_.size());
-        selected_command_suggestion_ = 0;
-        return true;
-      }
-    }
-    if (!busy_ && command_suggestions.empty() &&
-        (event == ftxui::Event::ArrowUp || event == ftxui::Event::ArrowDown)) {
-      const auto recalled = event == ftxui::Event::ArrowUp
-                                ? prompt_history_.previous(input_)
-                                : prompt_history_.next();
-      if (recalled.has_value()) {
-        input_ = *recalled;
-        input_cursor_position_ = static_cast<int>(input_.size());
-      }
-      return true;
-    }
-    if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left) {
-      const auto &mouse = event.mouse();
-      if (mouse.motion == ftxui::Mouse::Pressed) {
-        mouse_selection_pressed_ =
-            scroll_viewport_box_.Contain(mouse.x, mouse.y);
-        mouse_selection_dragged_ = false;
-        mouse_press_x_ = mouse.x;
-        mouse_press_y_ = mouse.y;
-        selection_copy_pending_ = false;
-        selected_text_.clear();
-        pressed_collapsible_message_.reset();
-        if (mouse_selection_pressed_) {
-          const auto &messages = transcript_.messages();
-          const auto box_count =
-              std::min(messages.size(), message_boxes_.size());
-          for (std::size_t index = 0; index < box_count; ++index) {
-            if (messages[index].collapsible &&
-                message_boxes_[index].Contain(mouse.x, mouse.y)) {
-              pressed_collapsible_message_ = index;
-              break;
-            }
-          }
-        }
-      } else if (mouse.motion == ftxui::Mouse::Moved &&
-                 mouse_selection_pressed_) {
-        mouse_selection_dragged_ = mouse_selection_dragged_ ||
-                                   mouse.x != mouse_press_x_ ||
-                                   mouse.y != mouse_press_y_;
-      } else if (mouse.motion == ftxui::Mouse::Released &&
-                 mouse_selection_pressed_) {
-        mouse_selection_pressed_ = false;
-        const bool dragged = std::exchange(mouse_selection_dragged_, false);
-        const auto clicked_message =
-            std::exchange(pressed_collapsible_message_, std::nullopt);
-        if (dragged) {
-          if (selected_text_.empty()) {
-            selection_copy_pending_ = true;
-          } else {
-            copy_selection(selected_text_);
-          }
-          return false;
-        }
-        if (clicked_message.has_value() &&
-            *clicked_message < message_boxes_.size() &&
-            message_boxes_[*clicked_message].Contain(mouse.x, mouse.y)) {
-          return transcript_.toggle_message_expansion(*clicked_message);
-        }
-      }
-    }
-    if (event.is_mouse() && event.mouse().motion == ftxui::Mouse::Pressed &&
-        (event.mouse().button == ftxui::Mouse::WheelUp ||
-         event.mouse().button == ftxui::Mouse::WheelDown)) {
-      if (event.mouse().button == ftxui::Mouse::WheelUp) {
-        scroll_state_.scroll_up(layout_box_rows(scroll_content_box_),
-                                box_rows(scroll_viewport_box_));
-      } else {
-        scroll_state_.scroll_down(layout_box_rows(scroll_content_box_),
-                                  box_rows(scroll_viewport_box_));
-      }
-      return true;
-    }
-    if (event == ftxui::Event::CtrlC || event == ftxui::Event::Escape) {
-      if (active_cancellation_ != nullptr) {
-        active_cancellation_->cancel();
-        transcript_.cancel_request();
-      } else if (event == ftxui::Event::CtrlC) {
-        app_->Exit();
-      }
-      return true;
-    }
-    return false;
-  });
+  }
+  const auto token_metrics = transcript_.token_metrics();
+  const auto context_summary =
+      terminal_context_summary(token_metrics, max_context_tokens_);
+  auto token_summary =
+      terminal_token_summary(token_metrics, max_context_tokens_);
+  token_summary.erase(0, context_summary.size());
+  footer_elements.push_back(ftxui::text(context_summary) | ftxui::bold |
+                            ftxui::color(theme.secondary) |
+                            ftxui::bgcolor(theme.input_background) |
+                            ftxui::reflect(context_footer_box_));
+  footer_elements.push_back(ftxui::text(std::move(token_summary)) |
+                            ftxui::color(theme.text_muted));
+  if (!command_suggestions.empty()) {
+    footer_elements.push_back(ftxui::text("  enter/tab complete") |
+                              ftxui::color(theme.text_muted));
+  }
+  auto footer = ftxui::hbox(std::move(footer_elements));
+  ftxui::Elements layout{body, ftxui::separatorEmpty()};
+  if (command_guide_visible)
+    layout.push_back(std::move(suggestions));
+  layout.push_back(std::move(composer));
+  layout.push_back(std::move(footer));
+  auto page = ftxui::vbox(std::move(layout)) | ftxui::color(theme.text) |
+              ftxui::bgcolor(theme.background) |
+              ftxui::selectionForegroundColor(theme.text) |
+              ftxui::selectionBackgroundColor(theme.background_element);
+  if (!context_analysis_visible_)
+    return page;
+  return render_terminal_context_overlay(std::move(page), token_metrics,
+                                         max_context_tokens_, theme);
+}
 
-  app_->Loop(root);
-  if (active_cancellation_ != nullptr)
-    active_cancellation_->cancel();
-  if (worker_.joinable())
-    worker_.join();
-  input_component_.reset();
-  app_.reset();
-  return core::Result<void>::success();
+bool TerminalApplication::handle_event(ftxui::Event event) {
+  if (event != ftxui::Event::Custom && !copy_status_.empty()) {
+    copy_status_.clear();
+    copy_status_error_ = false;
+  }
+  if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left) {
+    const auto &mouse = event.mouse();
+    if (mouse.motion == ftxui::Mouse::Pressed &&
+        context_footer_box_.Contain(mouse.x, mouse.y)) {
+      context_footer_pressed_ = true;
+      return true;
+    }
+    if (mouse.motion == ftxui::Mouse::Released &&
+        std::exchange(context_footer_pressed_, false)) {
+      if (context_footer_box_.Contain(mouse.x, mouse.y))
+        context_analysis_visible_ = !context_analysis_visible_;
+      return true;
+    }
+  }
+  if (context_analysis_visible_) {
+    if (event == ftxui::Event::Escape)
+      context_analysis_visible_ = false;
+    return event != ftxui::Event::Custom;
+  }
+  const auto command_suggestions =
+      terminal_command_suggestions(input_, command_hints_);
+  if (!busy_ && !command_suggestions.empty()) {
+    if (event == ftxui::Event::ArrowDown) {
+      selected_command_suggestion_ =
+          (selected_command_suggestion_ + 1) % command_suggestions.size();
+      return true;
+    }
+    if (event == ftxui::Event::ArrowUp) {
+      selected_command_suggestion_ =
+          (selected_command_suggestion_ + command_suggestions.size() - 1) %
+          command_suggestions.size();
+      return true;
+    }
+    if (is_terminal_command_completion_event(event)) {
+      input_ = complete_terminal_command(input_, command_hints_,
+                                         selected_command_suggestion_);
+      input_cursor_position_ = static_cast<int>(input_.size());
+      selected_command_suggestion_ = 0;
+      return true;
+    }
+  }
+  if (!busy_ && command_suggestions.empty() &&
+      (event == ftxui::Event::ArrowUp || event == ftxui::Event::ArrowDown)) {
+    const auto recalled = event == ftxui::Event::ArrowUp
+                              ? prompt_history_.previous(input_)
+                              : prompt_history_.next();
+    if (recalled.has_value()) {
+      input_ = *recalled;
+      input_cursor_position_ = static_cast<int>(input_.size());
+    }
+    return true;
+  }
+  if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left) {
+    const auto &mouse = event.mouse();
+    if (mouse.motion == ftxui::Mouse::Pressed) {
+      mouse_selection_pressed_ = scroll_viewport_box_.Contain(mouse.x, mouse.y);
+      mouse_selection_dragged_ = false;
+      mouse_press_x_ = mouse.x;
+      mouse_press_y_ = mouse.y;
+      selection_copy_pending_ = false;
+      selected_text_.clear();
+      pressed_collapsible_message_.reset();
+      if (mouse_selection_pressed_) {
+        const auto &messages = transcript_.messages();
+        const auto box_count = std::min(messages.size(), message_boxes_.size());
+        for (std::size_t index = 0; index < box_count; ++index) {
+          if (messages[index].collapsible &&
+              message_boxes_[index].Contain(mouse.x, mouse.y)) {
+            pressed_collapsible_message_ = index;
+            break;
+          }
+        }
+      }
+    } else if (mouse.motion == ftxui::Mouse::Moved &&
+               mouse_selection_pressed_) {
+      mouse_selection_dragged_ = mouse_selection_dragged_ ||
+                                 mouse.x != mouse_press_x_ ||
+                                 mouse.y != mouse_press_y_;
+    } else if (mouse.motion == ftxui::Mouse::Released &&
+               mouse_selection_pressed_) {
+      mouse_selection_pressed_ = false;
+      const bool dragged = std::exchange(mouse_selection_dragged_, false);
+      const auto clicked_message =
+          std::exchange(pressed_collapsible_message_, std::nullopt);
+      if (dragged) {
+        if (selected_text_.empty())
+          selection_copy_pending_ = true;
+        else
+          copy_selection(selected_text_);
+        return false;
+      }
+      if (clicked_message.has_value() &&
+          *clicked_message < message_boxes_.size() &&
+          message_boxes_[*clicked_message].Contain(mouse.x, mouse.y)) {
+        return transcript_.toggle_message_expansion(*clicked_message);
+      }
+    }
+  }
+  if (event.is_mouse() && event.mouse().motion == ftxui::Mouse::Pressed &&
+      (event.mouse().button == ftxui::Mouse::WheelUp ||
+       event.mouse().button == ftxui::Mouse::WheelDown)) {
+    if (event.mouse().button == ftxui::Mouse::WheelUp) {
+      scroll_state_.scroll_up(layout_box_rows(scroll_content_box_),
+                              box_rows(scroll_viewport_box_));
+    } else {
+      scroll_state_.scroll_down(layout_box_rows(scroll_content_box_),
+                                box_rows(scroll_viewport_box_));
+    }
+    return true;
+  }
+  if (event == ftxui::Event::CtrlC || event == ftxui::Event::Escape) {
+    if (active_cancellation_ != nullptr) {
+      active_cancellation_->cancel();
+      transcript_.cancel_request();
+    } else if (event == ftxui::Event::CtrlC) {
+      app_->Exit();
+    }
+    return true;
+  }
+  return false;
 }
 
 core::Result<void> TerminalApplication::reload_session() {
@@ -1601,7 +1618,7 @@ void TerminalApplication::submit_line() {
     transcript_.begin_request(display, TerminalActivity::action);
     active_cancellation_ = std::make_shared<core::CancellationSource>();
     const auto cancellation = active_cancellation_;
-    worker_ = std::thread([this, command, cancellation] {
+    worker_ = std::thread([this, command, cancellation, display] {
       const auto post_event = [this](core::AgentEvent event) {
         app_->Post([this, event = std::move(event)] {
           transcript_.append_event(event);
@@ -1609,13 +1626,21 @@ void TerminalApplication::submit_line() {
       };
       auto result = command_(command.name, command.arguments,
                              cancellation->token(), post_event);
-      app_->Post([this, command, result = std::move(result)]() mutable {
-        if (result && command.name == "session" && !command.arguments.empty()) {
+      app_->Post([this, command, display,
+                  result = std::move(result)]() mutable {
+        bool appended_after_restore = false;
+        if (result &&
+            terminal_command_reloads_session(command.name, command.arguments)) {
           const auto restored = reload_session();
-          if (!restored)
+          if (!restored) {
             result = core::Result<std::string>::failure(restored.error());
+          } else {
+            transcript_.append_command(display, result);
+            appended_after_restore = true;
+          }
         }
-        transcript_.complete_request(result);
+        if (!appended_after_restore)
+          transcript_.complete_request(result);
         busy_ = false;
         active_cancellation_.reset();
       });

@@ -18,7 +18,10 @@ public:
   ToolRegistry() = default;
   explicit ToolRegistry(std::vector<std::string> allowed_tools);
 
+  [[nodiscard]] Result<void>
+  validate_tool(const ToolDefinition &definition) const;
   Result<void> register_tool(std::unique_ptr<Tool> tool);
+  bool unregister_tool(std::string_view name);
 
   [[nodiscard]] std::vector<ToolDefinition> definitions() const;
   [[nodiscard]] std::vector<ToolDefinition> registered_definitions() const;
@@ -32,6 +35,7 @@ private:
 
   mutable std::mutex mutex_;
   std::vector<std::unique_ptr<Tool>> tools_;
+  std::vector<ToolDefinition> prepared_definitions_;
   std::optional<std::unordered_set<std::string>> allowed_tools_;
 };
 

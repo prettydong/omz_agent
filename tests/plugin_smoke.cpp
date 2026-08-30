@@ -225,6 +225,27 @@ int main() {
   }
 
   {
+    zed::core::ToolRegistry faulty_tools;
+    zed::extensions::ExtensionRegistry faulty_extensions;
+    zed::plugins::PluginManager faulty_manager(
+        {workspace,
+         {ZED_TEST_FAULTY_PLUGIN_ROOT},
+         {"fake", "fake"},
+         zed::core::ReasoningEffort::low},
+        faulty_extensions, faulty_tools, model, clangd);
+    assert(faulty_manager.discover_and_load());
+    assert(faulty_manager.statuses().size() == 1);
+    assert(!faulty_manager.statuses().front().loaded);
+    assert(faulty_manager.statuses().front().detail.find("properties") !=
+           std::string::npos);
+    assert(faulty_extensions.commands().empty());
+    assert(faulty_tools.definitions().empty());
+    const auto missing = faulty_extensions.execute("faulty_command", "");
+    assert(!missing);
+    assert(missing.error().code == zed::core::ErrorCode::not_found);
+  }
+
+  {
     const auto invalid_root = workspace / "invalid-plugin";
     std::filesystem::create_directories(invalid_root / "resources");
     std::ofstream manifest(invalid_root / "zeda-plugin.json");

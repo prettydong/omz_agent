@@ -112,6 +112,9 @@ struct TerminalCommand {
 
 [[nodiscard]] TerminalCommand parse_terminal_command(std::string_view line);
 
+[[nodiscard]] bool terminal_command_reloads_session(std::string_view name,
+                                                    std::string_view arguments);
+
 struct TerminalCommandOption {
   std::string value;
   std::string description;
@@ -301,6 +304,9 @@ public:
   core::Result<void> run();
 
 private:
+  void configure_app();
+  [[nodiscard]] ftxui::Element render_page();
+  bool handle_event(ftxui::Event event);
   core::Result<void> reload_session();
   void copy_selection(std::string_view selection);
   void submit_line();

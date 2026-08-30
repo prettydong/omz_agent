@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(zeda VERSION 0.1.0 LANGUAGES CXX)
+project(zeda VERSION 0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -117,10 +117,12 @@ add_library(zed_core
     src/subagents/subagent_runner.cpp
     src/subagents/worker.cpp
     src/subagents/worker_protocol.cpp
-    src/ui/tools/basic_tools.cpp
-    src/ui/tools/clangd_tool.cpp
-    src/ui/tools/multi_bash_tool.cpp
-    src/ui/tools/subagent_tool.cpp
+    src/support/atomic_file.cpp
+    src/support/child_process.cpp
+    src/tools/basic_tools.cpp
+    src/tools/clangd_tool.cpp
+    src/tools/multi_bash_tool.cpp
+    src/tools/subagent_tool.cpp
 )
 
 target_include_directories(zed_core
@@ -178,9 +180,20 @@ elseif (MSVC)
     target_compile_options(zed_ui PRIVATE /W4)
 endif()
 
-add_executable(zeda src/main.cpp)
+add_executable(zeda
+    src/main.cpp
+    src/app/application.cpp
+    src/app/builtin_commands.cpp
+)
 target_compile_definitions(zeda PRIVATE ZEDA_VERSION="${PROJECT_VERSION}")
 target_link_libraries(zeda PRIVATE zed_ui)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(zeda PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
+    )
+elseif (MSVC)
+    target_compile_options(zeda PRIVATE /W4)
+endif()
 
 if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
     add_library(zeda_deepwiki SHARED
@@ -300,6 +313,10 @@ if (BUILD_TESTING)
     target_link_libraries(zed_opencode_go_smoke PRIVATE zed_core)
     add_test(NAME zed_opencode_go_smoke COMMAND zed_opencode_go_smoke)
 
+    add_executable(zed_support_smoke tests/support_smoke.cpp)
+    target_link_libraries(zed_support_smoke PRIVATE zed_core)
+    add_test(NAME zed_support_smoke COMMAND zed_support_smoke)
+
     add_executable(zed_fake_clangd tests/fake_clangd.cpp)
     add_executable(zed_fake_opencode tests/fake_opencode.cpp)
     add_executable(zed_fake_model_catalog tests/fake_model_catalog.cpp)
@@ -314,6 +331,24 @@ if (BUILD_TESTING)
     add_test(NAME zed_subagent_smoke COMMAND zed_subagent_smoke)
 
     if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
+        set(ZEDA_FAULTY_PLUGIN_ROOT
+            ${CMAKE_CURRENT_BINARY_DIR}/plugins/faulty)
+        file(MAKE_DIRECTORY ${ZEDA_FAULTY_PLUGIN_ROOT}/resources)
+        add_library(zed_faulty_plugin SHARED tests/faulty_plugin.cpp)
+        target_include_directories(zed_faulty_plugin PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        set_target_properties(zed_faulty_plugin PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${ZEDA_FAULTY_PLUGIN_ROOT})
+        file(GENERATE
+            OUTPUT ${ZEDA_FAULTY_PLUGIN_ROOT}/zeda-plugin.json
+            CONTENT "{\"id\":\"faulty\",\"name\":\"Faulty fixture\",\"version\":\"1\",\"abi_version\":1,\"library\":\"$<TARGET_FILE_NAME:zed_faulty_plugin>\",\"resources\":\"resources\"}\n")
+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(zed_faulty_plugin PRIVATE
+                -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+        elseif (MSVC)
+            target_compile_options(zed_faulty_plugin PRIVATE /W4)
+        endif()
+
         add_executable(zed_plugin_smoke tests/plugin_smoke.cpp)
         target_link_libraries(zed_plugin_smoke PRIVATE
             zed_core
@@ -321,8 +356,9 @@ if (BUILD_TESTING)
         )
         target_compile_definitions(zed_plugin_smoke PRIVATE
             ZED_TEST_PLUGIN_ROOT="${CMAKE_BINARY_DIR}/plugins/deepwiki"
+            ZED_TEST_FAULTY_PLUGIN_ROOT="${ZEDA_FAULTY_PLUGIN_ROOT}"
         )
-        add_dependencies(zed_plugin_smoke zeda_deepwiki)
+        add_dependencies(zed_plugin_smoke zeda_deepwiki zed_faulty_plugin)
         add_test(NAME zed_plugin_smoke COMMAND zed_plugin_smoke)
     endif()
 
@@ -348,6 +384,7 @@ if (BUILD_TESTING)
         zed_quick_bash_smoke
         zed_session_smoke
         zed_opencode_go_smoke
+        zed_support_smoke
         zed_subagent_smoke
     )
     if (TARGET zed_plugin_smoke)

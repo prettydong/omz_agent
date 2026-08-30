@@ -1823,8 +1823,9 @@ void destroy_plugin(void *instance) {
 }
 
 const ZedaPluginDescriptorV1 kDescriptor{
-    ZEDA_PLUGIN_ABI_VERSION, view("deepwiki"), view("DeepWiki"),
-    view("0.1.0"),           create_plugin,    initialize_plugin,
+    ZEDA_PLUGIN_ABI_VERSION, view("deepwiki"),
+    view("DeepWiki"),        view("0.2"),
+    create_plugin,           initialize_plugin,
     shutdown_plugin,         destroy_plugin,
 };
 

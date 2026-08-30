@@ -83,23 +83,6 @@ void write_event(std::ostream &output, const WorkerEvent &event) {
   output << serialize_worker_event(event) << '\n' << std::flush;
 }
 
-core::ContextLimits
-model_context_limits(core::ContextLimits configured,
-                     const providers::OpenCodeGoModelInfo &model) {
-  if (model.max_context_tokens == 0 ||
-      model.max_context_tokens >= configured.max_context_tokens) {
-    return configured;
-  }
-  configured.max_context_tokens = model.max_context_tokens;
-  if (configured.reserved_output_tokens >= configured.max_context_tokens)
-    configured.reserved_output_tokens = configured.max_context_tokens / 8;
-  const auto available =
-      configured.max_context_tokens - configured.reserved_output_tokens;
-  if (configured.compaction_trigger_tokens >= available)
-    configured.compaction_trigger_tokens = 0;
-  return configured;
-}
-
 std::string limit_final_output(std::string output) {
   auto sanitized = core::sanitize_utf8(output).text;
   constexpr std::string_view kMarker = "\n[worker output truncated]";
@@ -257,8 +240,8 @@ int run_explorer_worker(std::istream &input, std::ostream &output,
         agent->max_output_tokens, model_info->max_output_tokens == 0
                                       ? agent->max_output_tokens
                                       : model_info->max_output_tokens);
-    config.context_limits =
-        model_context_limits(runtime.value().context_limits, *model_info);
+    config.context_limits = core::cap_context_limits(
+        runtime.value().context_limits, model_info->max_context_tokens);
     config.context_limits.automatic_compaction = true;
     config.max_turns = agent->max_turns;
     config.system_prompt = agent->system_prompt;

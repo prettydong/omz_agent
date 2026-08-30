@@ -3,6 +3,7 @@
 #include "zed/app/config.hpp"
 #include "zed/app/configure_web_page.hpp"
 #include "zed/skills/skill_registry.hpp"
+#include "zed/support/child_process.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -186,6 +187,7 @@ void launch_url(std::string_view url) {
     return;
 #if defined(__APPLE__) || defined(__linux__)
   const std::string target(url);
+  auto spawn_lock = zed::support::lock_process_spawn();
   const pid_t child = fork();
   if (child < 0)
     return;
@@ -202,6 +204,7 @@ void launch_url(std::string_view url) {
 #endif
     _exit(127);
   }
+  spawn_lock.unlock();
   int status = 0;
   while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
   }

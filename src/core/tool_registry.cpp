@@ -70,6 +70,32 @@ ToolRegistry::ToolRegistry(std::vector<std::string> allowed_tools)
     : allowed_tools_(std::in_place, allowed_tools.begin(),
                      allowed_tools.end()) {}
 
+Result<void>
+ToolRegistry::validate_tool(const ToolDefinition &definition) const {
+  if (definition.name.empty()) {
+    return Result<void>::failure({
+        ErrorCode::invalid_argument,
+        "tool name cannot be empty",
+    });
+  }
+  const auto prepared_schema = schema_with_purpose(definition);
+  if (!prepared_schema)
+    return Result<void>::failure(prepared_schema.error());
+
+  std::scoped_lock lock(mutex_);
+  const auto duplicate =
+      std::find_if(tools_.begin(), tools_.end(), [&](const auto &registered) {
+        return registered->definition().name == definition.name;
+      });
+  if (duplicate != tools_.end()) {
+    return Result<void>::failure({
+        ErrorCode::conflict,
+        "tool already registered: " + definition.name,
+    });
+  }
+  return Result<void>::success();
+}
+
 bool ToolRegistry::allowed(std::string_view name) const {
   return !allowed_tools_.has_value() || allowed_tools_->contains("*") ||
          allowed_tools_->contains(std::string(name));
@@ -120,12 +146,9 @@ Result<void> ToolRegistry::register_tool(std::unique_ptr<Tool> tool) {
   }
 
   const auto &definition = tool->definition();
-  if (definition.name.empty()) {
-    return Result<void>::failure({
-        ErrorCode::invalid_argument,
-        "tool name cannot be empty",
-    });
-  }
+  const auto validation = validate_tool(definition);
+  if (!validation)
+    return validation;
   const auto prepared_schema = schema_with_purpose(definition);
   if (!prepared_schema)
     return Result<void>::failure(prepared_schema.error());
@@ -142,38 +165,46 @@ Result<void> ToolRegistry::register_tool(std::unique_ptr<Tool> tool) {
     });
   }
 
+  auto prepared_definition = definition;
+  prepared_definition.input_schema_json = prepared_schema.value().dump();
+  tools_.reserve(tools_.size() + 1);
+  prepared_definitions_.reserve(prepared_definitions_.size() + 1);
+  prepared_definitions_.push_back(std::move(prepared_definition));
   tools_.push_back(std::move(tool));
   return Result<void>::success();
+}
+
+bool ToolRegistry::unregister_tool(std::string_view name) {
+  std::scoped_lock lock(mutex_);
+  const auto iterator =
+      std::find_if(tools_.begin(), tools_.end(), [&](const auto &tool) {
+        return tool->definition().name == name;
+      });
+  if (iterator == tools_.end())
+    return false;
+  const auto index =
+      static_cast<std::size_t>(std::distance(tools_.begin(), iterator));
+  tools_.erase(iterator);
+  prepared_definitions_.erase(prepared_definitions_.begin() +
+                              static_cast<std::ptrdiff_t>(index));
+  return true;
 }
 
 std::vector<ToolDefinition> ToolRegistry::definitions() const {
   std::scoped_lock lock(mutex_);
   std::vector<ToolDefinition> result;
   result.reserve(tools_.size());
-  for (const auto &tool : tools_) {
-    if (!allowed(tool->definition().name))
+  for (const auto &definition : prepared_definitions_) {
+    if (!allowed(definition.name))
       continue;
-    auto definition = tool->definition();
-    const auto schema = schema_with_purpose(definition);
-    if (schema)
-      definition.input_schema_json = schema.value().dump();
-    result.push_back(std::move(definition));
+    result.push_back(definition);
   }
   return result;
 }
 
 std::vector<ToolDefinition> ToolRegistry::registered_definitions() const {
   std::scoped_lock lock(mutex_);
-  std::vector<ToolDefinition> result;
-  result.reserve(tools_.size());
-  for (const auto &tool : tools_) {
-    auto definition = tool->definition();
-    const auto schema = schema_with_purpose(definition);
-    if (schema)
-      definition.input_schema_json = schema.value().dump();
-    result.push_back(std::move(definition));
-  }
-  return result;
+  return prepared_definitions_;
 }
 
 Result<ToolResult>

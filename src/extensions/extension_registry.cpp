@@ -5,7 +5,8 @@
 
 namespace zed::extensions {
 
-core::Result<void> ExtensionRegistry::register_command(Command command) {
+core::Result<void>
+ExtensionRegistry::validate_command(const Command &command) const {
   if (command.name.empty() ||
       (!command.execute && !command.execute_with_events)) {
     return core::Result<void>::failure({
@@ -45,8 +46,25 @@ core::Result<void> ExtensionRegistry::register_command(Command command) {
         "extension command already registered: " + command.name,
     });
   }
+  return core::Result<void>::success();
+}
+
+core::Result<void> ExtensionRegistry::register_command(Command command) {
+  const auto validation = validate_command(command);
+  if (!validation)
+    return validation;
   commands_.push_back(std::move(command));
   return core::Result<void>::success();
+}
+
+bool ExtensionRegistry::unregister_command(std::string_view name) {
+  const auto iterator = std::find_if(
+      commands_.begin(), commands_.end(),
+      [&](const Command &command) { return command.name == name; });
+  if (iterator == commands_.end())
+    return false;
+  commands_.erase(iterator);
+  return true;
 }
 
 core::Result<std::string>

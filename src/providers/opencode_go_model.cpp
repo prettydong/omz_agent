@@ -1,18 +1,19 @@
 #include "zed/providers/opencode_go_model.hpp"
 
+#include "zed/support/child_process.hpp"
+#include "zed/support/unique_fd.hpp"
+
 #include <cerrno>
 #include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <poll.h>
-#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -860,60 +861,140 @@ core::Result<void> validate_tool_calls(const std::vector<ToolCall> &calls) {
   return core::Result<void>::success();
 }
 
+bool write_all(int descriptor, std::string_view content) {
+  std::size_t offset = 0;
+  while (offset < content.size()) {
+    const auto written =
+        write(descriptor, content.data() + offset, content.size() - offset);
+    if (written > 0) {
+      offset += static_cast<std::size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR)
+      continue;
+    return false;
+  }
+  return true;
+}
+
+class TemporaryRequestFile {
+public:
+  static core::Result<TemporaryRequestFile> create(std::string_view body) {
+    std::string path_template =
+        (std::filesystem::temp_directory_path() / "zed-request-XXXXXX")
+            .string();
+    std::vector<char> path(path_template.begin(), path_template.end());
+    path.push_back('\0');
+    support::UniqueFd descriptor(mkstemp(path.data()));
+    if (!descriptor.valid()) {
+      return core::Result<TemporaryRequestFile>::failure(
+          {ErrorCode::model_error, "cannot create request file"});
+    }
+    TemporaryRequestFile file(std::string(path.data()));
+    if (!write_all(descriptor.get(), body)) {
+      return core::Result<TemporaryRequestFile>::failure(
+          {ErrorCode::model_error, "cannot write request body"});
+    }
+    return core::Result<TemporaryRequestFile>::success(std::move(file));
+  }
+
+  TemporaryRequestFile(const TemporaryRequestFile &) = delete;
+  TemporaryRequestFile &operator=(const TemporaryRequestFile &) = delete;
+
+  TemporaryRequestFile(TemporaryRequestFile &&other) noexcept
+      : path_(std::exchange(other.path_, {})) {}
+
+  ~TemporaryRequestFile() {
+    if (!path_.empty())
+      static_cast<void>(unlink(path_.c_str()));
+  }
+
+  [[nodiscard]] const std::string &path() const { return path_; }
+
+private:
+  explicit TemporaryRequestFile(std::string path) : path_(std::move(path)) {}
+
+  std::string path_;
+};
+
+class LineBuffer {
+public:
+  explicit LineBuffer(
+      const std::function<core::Result<void>(std::string_view)> &on_line)
+      : on_line_(on_line) {}
+
+  core::Result<void> append(std::string_view chunk) {
+    pending_.append(chunk);
+    return process(false);
+  }
+
+  core::Result<void> flush() { return process(true); }
+
+private:
+  core::Result<void> process(bool flush) {
+    while (true) {
+      const auto newline = pending_.find('\n');
+      if (newline == std::string::npos)
+        break;
+      std::string line = pending_.substr(0, newline);
+      pending_.erase(0, newline + 1);
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      const auto processed = on_line_(line);
+      if (!processed)
+        return processed;
+    }
+    if (flush && !pending_.empty()) {
+      if (pending_.back() == '\r')
+        pending_.pop_back();
+      const auto processed = on_line_(pending_);
+      pending_.clear();
+      if (!processed)
+        return processed;
+    }
+    return core::Result<void>::success();
+  }
+
+  const std::function<core::Result<void>(std::string_view)> &on_line_;
+  std::string pending_;
+};
+
 core::Result<void>
 run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
          const std::vector<std::string> &extra_headers, std::string_view body,
          core::CancellationToken cancellation,
          const std::function<core::Result<void>(std::string_view)> &on_line) {
-  std::string temporary_template =
-      (std::filesystem::temp_directory_path() / "zed-request-XXXXXX").string();
-  std::vector<char> temporary_path(temporary_template.begin(),
-                                   temporary_template.end());
-  temporary_path.push_back('\0');
-  const int temporary_fd = mkstemp(temporary_path.data());
-  if (temporary_fd == -1)
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot create request file"});
-  const ssize_t written = write(temporary_fd, body.data(), body.size());
-  close(temporary_fd);
-  if (written != static_cast<ssize_t>(body.size())) {
-    unlink(temporary_path.data());
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot write request body"});
-  }
+  auto request_file = TemporaryRequestFile::create(body);
+  if (!request_file)
+    return core::Result<void>::failure(request_file.error());
 
+  auto spawn_lock = support::lock_process_spawn();
   int output_pipe[2];
-  if (pipe(output_pipe) != 0) {
-    unlink(temporary_path.data());
+  if (!support::create_cloexec_pipe(output_pipe))
     return core::Result<void>::failure(
         {ErrorCode::model_error, "cannot create HTTP output pipe"});
-  }
+  support::UniqueFd output_read(output_pipe[0]);
+  support::UniqueFd output_write(output_pipe[1]);
+
   int config_pipe[2];
-  if (pipe(config_pipe) != 0) {
-    close(output_pipe[0]);
-    close(output_pipe[1]);
-    unlink(temporary_path.data());
+  if (!support::create_cloexec_pipe(config_pipe))
     return core::Result<void>::failure(
         {ErrorCode::model_error, "cannot create curl config pipe"});
-  }
+  support::UniqueFd config_read(config_pipe[0]);
+  support::UniqueFd config_write(config_pipe[1]);
+
   const pid_t child = fork();
-  if (child == -1) {
-    close(output_pipe[0]);
-    close(output_pipe[1]);
-    close(config_pipe[0]);
-    close(config_pipe[1]);
-    unlink(temporary_path.data());
+  if (child == -1)
     return core::Result<void>::failure(
         {ErrorCode::model_error, "cannot start curl"});
-  }
   if (child == 0) {
-    close(output_pipe[0]);
-    close(config_pipe[1]);
+    output_read.reset();
+    config_write.reset();
     setpgid(0, 0);
-    dup2(output_pipe[1], STDOUT_FILENO);
-    dup2(config_pipe[0], STDIN_FILENO);
-    close(output_pipe[1]);
-    close(config_pipe[0]);
+    dup2(output_write.get(), STDOUT_FILENO);
+    dup2(config_read.get(), STDIN_FILENO);
+    output_write.reset();
+    config_read.reset();
     const int error_fd = open("/dev/null", O_WRONLY);
     if (error_fd >= 0) {
       dup2(error_fd, STDERR_FILENO);
@@ -931,10 +1012,18 @@ run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
     _exit(127);
   }
 
+  spawn_lock.unlock();
+
   setpgid(child, child);
 
-  close(output_pipe[1]);
-  close(config_pipe[0]);
+  output_write.reset();
+  config_read.reset();
+  bool child_finished = false;
+  int status = 0;
+  const auto terminate_child = [&] {
+    support::terminate_process_group(child, std::chrono::milliseconds(250),
+                                     child_finished, status);
+  };
   std::string curl_config = "url = \"" + curl_config_escape(endpoint) + "\"\n" +
                             "request = \"POST\"\n" +
                             "header = \"Authorization: Bearer " +
@@ -943,36 +1032,18 @@ run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
   for (const auto &header : extra_headers) {
     curl_config += "header = \"" + curl_config_escape(header) + "\"\n";
   }
-  curl_config +=
-      "data-binary = \"@" + curl_config_escape(temporary_path.data()) + "\"\n";
-  std::size_t config_offset = 0;
-  while (config_offset < curl_config.size()) {
-    const ssize_t written =
-        write(config_pipe[1], curl_config.data() + config_offset,
-              curl_config.size() - config_offset);
-    if (written > 0) {
-      config_offset += static_cast<std::size_t>(written);
-      continue;
-    }
-    if (written < 0 && errno == EINTR)
-      continue;
-    break;
-  }
-  close(config_pipe[1]);
-  if (config_offset != curl_config.size()) {
-    kill(-child, SIGTERM);
-    waitpid(child, nullptr, 0);
-    close(output_pipe[0]);
-    unlink(temporary_path.data());
+  curl_config += "data-binary = \"@" +
+                 curl_config_escape(request_file.value().path()) + "\"\n";
+  const bool wrote_config = write_all(config_write.get(), curl_config);
+  config_write.reset();
+  if (!wrote_config) {
+    terminate_child();
     return core::Result<void>::failure(
         {ErrorCode::model_error, "cannot write curl config"});
   }
-  const int flags = fcntl(output_pipe[0], F_GETFL, 0);
-  if (flags < 0 || fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK) < 0) {
-    kill(-child, SIGTERM);
-    waitpid(child, nullptr, 0);
-    close(output_pipe[0]);
-    unlink(temporary_path.data());
+  const int flags = fcntl(output_read.get(), F_GETFL, 0);
+  if (flags < 0 || fcntl(output_read.get(), F_SETFL, flags | O_NONBLOCK) < 0) {
+    terminate_child();
     return core::Result<void>::failure(
         {ErrorCode::model_error, "cannot configure curl output"});
   }
@@ -980,69 +1051,36 @@ run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
   bool cancelled = false;
   bool timed_out = false;
   bool pipe_closed = false;
-  bool child_finished = false;
-  int status = 0;
-  std::string pending;
-  auto process_pending = [&](bool flush) -> core::Result<void> {
-    while (true) {
-      const auto newline = pending.find('\n');
-      if (newline == std::string::npos)
-        break;
-      std::string line = pending.substr(0, newline);
-      pending.erase(0, newline + 1);
-      if (!line.empty() && line.back() == '\r')
-        line.pop_back();
-      const auto processed = on_line(line);
-      if (!processed)
-        return processed;
-    }
-    if (flush && !pending.empty()) {
-      if (!pending.empty() && pending.back() == '\r')
-        pending.pop_back();
-      const auto processed = on_line(pending);
-      pending.clear();
-      if (!processed)
-        return processed;
-    }
-    return core::Result<void>::success();
-  };
-
+  LineBuffer line_buffer(on_line);
   const auto started_at = std::chrono::steady_clock::now();
   while (!pipe_closed || !child_finished) {
     if (cancellation.is_cancelled()) {
       cancelled = true;
-      kill(-child, SIGTERM);
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - started_at)
                              .count();
     if (elapsed >= static_cast<long long>(config.request_timeout_ms)) {
       timed_out = true;
-      kill(-child, SIGTERM);
     }
 
-    pollfd descriptor{output_pipe[0], POLLIN | POLLHUP, 0};
+    pollfd descriptor{output_read.get(), POLLIN | POLLHUP, 0};
     const int poll_result = poll(&descriptor, 1, 50);
     if (poll_result < 0 && errno != EINTR) {
-      kill(-child, SIGTERM);
-      waitpid(child, nullptr, 0);
-      close(output_pipe[0]);
-      unlink(temporary_path.data());
+      terminate_child();
       return core::Result<void>::failure(
           {ErrorCode::model_error, "cannot poll curl output"});
     }
     if (poll_result > 0 && (descriptor.revents & (POLLIN | POLLHUP)) != 0) {
       char buffer[8192];
       while (true) {
-        const ssize_t read_count = read(output_pipe[0], buffer, sizeof(buffer));
+        const ssize_t read_count =
+            read(output_read.get(), buffer, sizeof(buffer));
         if (read_count > 0) {
-          pending.append(buffer, static_cast<std::size_t>(read_count));
-          const auto processed = process_pending(false);
+          const auto processed = line_buffer.append(
+              std::string_view(buffer, static_cast<std::size_t>(read_count)));
           if (!processed) {
-            kill(-child, SIGTERM);
-            waitpid(child, nullptr, 0);
-            close(output_pipe[0]);
-            unlink(temporary_path.data());
+            terminate_child();
             return processed;
           }
           continue;
@@ -1060,19 +1098,14 @@ run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
       }
     }
 
-    const pid_t waited = waitpid(child, &status, WNOHANG);
-    if (waited == child)
-      child_finished = true;
+    if (!child_finished)
+      child_finished = support::try_reap_child(child, status);
     if ((cancelled || timed_out) && !child_finished) {
-      kill(-child, SIGKILL);
-      waitpid(child, &status, 0);
-      child_finished = true;
+      terminate_child();
     }
   }
 
-  const auto processed = process_pending(true);
-  close(output_pipe[0]);
-  unlink(temporary_path.data());
+  const auto processed = line_buffer.flush();
   if (!processed)
     return processed;
   if (cancelled || cancellation.is_cancelled())

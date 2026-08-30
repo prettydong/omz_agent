@@ -39,6 +39,9 @@ TokenCount estimated_message_tokens(const Message &message) {
 
 ContextTokenBreakdown context_breakdown_for(const ModelRequest &request,
                                             TokenCount exact_total) {
+  // Providers usually report only a total input count. Estimate each category,
+  // then scale estimates down proportionally when they exceed that exact total.
+  // Rounding leftovers remain visible as `other_tokens` instead of being lost.
   std::array<TokenCount, 5> estimated{};
   for (const auto &message : request.messages) {
     const auto tokens = estimated_message_tokens(message);
@@ -468,6 +471,9 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
       if (execution) {
         tool_result = execution.value();
       } else if (execution.error().code == ErrorCode::cancelled) {
+        emit({AgentEventType::error, execution.error().message, std::nullopt,
+              std::nullopt},
+             on_event);
         return Result<std::string>::failure(execution.error());
       } else {
         tool_result = {

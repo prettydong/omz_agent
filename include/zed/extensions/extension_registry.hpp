@@ -28,7 +28,10 @@ struct Command {
 
 class ExtensionRegistry {
 public:
+  [[nodiscard]] core::Result<void>
+  validate_command(const Command &command) const;
   core::Result<void> register_command(Command command);
+  bool unregister_command(std::string_view name);
 
   [[nodiscard]] const std::vector<Command> &commands() const {
     return commands_;

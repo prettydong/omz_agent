@@ -299,9 +299,11 @@ int main() {
       10, 10);
   assert(three_rows_up_view.starts_with("row 17"));
 
-  const auto welcome = render(zed::ui::render_terminal_welcome(
-      "/tmp/workspace", "fixture-model", "0.1.0", startup_timing(),
-      zed::core::ReasoningEffort::low, zed::ui::ThemeKind::light));
+  const auto welcome = render_in_box(
+      zed::ui::render_terminal_welcome(
+          "/tmp/workspace", "fixture-model", "0.2", startup_timing(),
+          zed::core::ReasoningEffort::low, zed::ui::ThemeKind::light),
+      160, 6);
   const auto startup_summary =
       zed::ui::terminal_startup_summary(startup_timing());
   assert(startup_summary ==
@@ -313,7 +315,7 @@ int main() {
   assert(welcome.find("fixture-model") != std::string::npos);
   assert(welcome.find("low") != std::string::npos);
   assert(welcome.find("/tmp/workspace") != std::string::npos);
-  assert(welcome.find("zeda 0.1.0") != std::string::npos);
+  assert(welcome.find("zeda 0.2") != std::string::npos);
   assert(welcome.find("startup:") != std::string::npos);
   assert(welcome.find("23.000 ms") != std::string::npos);
   assert(welcome.find("session") != std::string::npos);
@@ -323,7 +325,7 @@ int main() {
   assert(welcome.find("quick bash") == std::string::npos);
   assert(welcome.find("theme") == std::string::npos);
   assert(rendered_rows(zed::ui::render_terminal_welcome(
-             "/tmp/workspace", "fixture-model", "0.1.0", startup_timing(),
+             "/tmp/workspace", "fixture-model", "0.2", startup_timing(),
              zed::core::ReasoningEffort::low, zed::ui::ThemeKind::light)) == 6);
 
   assert(zed::ui::theme_kind_from_name("light") == zed::ui::ThemeKind::light);
@@ -458,7 +460,7 @@ int main() {
              20, 10) >= 3);
   auto viewport_content = ftxui::vbox({
       zed::ui::render_terminal_welcome(
-          "/tmp/workspace", "fixture-model", "0.1.0", startup_timing(),
+          "/tmp/workspace", "fixture-model", "0.2", startup_timing(),
           zed::core::ReasoningEffort::low, zed::ui::ThemeKind::light),
       ftxui::separatorEmpty(),
       zed::ui::render_terminal_messages(wrapped_messages, light_theme),
@@ -669,6 +671,31 @@ int main() {
   assert(restored_output.find("Inspection complete.") != std::string::npos);
   assert(restored_output.find("private system prompt") == std::string::npos);
   assert(restored_output.find("restored tool output") == std::string::npos);
+
+  assert(!zed::ui::terminal_command_reloads_session("theme", "dark"));
+  assert(!zed::ui::terminal_command_reloads_session("session", ""));
+  assert(!zed::ui::terminal_command_reloads_session("session", "list"));
+  assert(!zed::ui::terminal_command_reloads_session("session", "rename new"));
+  assert(zed::ui::terminal_command_reloads_session("session", "open existing"));
+
+  zed::ui::TerminalTranscript list_transcript;
+  list_transcript.begin_request("/session list",
+                                zed::ui::TerminalActivity::action);
+  list_transcript.complete_request(
+      zed::core::Result<std::string>::success("saved sessions: none\n"));
+  assert(list_transcript.messages().size() == 1);
+  assert(list_transcript.messages()[0].kind ==
+         zed::ui::TerminalMessageKind::command);
+  assert(list_transcript.messages()[0].content.find("saved sessions") !=
+         std::string::npos);
+
+  restored_transcript.append_command(
+      "/session open existing",
+      zed::core::Result<std::string>::success("opened session: existing\n"));
+  assert(restored_transcript.messages().back().kind ==
+         zed::ui::TerminalMessageKind::command);
+  assert(restored_transcript.messages().back().content.find("opened session") !=
+         std::string::npos);
 
   zed::ui::TerminalPromptHistory prompt_history;
   assert(!prompt_history.previous("draft").has_value());

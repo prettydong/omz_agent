@@ -662,13 +662,19 @@ core::Result<void> trim_partial_record(const std::filesystem::path &path,
 
 } // namespace
 
+struct JsonlSessionStore::CachedSession {
+  ParsedSession parsed;
+  std::uintmax_t file_size{};
+  std::filesystem::file_time_type write_time{};
+};
+
 JsonlSessionStore::JsonlSessionStore(std::filesystem::path path)
     : path_(std::move(path)) {}
 
 JsonlSessionStore::~JsonlSessionStore() { release_write_lock(); }
 
 core::Result<void> JsonlSessionStore::acquire_write_lock() {
-  if (lock_fd_ >= 0)
+  if (lock_fd_.valid())
     return core::Result<void>::success();
 
   std::error_code filesystem_error;
@@ -681,15 +687,14 @@ core::Result<void> JsonlSessionStore::acquire_write_lock() {
     }
   }
   const auto lock_path = path_.string() + ".lock";
-  const int descriptor =
-      open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-  if (descriptor < 0) {
+  support::UniqueFd descriptor(
+      open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600));
+  if (!descriptor.valid()) {
     return core::Result<void>::failure(
         session_error("cannot open session lock", path_, std::strerror(errno)));
   }
-  if (flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
+  if (flock(descriptor.get(), LOCK_EX | LOCK_NB) != 0) {
     const int lock_error = errno;
-    close(descriptor);
     return core::Result<void>::failure({
         lock_error == EWOULDBLOCK ? ErrorCode::conflict
                                   : ErrorCode::session_error,
@@ -699,16 +704,63 @@ core::Result<void> JsonlSessionStore::acquire_write_lock() {
                  : std::string(std::strerror(lock_error))),
     });
   }
-  lock_fd_ = descriptor;
+  lock_fd_ = std::move(descriptor);
   return core::Result<void>::success();
 }
 
-void JsonlSessionStore::release_write_lock() {
-  if (lock_fd_ < 0)
+core::Result<void>
+JsonlSessionStore::refresh_cache(bool allow_trailing_partial_record) const {
+  std::error_code filesystem_error;
+  const auto size = std::filesystem::file_size(path_, filesystem_error);
+  if (filesystem_error) {
+    return core::Result<void>::failure(session_error(
+        "cannot inspect session", path_, filesystem_error.message()));
+  }
+  const auto write_time =
+      std::filesystem::last_write_time(path_, filesystem_error);
+  if (filesystem_error) {
+    return core::Result<void>::failure(session_error(
+        "cannot inspect session", path_, filesystem_error.message()));
+  }
+  if (cache_ != nullptr && cache_->file_size == size &&
+      cache_->write_time == write_time &&
+      (allow_trailing_partial_record ||
+       !cache_->parsed.trailing_partial_record)) {
+    return core::Result<void>::success();
+  }
+
+  const auto parsed = parse_session_file(path_, allow_trailing_partial_record);
+  if (!parsed)
+    return core::Result<void>::failure(parsed.error());
+  cache_ = std::make_unique<CachedSession>(
+      CachedSession{parsed.value(), size, write_time});
+  return core::Result<void>::success();
+}
+
+void JsonlSessionStore::mark_cache_current() const {
+  if (cache_ == nullptr)
     return;
-  static_cast<void>(flock(lock_fd_, LOCK_UN));
-  static_cast<void>(close(lock_fd_));
-  lock_fd_ = -1;
+  std::error_code filesystem_error;
+  cache_->file_size = std::filesystem::file_size(path_, filesystem_error);
+  if (filesystem_error) {
+    cache_.reset();
+    return;
+  }
+  cache_->write_time =
+      std::filesystem::last_write_time(path_, filesystem_error);
+  if (filesystem_error) {
+    cache_.reset();
+    return;
+  }
+  cache_->parsed.valid_file_bytes = cache_->file_size;
+  cache_->parsed.trailing_partial_record = false;
+}
+
+void JsonlSessionStore::release_write_lock() {
+  if (!lock_fd_.valid())
+    return;
+  static_cast<void>(flock(lock_fd_.get(), LOCK_UN));
+  lock_fd_.reset();
 }
 
 core::Result<void> JsonlSessionStore::initialize(SessionMetadata metadata) {
@@ -728,10 +780,7 @@ core::Result<void> JsonlSessionStore::initialize(SessionMetadata metadata) {
           "cannot initialize session", path_, filesystem_error.message()));
     }
     if (size != 0) {
-      const auto parsed = parse_session_file(path_, true);
-      if (!parsed)
-        return core::Result<void>::failure(parsed.error());
-      return core::Result<void>::success();
+      return refresh_cache(true);
     }
   }
 
@@ -756,40 +805,51 @@ core::Result<void> JsonlSessionStore::initialize(SessionMetadata metadata) {
         "session title must contain 1 to 160 bytes",
     });
   }
-  return append_records(path_, {metadata_json(metadata)});
+  const auto written = append_records(path_, {metadata_json(metadata)});
+  if (!written)
+    return written;
+  cache_ = std::make_unique<CachedSession>();
+  cache_->parsed.metadata = std::move(metadata);
+  mark_cache_current();
+  return core::Result<void>::success();
 }
 
 core::Result<void> JsonlSessionStore::append(const Message &message) {
-  if (lock_fd_ < 0) {
+  if (!lock_fd_.valid()) {
     return core::Result<void>::failure(session_error(
         "cannot append message", path_, "Session is not open for writing"));
   }
-  const auto parsed = parse_session_file(path_, false);
-  if (!parsed)
-    return core::Result<void>::failure(parsed.error());
-  if (!parsed.value().active_turn.has_value()) {
+  const auto refreshed = refresh_cache(false);
+  if (!refreshed)
+    return refreshed;
+  if (!cache_->parsed.active_turn.has_value()) {
     return core::Result<void>::failure(session_error(
         "cannot append message", path_, "there is no active turn"));
   }
-  auto candidate = parsed.value();
+  auto candidate = cache_->parsed;
+  const auto turn_id = candidate.active_turn->id;
   const auto applied = apply_message(candidate, message);
   if (!applied)
     return core::Result<void>::failure(
         session_error("cannot append message", path_, applied.error().message));
-  return append_records(
-      path_, {message_json(message, parsed.value().active_turn->id)});
+  const auto written = append_records(path_, {message_json(message, turn_id)});
+  if (!written)
+    return written;
+  cache_->parsed = std::move(candidate);
+  mark_cache_current();
+  return core::Result<void>::success();
 }
 
 core::Result<std::vector<Message>> JsonlSessionStore::load() const {
-  const auto parsed = parse_session_file(path_, false);
-  if (!parsed)
-    return core::Result<std::vector<Message>>::failure(parsed.error());
-  return core::Result<std::vector<Message>>::success(parsed.value().messages);
+  const auto refreshed = refresh_cache(false);
+  if (!refreshed)
+    return core::Result<std::vector<Message>>::failure(refreshed.error());
+  return core::Result<std::vector<Message>>::success(cache_->parsed.messages);
 }
 
 core::Result<void> JsonlSessionStore::begin_turn(std::string_view turn_id,
                                                  const Message &user_message) {
-  if (lock_fd_ < 0) {
+  if (!lock_fd_.valid()) {
     return core::Result<void>::failure(session_error(
         "cannot begin turn", path_, "Session is not open for writing"));
   }
@@ -804,15 +864,17 @@ core::Result<void> JsonlSessionStore::begin_turn(std::string_view turn_id,
   const auto recovered = recover_interrupted_turn();
   if (!recovered)
     return core::Result<void>::failure(recovered.error());
-  const auto parsed = parse_session_file(path_, false);
-  if (!parsed)
-    return core::Result<void>::failure(parsed.error());
-  if (parsed.value().active_turn.has_value()) {
+  const auto refreshed = refresh_cache(false);
+  if (!refreshed)
+    return refreshed;
+  if (cache_->parsed.active_turn.has_value()) {
     return core::Result<void>::failure(session_error(
         "cannot begin turn", path_, "another turn is already active"));
   }
-  auto candidate = parsed.value();
+  auto candidate = cache_->parsed;
   candidate.active_turn = ActiveTurn{std::string(turn_id), false, false, {}};
+  ++candidate.turn_count;
+  candidate.last_turn_interrupted = false;
   const auto applied = apply_message(candidate, user_message);
   if (!applied) {
     return core::Result<void>::failure(
@@ -825,27 +887,32 @@ core::Result<void> JsonlSessionStore::begin_turn(std::string_view turn_id,
       {"turn_id", turn_id},
       {"started_at_unix_ms", unix_time_ms()},
   };
-  return append_records(
+  const auto written = append_records(
       path_, {std::move(turn_start), message_json(user_message, turn_id)});
+  if (!written)
+    return written;
+  cache_->parsed = std::move(candidate);
+  mark_cache_current();
+  return core::Result<void>::success();
 }
 
 core::Result<void> JsonlSessionStore::finish_turn(std::string_view turn_id,
                                                   SessionTurnOutcome outcome,
                                                   std::string_view detail) {
-  if (lock_fd_ < 0) {
+  if (!lock_fd_.valid()) {
     return core::Result<void>::failure(session_error(
         "cannot finish turn", path_, "Session is not open for writing"));
   }
-  const auto parsed = parse_session_file(path_, false);
-  if (!parsed)
-    return core::Result<void>::failure(parsed.error());
-  if (!parsed.value().active_turn.has_value() ||
-      parsed.value().active_turn->id != turn_id) {
+  const auto refreshed = refresh_cache(false);
+  if (!refreshed)
+    return refreshed;
+  if (!cache_->parsed.active_turn.has_value() ||
+      cache_->parsed.active_turn->id != turn_id) {
     return core::Result<void>::failure(
         session_error("cannot finish turn", path_, "turn is not active"));
   }
 
-  const auto &turn = *parsed.value().active_turn;
+  const auto &turn = *cache_->parsed.active_turn;
   if (outcome == SessionTurnOutcome::completed &&
       !turn.pending_tool_calls.empty()) {
     return core::Result<void>::failure(
@@ -859,12 +926,18 @@ core::Result<void> JsonlSessionStore::finish_turn(std::string_view turn_id,
                       "completed turn has no terminal assistant response"));
   }
 
+  auto candidate = cache_->parsed;
   std::vector<Json> records;
   if (outcome != SessionTurnOutcome::completed) {
     records.reserve(turn.pending_tool_calls.size() + 1);
     for (const auto &call : turn.pending_tool_calls) {
-      records.push_back(
-          message_json(interrupted_tool_result(turn.id, call), turn.id));
+      const auto result = interrupted_tool_result(turn.id, call);
+      records.push_back(message_json(result, turn.id));
+      const auto applied = apply_message(candidate, result);
+      if (!applied) {
+        return core::Result<void>::failure(session_error(
+            "cannot finish turn", path_, applied.error().message));
+      }
     }
   }
   std::string bounded_detail(detail.substr(0, kMaxTurnDetailBytes));
@@ -876,11 +949,18 @@ core::Result<void> JsonlSessionStore::finish_turn(std::string_view turn_id,
       {"detail", std::move(bounded_detail)},
       {"ended_at_unix_ms", unix_time_ms()},
   });
-  return append_records(path_, records);
+  const auto written = append_records(path_, records);
+  if (!written)
+    return written;
+  candidate.last_turn_interrupted = outcome == SessionTurnOutcome::interrupted;
+  candidate.active_turn.reset();
+  cache_->parsed = std::move(candidate);
+  mark_cache_current();
+  return core::Result<void>::success();
 }
 
 core::Result<void> JsonlSessionStore::set_title(std::string_view title) {
-  if (lock_fd_ < 0) {
+  if (!lock_fd_.valid()) {
     return core::Result<void>::failure(session_error(
         "cannot rename session", path_, "Session is not open for writing"));
   }
@@ -890,20 +970,28 @@ core::Result<void> JsonlSessionStore::set_title(std::string_view title) {
         "session title must contain 1 to 160 bytes",
     });
   }
-  const auto parsed = parse_session_file(path_, false);
-  if (!parsed)
-    return core::Result<void>::failure(parsed.error());
-  return append_records(path_, {{
-                                   {"version", kSessionVersion},
-                                   {"type", "session_metadata"},
-                                   {"title", title},
-                                   {"updated_at_unix_ms", unix_time_ms()},
-                               }});
+  const auto refreshed = refresh_cache(false);
+  if (!refreshed)
+    return refreshed;
+  const auto updated_at = unix_time_ms();
+  const auto written =
+      append_records(path_, {{
+                                {"version", kSessionVersion},
+                                {"type", "session_metadata"},
+                                {"title", title},
+                                {"updated_at_unix_ms", updated_at},
+                            }});
+  if (!written)
+    return written;
+  cache_->parsed.metadata.title = title;
+  cache_->parsed.metadata.updated_at_unix_ms = updated_at;
+  mark_cache_current();
+  return core::Result<void>::success();
 }
 
 core::Result<void> JsonlSessionStore::fork_to(const std::filesystem::path &path,
                                               std::string_view title) {
-  if (lock_fd_ < 0) {
+  if (!lock_fd_.valid()) {
     return core::Result<void>::failure(session_error(
         "cannot fork session", path_, "Session is not open for writing"));
   }
@@ -913,10 +1001,10 @@ core::Result<void> JsonlSessionStore::fork_to(const std::filesystem::path &path,
         "session title must contain 1 to 160 bytes",
     });
   }
-  const auto parsed = parse_session_file(path_, false);
-  if (!parsed)
-    return core::Result<void>::failure(parsed.error());
-  if (parsed.value().active_turn.has_value()) {
+  const auto refreshed = refresh_cache(false);
+  if (!refreshed)
+    return refreshed;
+  if (cache_->parsed.active_turn.has_value()) {
     return core::Result<void>::failure(session_error(
         "cannot fork session", path_, "the active turn has not ended"));
   }
@@ -934,7 +1022,7 @@ core::Result<void> JsonlSessionStore::fork_to(const std::filesystem::path &path,
          "session fork destination already exists: " + path.string()});
   }
 
-  auto metadata = parsed.value().metadata;
+  auto metadata = cache_->parsed.metadata;
   metadata.parent_id = metadata.id;
   metadata.id = path.stem().string();
   metadata.title =
@@ -971,16 +1059,16 @@ core::Result<void> JsonlSessionStore::fork_to(const std::filesystem::path &path,
           "cannot create fork destination", path, filesystem_error.message()));
     }
   }
-  const int reservation =
-      open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-  if (reservation < 0) {
+  support::UniqueFd reservation(
+      open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
+  if (!reservation.valid()) {
     return core::Result<void>::failure({
         errno == EEXIST ? ErrorCode::conflict : ErrorCode::session_error,
         "cannot reserve session fork destination '" + path.string() +
             "': " + std::strerror(errno),
     });
   }
-  static_cast<void>(close(reservation));
+  reservation.reset();
   const auto written = append_records(path, records);
   if (!written) {
     std::filesystem::remove(path, filesystem_error);
@@ -990,46 +1078,48 @@ core::Result<void> JsonlSessionStore::fork_to(const std::filesystem::path &path,
 }
 
 core::Result<SessionInspection> JsonlSessionStore::inspect() const {
-  const auto parsed = parse_session_file(path_, true);
-  if (!parsed)
-    return core::Result<SessionInspection>::failure(parsed.error());
-  const bool interrupted = parsed.value().active_turn.has_value() ||
-                           parsed.value().trailing_partial_record ||
-                           parsed.value().last_turn_interrupted;
+  const auto refreshed = refresh_cache(true);
+  if (!refreshed)
+    return core::Result<SessionInspection>::failure(refreshed.error());
+  const auto &parsed = cache_->parsed;
+  const bool interrupted = parsed.active_turn.has_value() ||
+                           parsed.trailing_partial_record ||
+                           parsed.last_turn_interrupted;
   const std::size_t unresolved =
-      parsed.value().active_turn.has_value()
-          ? parsed.value().active_turn->pending_tool_calls.size()
+      parsed.active_turn.has_value()
+          ? parsed.active_turn->pending_tool_calls.size()
           : 0;
   return core::Result<SessionInspection>::success({
-      parsed.value().metadata,
-      parsed.value().messages.size(),
-      parsed.value().turn_count,
+      parsed.metadata,
+      parsed.messages.size(),
+      parsed.turn_count,
       interrupted,
       unresolved,
   });
 }
 
 core::Result<SessionRecovery> JsonlSessionStore::recover_interrupted_turn() {
-  if (lock_fd_ < 0) {
+  if (!lock_fd_.valid()) {
     return core::Result<SessionRecovery>::failure(session_error(
         "cannot recover session", path_, "Session is not open for writing"));
   }
-  auto parsed = parse_session_file(path_, true);
-  if (!parsed)
-    return core::Result<SessionRecovery>::failure(parsed.error());
-  if (parsed.value().trailing_partial_record) {
+  auto refreshed = refresh_cache(true);
+  if (!refreshed)
+    return core::Result<SessionRecovery>::failure(refreshed.error());
+  if (cache_->parsed.trailing_partial_record) {
     const auto trimmed =
-        trim_partial_record(path_, parsed.value().valid_file_bytes);
+        trim_partial_record(path_, cache_->parsed.valid_file_bytes);
     if (!trimmed)
       return core::Result<SessionRecovery>::failure(trimmed.error());
-    parsed = parse_session_file(path_, false);
-    if (!parsed)
-      return core::Result<SessionRecovery>::failure(parsed.error());
+    cache_.reset();
+    refreshed = refresh_cache(false);
+    if (!refreshed)
+      return core::Result<SessionRecovery>::failure(refreshed.error());
   }
-  if (!parsed.value().active_turn.has_value())
+  if (!cache_->parsed.active_turn.has_value())
     return core::Result<SessionRecovery>::success({});
 
-  const auto turn = *parsed.value().active_turn;
+  const auto turn = *cache_->parsed.active_turn;
   const auto pending_count = turn.pending_tool_calls.size();
   const auto finished =
       finish_turn(turn.id, SessionTurnOutcome::interrupted,
@@ -1069,7 +1159,8 @@ JsonlSessionStore::switch_to(std::filesystem::path path) {
   }
   release_write_lock();
   path_ = std::move(path);
-  lock_fd_ = std::exchange(candidate.lock_fd_, -1);
+  lock_fd_ = std::move(candidate.lock_fd_);
+  cache_ = std::move(candidate.cache_);
   return recovered;
 }
 

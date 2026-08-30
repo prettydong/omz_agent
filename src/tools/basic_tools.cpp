@@ -2,6 +2,9 @@
 
 #include "zed/core/utf8.hpp"
 #include "zed/lsp/clangd_client.hpp"
+#include "zed/support/atomic_file.hpp"
+#include "zed/support/child_process.hpp"
+#include "zed/support/unique_fd.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -413,31 +416,11 @@ WriteFileTool::execute(const ToolCall &call,
     return core::Result<ToolResult>::failure(
         {ErrorCode::tool_error,
          "cannot create parent directory: " + error.message()});
-  const auto temporary =
-      resolved.value().string() + ".zed-write-tmp-" + std::to_string(getpid());
-  std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-  if (!output)
-    return core::Result<ToolResult>::failure(
-        {ErrorCode::tool_error,
-         "cannot open file for writing: " + path.value()});
-  output << content.value();
-  if (!output) {
-    std::filesystem::remove(temporary);
-    return core::Result<ToolResult>::failure(
-        {ErrorCode::tool_error, "cannot write file: " + path.value()});
-  }
-  output.close();
-  if (cancellation.is_cancelled()) {
-    std::filesystem::remove(temporary);
-    return core::Result<ToolResult>::failure(
-        {ErrorCode::cancelled, "write cancelled"});
-  }
-  std::filesystem::rename(temporary, resolved.value(), error);
-  if (error) {
-    std::filesystem::remove(temporary);
-    return core::Result<ToolResult>::failure(
-        {ErrorCode::tool_error, "cannot replace file: " + error.message()});
-  }
+  const auto written =
+      support::write_file_atomically(resolved.value(), content.value(),
+                                     "workspace file", overwrite, cancellation);
+  if (!written)
+    return core::Result<ToolResult>::failure(written.error());
   std::string result =
       "wrote " + std::to_string(content.value().size()) + " bytes";
   result += clangd_feedback(clangd_, resolved.value(), cancellation);
@@ -466,50 +449,54 @@ BashTool::execute(const ToolCall &call, core::CancellationToken cancellation) {
       return core::Result<ToolResult>::failure(resolved.error());
     working_directory = resolved.value();
   }
+  constexpr std::size_t kMaximumTimeoutMs = 24U * 60U * 60U * 1000U;
   std::size_t timeout_ms = limits().command_timeout_ms;
   if (const auto *value = field(arguments.value(), "timeout_ms");
       value != nullptr && value->is_number()) {
     timeout_ms = static_cast<std::size_t>(std::max(1.0, value->get<double>()));
   }
+  timeout_ms = std::min(timeout_ms, kMaximumTimeoutMs);
   std::size_t max_output = limits().max_command_output_bytes;
   if (const auto *value = field(arguments.value(), "max_output_bytes");
       value != nullptr && value->is_number()) {
     max_output = static_cast<std::size_t>(std::max(1.0, value->get<double>()));
   }
+  max_output = std::min(max_output, limits().max_command_output_bytes);
 
+  auto spawn_lock = support::lock_process_spawn();
   int output_pipe[2];
-  if (pipe(output_pipe) != 0) {
+  if (!support::create_cloexec_pipe(output_pipe)) {
     return core::Result<ToolResult>::failure(
         {ErrorCode::tool_error, "cannot create command output pipe"});
   }
+  support::UniqueFd output_read(output_pipe[0]);
+  support::UniqueFd output_write(output_pipe[1]);
   const pid_t child = fork();
   if (child == -1) {
-    close(output_pipe[0]);
-    close(output_pipe[1]);
     return core::Result<ToolResult>::failure(
         {ErrorCode::tool_error, "cannot fork command process"});
   }
   if (child == 0) {
-    close(output_pipe[0]);
+    close(output_read.get());
     setpgid(0, 0);
     if (chdir(working_directory.c_str()) != 0)
       _exit(126);
-    dup2(output_pipe[1], STDOUT_FILENO);
-    dup2(output_pipe[1], STDERR_FILENO);
-    close(output_pipe[1]);
-    unsetenv("OPENAI_API_KEY");
-    unsetenv("OPENCODE_GO_API_KEY");
-    unsetenv("ANTHROPIC_API_KEY");
+    dup2(output_write.get(), STDOUT_FILENO);
+    dup2(output_write.get(), STDERR_FILENO);
+    close(output_write.get());
+    support::clear_sensitive_environment();
     execl("/bin/sh", "sh", "-c", command.value().c_str(),
           static_cast<char *>(nullptr));
     _exit(127);
   }
 
+  spawn_lock.unlock();
+
   setpgid(child, child);
 
-  close(output_pipe[1]);
-  const int flags = fcntl(output_pipe[0], F_GETFL, 0);
-  fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
+  output_write.reset();
+  const int flags = fcntl(output_read.get(), F_GETFL, 0);
+  fcntl(output_read.get(), F_SETFL, flags | O_NONBLOCK);
   std::string output;
   bool output_truncated = false;
   bool timed_out = false;
@@ -517,25 +504,27 @@ BashTool::execute(const ToolCall &call, core::CancellationToken cancellation) {
   bool pipe_closed = false;
   int status = 0;
   bool child_finished = false;
+  const auto terminate_child = [&] {
+    support::terminate_process_group(child, std::chrono::milliseconds(250),
+                                     child_finished, status);
+  };
   const auto start = std::chrono::steady_clock::now();
 
   while (!pipe_closed || !child_finished) {
     if (cancellation.is_cancelled()) {
       cancelled = true;
-      kill(-child, SIGTERM);
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - start)
                              .count();
     if (elapsed >= static_cast<long long>(timeout_ms)) {
-      kill(-child, SIGTERM);
       timed_out = true;
     }
 
-    pollfd descriptor{output_pipe[0], POLLIN, 0};
+    pollfd descriptor{output_read.get(), POLLIN, 0};
     poll(&descriptor, 1, 50);
     char buffer[4096];
-    const ssize_t read_count = read(output_pipe[0], buffer, sizeof(buffer));
+    const ssize_t read_count = read(output_read.get(), buffer, sizeof(buffer));
     if (read_count > 0) {
       const std::size_t remaining =
           output.size() < max_output ? max_output - output.size() : 0;
@@ -550,17 +539,12 @@ BashTool::execute(const ToolCall &call, core::CancellationToken cancellation) {
       pipe_closed = true;
     }
 
-    const pid_t waited = waitpid(child, &status, WNOHANG);
-    if (waited == child)
-      child_finished = true;
+    if (!child_finished)
+      child_finished = support::try_reap_child(child, status);
     if ((timed_out || cancelled) && !child_finished) {
-      kill(-child, SIGKILL);
-      waitpid(child, &status, 0);
-      child_finished = true;
+      terminate_child();
     }
   }
-  close(output_pipe[0]);
-
   output = truncate_output(std::move(output), max_output, output_truncated);
   if (cancelled) {
     return core::Result<ToolResult>::failure(
@@ -949,25 +933,10 @@ EditFileTool::execute(const ToolCall &call,
     updated += new_text.value();
     position = found + old_text.value().size();
   }
-  const auto temporary = resolved.value().string() + ".zed-edit-tmp";
-  {
-    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-    if (!output)
-      return core::Result<ToolResult>::failure(
-          {ErrorCode::tool_error, "cannot create edit temp file"});
-    output << updated;
-    if (!output)
-      return core::Result<ToolResult>::failure(
-          {ErrorCode::tool_error, "cannot write edit temp file"});
-  }
-  std::error_code rename_error;
-  std::filesystem::rename(temporary, resolved.value(), rename_error);
-  if (rename_error) {
-    std::filesystem::remove(temporary);
-    return core::Result<ToolResult>::failure(
-        {ErrorCode::tool_error,
-         "cannot replace edited file: " + rename_error.message()});
-  }
+  const auto written = support::write_file_atomically(
+      resolved.value(), updated, "edited workspace file", true, cancellation);
+  if (!written)
+    return core::Result<ToolResult>::failure(written.error());
   std::string result = "replaced " + std::to_string(count) + " occurrence(s)";
   result += clangd_feedback(clangd_, resolved.value(), cancellation);
   return core::Result<ToolResult>::success({call.id, std::move(result), false});

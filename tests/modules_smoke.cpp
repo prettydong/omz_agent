@@ -418,6 +418,52 @@ int main() {
       {});
   assert(edit);
 
+  const auto protected_outside = root.parent_path() / "zed-edit-outside.txt";
+  {
+    std::ofstream outside_file(protected_outside);
+    outside_file << "outside stays unchanged";
+  }
+  {
+    std::ofstream editable(root / "editable.txt");
+    editable << "before";
+  }
+  std::filesystem::permissions(root / "editable.txt",
+                               std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::add);
+  std::error_code temporary_symlink_error;
+  std::filesystem::create_symlink(protected_outside,
+                                  root / "editable.txt.zed-edit-tmp",
+                                  temporary_symlink_error);
+  assert(!temporary_symlink_error);
+  const auto safe_edit = registry.execute(
+      call("edit-safe", "edit",
+           R"({"path":"editable.txt","old_text":"before","new_text":"after"})"),
+      {});
+  assert(safe_edit);
+  {
+    std::ifstream outside_file(protected_outside);
+    assert(std::string(std::istreambuf_iterator<char>(outside_file), {}) ==
+           "outside stays unchanged");
+  }
+  assert((std::filesystem::status(root / "editable.txt").permissions() &
+          std::filesystem::perms::owner_exec) != std::filesystem::perms::none);
+
+  const auto old_write_temporary =
+      root / ("created.txt.zed-write-tmp-" + std::to_string(getpid()));
+  std::filesystem::create_symlink(protected_outside, old_write_temporary,
+                                  temporary_symlink_error);
+  assert(!temporary_symlink_error);
+  const auto safe_write = registry.execute(
+      call("write-safe", "write",
+           R"({"path":"created.txt","content":"workspace content"})"),
+      {});
+  assert(safe_write);
+  {
+    std::ifstream outside_file(protected_outside);
+    assert(std::string(std::istreambuf_iterator<char>(outside_file), {}) ==
+           "outside stays unchanged");
+  }
+
   std::filesystem::create_directories(root / "tree" / "docs");
   std::filesystem::create_directories(root / "tree" / "src");
   {
@@ -529,6 +575,15 @@ int main() {
   const auto symlink_read = registry.execute(
       call("read-3", "read", R"({"path":"outside-link.txt"})"), {});
   assert(!symlink_read);
+  const auto symlink_write = registry.execute(
+      call("write-symlink-1", "write",
+           R"({"path":"outside-link.txt","content":"pwned","overwrite":true})"),
+      {});
+  assert(!symlink_write);
+  {
+    std::ifstream saved(outside);
+    assert(std::string(std::istreambuf_iterator<char>(saved), {}) == "secret");
+  }
 
   const auto find_symlink = registry.execute(
       call("find-6", "find", R"({"pattern":"outside-link.txt","path":"."})"),
@@ -545,6 +600,7 @@ int main() {
   assert(listed_symlink.value().content.find("outside-link.txt@") !=
          std::string::npos);
   std::filesystem::remove(outside, cleanup_error);
+  std::filesystem::remove(protected_outside, cleanup_error);
 
   const auto overwrite_rejected = registry.execute(
       call("write-3", "write", R"({"path":"hello.txt","content":"replace"})"),
@@ -673,6 +729,36 @@ int main() {
   assert(!cancelled_bash.value());
   assert(cancelled_bash->error().code == ErrorCode::cancelled);
 
+  assert(setenv("AWS_SECRET_ACCESS_KEY", "super-secret-from-host", 1) == 0);
+  assert(setenv("OPENAI_API_KEY", "openai-secret-from-host", 1) == 0);
+  const auto scrubbed_bash = registry.execute(
+      call(
+          "bash-env-1", "bash",
+          R"({"command":"printf ${AWS_SECRET_ACCESS_KEY:-unset}:${OPENAI_API_KEY:-unset}","timeout_ms":1000})"),
+      {});
+  assert(scrubbed_bash);
+  assert(scrubbed_bash.value().content.find("super-secret-from-host") ==
+         std::string::npos);
+  assert(scrubbed_bash.value().content.find("openai-secret-from-host") ==
+         std::string::npos);
+  assert(scrubbed_bash.value().content.find("unset:unset") !=
+         std::string::npos);
+  assert(unsetenv("AWS_SECRET_ACCESS_KEY") == 0);
+  assert(unsetenv("OPENAI_API_KEY") == 0);
+
+  zed::core::ToolRegistry capped_bash_registry;
+  assert(
+      capped_bash_registry.register_tool(std::make_unique<zed::tools::BashTool>(
+          root, zed::tools::ToolLimits{256 * 1024, 256 * 1024, 8, 1'000})));
+  const auto capped_output = capped_bash_registry.execute(
+      call("bash-cap-1", "bash",
+           R"({"command":"printf 123456789","max_output_bytes":1000000})"),
+      {});
+  assert(capped_output);
+  assert(capped_output.value().content.find("[output truncated]") !=
+         std::string::npos);
+  assert(capped_output.value().content.find("123456789") == std::string::npos);
+
   const auto skill_root = root / ".zed" / "skills";
   const auto skill_directory = skill_root / "review";
   std::filesystem::create_directories(skill_directory);
@@ -745,7 +831,7 @@ int main() {
 
   std::stringstream terminal_output;
   zed::ui::TerminalRenderer renderer(terminal_output, {false});
-  renderer.banner("/tmp/workspace", "muse-spark-1.2-contributor", "0.1.0",
+  renderer.banner("/tmp/workspace", "muse-spark-1.2-contributor", "0.2",
                   startup_timing(), zed::core::ReasoningEffort::low);
   renderer.render({zed::core::AgentEventType::assistant_delta, "hello", {}});
   renderer.render({zed::core::AgentEventType::agent_end, "", {}});
@@ -761,7 +847,7 @@ int main() {
   assert(terminal_output.str().find("workspace: /tmp/workspace\n" +
                                     startup_summary + "\n") !=
          std::string::npos);
-  assert(terminal_output.str().find("zeda 0.1.0") != std::string::npos);
+  assert(terminal_output.str().find("zeda 0.2") != std::string::npos);
   assert(terminal_output.str().find("session 3.000") != std::string::npos);
   assert(terminal_output.str().find("core") == std::string::npos);
   assert(terminal_output.str().find("other 1.000") != std::string::npos);

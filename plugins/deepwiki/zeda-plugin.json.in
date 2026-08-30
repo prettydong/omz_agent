@@ -1,7 +1,7 @@
 {
   "id": "deepwiki",
   "name": "DeepWiki",
-  "version": "0.1.0",
+  "version": "@PROJECT_VERSION@",
   "abi_version": 1,
   "library": "@CMAKE_SHARED_LIBRARY_PREFIX@zeda_deepwiki@CMAKE_SHARED_LIBRARY_SUFFIX@",
   "resources": "resources"

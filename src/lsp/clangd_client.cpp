@@ -1,5 +1,8 @@
 #include "zed/lsp/clangd_client.hpp"
 
+#include "zed/support/child_process.hpp"
+#include "zed/support/unique_fd.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -31,16 +34,6 @@ using core::ErrorCode;
 constexpr std::size_t kMaximumHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaximumStderrBytes = 64 * 1024;
 
-void clear_sensitive_environment() {
-  static constexpr std::array<const char *, 9> kSensitiveVariables{
-      "OPENAI_API_KEY",       "OPENCODE_GO_API_KEY",   "ANTHROPIC_API_KEY",
-      "AZURE_OPENAI_API_KEY", "GOOGLE_API_KEY",        "GITHUB_TOKEN",
-      "AWS_ACCESS_KEY_ID",    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-  };
-  for (const auto *name : kSensitiveVariables)
-    unsetenv(name);
-}
-
 std::filesystem::path canonical_path(const std::filesystem::path &path) {
   std::error_code error;
   const auto canonical = std::filesystem::weakly_canonical(path, error);
@@ -64,6 +57,8 @@ std::string lowercase(std::string value) {
 }
 
 std::string percent_encode_path(std::string_view path) {
+  // File URIs preserve path separators but encode every other byte outside the
+  // RFC 3986 unreserved set. Iterating bytes also keeps UTF-8 encoding stable.
   static constexpr char kHex[] = "0123456789ABCDEF";
   std::string encoded;
   encoded.reserve(path.size());
@@ -320,17 +315,28 @@ private:
       return core::Result<void>::failure(
           {ErrorCode::cancelled, "clangd start cancelled"});
 
-    int input_pipe[2]{-1, -1};
-    int output_pipe[2]{-1, -1};
-    int error_pipe[2]{-1, -1};
-    if (pipe(input_pipe) != 0 || pipe(output_pipe) != 0 ||
-        pipe(error_pipe) != 0) {
-      close_pair(input_pipe);
-      close_pair(output_pipe);
-      close_pair(error_pipe);
+    auto spawn_lock = support::lock_process_spawn();
+    int input_pipe[2];
+    if (!support::create_cloexec_pipe(input_pipe)) {
       return core::Result<void>::failure(
           process_error("cannot create clangd pipes", std::strerror(errno)));
     }
+    support::UniqueFd input_read(input_pipe[0]);
+    support::UniqueFd input_write(input_pipe[1]);
+    int output_pipe[2];
+    if (!support::create_cloexec_pipe(output_pipe)) {
+      return core::Result<void>::failure(
+          process_error("cannot create clangd pipes", std::strerror(errno)));
+    }
+    support::UniqueFd output_read(output_pipe[0]);
+    support::UniqueFd output_write(output_pipe[1]);
+    int error_pipe[2];
+    if (!support::create_cloexec_pipe(error_pipe)) {
+      return core::Result<void>::failure(
+          process_error("cannot create clangd pipes", std::strerror(errno)));
+    }
+    support::UniqueFd error_read(error_pipe[0]);
+    support::UniqueFd error_write(error_pipe[1]);
 
     std::vector<std::string> arguments{config_.executable, "--clang-tidy"};
     if (config_.background_index)
@@ -347,42 +353,41 @@ private:
 
     const pid_t child = fork();
     if (child == -1) {
-      close_pair(input_pipe);
-      close_pair(output_pipe);
-      close_pair(error_pipe);
       return core::Result<void>::failure(
           process_error("cannot fork clangd", std::strerror(errno)));
     }
     if (child == 0) {
       setpgid(0, 0);
-      close(input_pipe[1]);
-      close(output_pipe[0]);
-      close(error_pipe[0]);
+      close(input_write.get());
+      close(output_read.get());
+      close(error_read.get());
       if (chdir(workspace_root_.c_str()) != 0)
         _exit(126);
-      if (dup2(input_pipe[0], STDIN_FILENO) == -1 ||
-          dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
-          dup2(error_pipe[1], STDERR_FILENO) == -1) {
+      if (dup2(input_read.get(), STDIN_FILENO) == -1 ||
+          dup2(output_write.get(), STDOUT_FILENO) == -1 ||
+          dup2(error_write.get(), STDERR_FILENO) == -1) {
         _exit(126);
       }
-      close(input_pipe[0]);
-      close(output_pipe[1]);
-      close(error_pipe[1]);
-      clear_sensitive_environment();
+      close(input_read.get());
+      close(output_write.get());
+      close(error_write.get());
+      support::clear_sensitive_environment();
       execvp(argv[0], argv.data());
       _exit(127);
     }
 
+    spawn_lock.unlock();
+
     setpgid(child, child);
-    close(input_pipe[0]);
-    close(output_pipe[1]);
-    close(error_pipe[1]);
+    input_read.reset();
+    output_write.reset();
+    error_write.reset();
     pid_ = child;
-    input_fd_ = input_pipe[1];
-    output_fd_ = output_pipe[0];
-    error_fd_ = error_pipe[0];
-    set_nonblocking(output_fd_);
-    set_nonblocking(error_fd_);
+    input_fd_ = std::move(input_write);
+    output_fd_ = std::move(output_read);
+    error_fd_ = std::move(error_read);
+    set_nonblocking(output_fd_.get());
+    set_nonblocking(error_fd_.get());
     std::signal(SIGPIPE, SIG_IGN);
 
     const Json initialize_parameters{
@@ -415,15 +420,6 @@ private:
     return core::Result<void>::success();
   }
 
-  static void close_pair(int (&descriptors)[2]) {
-    for (int &descriptor : descriptors) {
-      if (descriptor >= 0) {
-        close(descriptor);
-        descriptor = -1;
-      }
-    }
-  }
-
   static void set_nonblocking(int descriptor) {
     const int flags = fcntl(descriptor, F_GETFL, 0);
     if (flags >= 0)
@@ -436,8 +432,8 @@ private:
         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
     std::size_t written = 0;
     while (written < framed.size()) {
-      const ssize_t count =
-          write(input_fd_, framed.data() + written, framed.size() - written);
+      const ssize_t count = write(input_fd_.get(), framed.data() + written,
+                                  framed.size() - written);
       if (count > 0) {
         written += static_cast<std::size_t>(count);
         continue;
@@ -501,6 +497,8 @@ private:
   }
 
   core::Result<std::optional<Json>> extract_message() {
+    // LSP frames JSON with an ASCII header and a byte-counted body. Keep an
+    // incomplete frame buffered; consume it only after the full body arrives.
     const auto header_end = output_buffer_.find("\r\n\r\n");
     if (header_end == std::string::npos) {
       if (output_buffer_.size() > kMaximumHeaderBytes) {
@@ -569,8 +567,8 @@ private:
       const int poll_timeout =
           static_cast<int>(std::min<long long>(remaining, 50));
       std::array<pollfd, 2> descriptors{{
-          {output_fd_, POLLIN | POLLHUP, 0},
-          {error_fd_, POLLIN | POLLHUP, 0},
+          {output_fd_.get(), POLLIN | POLLHUP, 0},
+          {error_fd_.get(), POLLIN | POLLHUP, 0},
       }};
       const int ready =
           poll(descriptors.data(), descriptors.size(), poll_timeout);
@@ -584,7 +582,8 @@ private:
         drain_stderr();
       if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0) {
         std::array<char, 8192> buffer{};
-        const ssize_t count = read(output_fd_, buffer.data(), buffer.size());
+        const ssize_t count =
+            read(output_fd_.get(), buffer.data(), buffer.size());
         if (count > 0) {
           output_buffer_.append(buffer.data(), static_cast<std::size_t>(count));
         } else if (count == 0) {
@@ -605,7 +604,7 @@ private:
   void drain_stderr() {
     std::array<char, 4096> buffer{};
     while (true) {
-      const ssize_t count = read(error_fd_, buffer.data(), buffer.size());
+      const ssize_t count = read(error_fd_.get(), buffer.data(), buffer.size());
       if (count <= 0)
         break;
       stderr_tail_.append(buffer.data(), static_cast<std::size_t>(count));
@@ -767,35 +766,20 @@ private:
   }
 
   void terminate_process() {
-    if (input_fd_ >= 0) {
-      close(input_fd_);
-      input_fd_ = -1;
-    }
+    input_fd_.reset();
     bool exited = false;
+    int status = 0;
     for (int attempt = 0; attempt < 50; ++attempt) {
-      int status = 0;
-      const pid_t waited = waitpid(pid_, &status, WNOHANG);
-      if (waited == pid_) {
+      if (support::try_reap_child(pid_, status)) {
         exited = true;
         break;
       }
       usleep(10'000);
     }
-    if (!exited) {
-      kill(-pid_, SIGTERM);
-      usleep(50'000);
-      int status = 0;
-      if (waitpid(pid_, &status, WNOHANG) != pid_) {
-        kill(-pid_, SIGKILL);
-        waitpid(pid_, &status, 0);
-      }
-    }
-    if (output_fd_ >= 0)
-      close(output_fd_);
-    if (error_fd_ >= 0)
-      close(error_fd_);
-    output_fd_ = -1;
-    error_fd_ = -1;
+    support::terminate_process_group(pid_, std::chrono::milliseconds(50),
+                                     exited, status);
+    output_fd_.reset();
+    error_fd_.reset();
     pid_ = -1;
     initialized_ = false;
   }
@@ -804,9 +788,9 @@ private:
   std::filesystem::path workspace_root_;
   std::mutex mutex_;
   pid_t pid_{-1};
-  int input_fd_{-1};
-  int output_fd_{-1};
-  int error_fd_{-1};
+  support::UniqueFd input_fd_;
+  support::UniqueFd output_fd_;
+  support::UniqueFd error_fd_;
   bool initialized_{false};
   std::uint64_t request_id_{};
   std::string output_buffer_;

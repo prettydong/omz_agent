@@ -1,11 +1,15 @@
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "zed/core/agent_loop.hpp"
 #include "zed/core/model_context_controller.hpp"
+#include "zed/core/utf8.hpp"
 
 namespace {
 
@@ -215,6 +219,84 @@ public:
   }
 };
 
+class CancellingContextController final : public ContextController {
+public:
+  Result<ContextDecision> decide(const ContextRequest &,
+                                 CancellationToken) override {
+    return Result<ContextDecision>::failure({
+        ErrorCode::cancelled,
+        "context controller cancelled",
+    });
+  }
+};
+
+class SlowCancelTool final : public Tool {
+public:
+  SlowCancelTool()
+      : definition_{
+            "slow_cancel",
+            "Blocks until cancelled.",
+            R"({"type":"object","properties":{}})",
+        } {}
+
+  [[nodiscard]] const ToolDefinition &definition() const override {
+    return definition_;
+  }
+
+  Result<ToolResult> execute(const ToolCall &call,
+                             CancellationToken cancellation) override {
+    for (int attempt = 0; attempt < 200 && !cancellation.is_cancelled();
+         ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (cancellation.is_cancelled()) {
+      return Result<ToolResult>::failure({
+          ErrorCode::cancelled,
+          "slow_cancel cancelled",
+      });
+    }
+    return Result<ToolResult>::success({call.id, "finished", false});
+  }
+
+private:
+  ToolDefinition definition_;
+};
+
+class SlowCancelModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &,
+                                     const StreamCallback &,
+                                     CancellationToken cancellation) override {
+    if (cancellation.is_cancelled()) {
+      return Result<AssistantResponse>::failure({
+          ErrorCode::cancelled,
+          "slow cancel model cancelled",
+      });
+    }
+    ++calls_;
+    if (calls_ == 1) {
+      return Result<AssistantResponse>::success({
+          {},
+          {{"slow-1", "slow_cancel",
+            R"({"purpose":"Wait until the caller cancels"})"}},
+          FinishReason::tool_calls,
+          {},
+      });
+    }
+    return Result<AssistantResponse>::success({
+        "should not happen",
+        {},
+        FinishReason::stop,
+        {},
+    });
+  }
+
+  [[nodiscard]] int calls() const { return calls_; }
+
+private:
+  int calls_{0};
+};
+
 class ConfiguredContextModel final : public Model {
 public:
   Result<AssistantResponse> complete(const ModelRequest &request,
@@ -234,9 +316,35 @@ public:
   }
 };
 
+class PartialToolContextController final : public ContextController {
+public:
+  Result<ContextDecision> decide(const ContextRequest &request,
+                                 CancellationToken) override {
+    ContextDecision decision;
+    for (const auto &candidate : request.candidates) {
+      if (candidate.required || candidate.id == "partial-tool")
+        decision.selected_ids.push_back(candidate.id);
+    }
+    return Result<ContextDecision>::success(std::move(decision));
+  }
+};
+
 } // namespace
 
 int main() {
+  const ContextLimits configured_limits{1'000, 200, 700};
+  assert(cap_context_limits(configured_limits, 0).max_context_tokens == 1'000);
+  assert(cap_context_limits(configured_limits, 2'000).max_context_tokens ==
+         1'000);
+  const auto capped_limits = cap_context_limits(configured_limits, 800);
+  assert(capped_limits.max_context_tokens == 800);
+  assert(capped_limits.reserved_output_tokens == 200);
+  assert(capped_limits.compaction_trigger_tokens == 0);
+  const auto tightly_capped_limits = cap_context_limits(configured_limits, 100);
+  assert(tightly_capped_limits.max_context_tokens == 100);
+  assert(tightly_capped_limits.reserved_output_tokens == 12);
+  assert(tightly_capped_limits.compaction_trigger_tokens == 0);
+
   ConfiguredContextModel configured_context_model;
   ModelBackedContextController configured_controller(
       configured_context_model, {"test", "context-fixture"},
@@ -450,5 +558,135 @@ int main() {
   assert(additional_context_history);
   assert(additional_context_history.value().size() == 2);
   assert(additional_context_history.value()[0].content == "exact user input");
+
+  assert(is_valid_utf8("hello 你好"));
+  assert(!is_valid_utf8("before\x80"
+                        "after"));
+  const auto sanitized = sanitize_utf8("before\x80"
+                                       "after");
+  assert(sanitized.replacement_count == 1);
+  assert(sanitized.text.find("before") == 0);
+  assert(sanitized.text.find("after") != std::string::npos);
+  assert(sanitized.text.find('\x80') == std::string::npos);
+
+  const std::vector<Message> paired_history{
+      {"sys", Role::system, "sys", {}, std::nullopt},
+      {"old-user", Role::user, std::string(400, 'x'), {}, std::nullopt},
+      {"assistant-1",
+       Role::assistant,
+       {},
+       {{"call-keep", "echo", std::string(40, 'a')}},
+       std::nullopt},
+      {"tool-1", Role::tool, "ok", {}, "call-keep"},
+  };
+  const auto paired_window =
+      compaction_manager.build(paired_history, {80, 10, 10, true}, {});
+  assert(paired_window);
+  assert(paired_window.value().was_compacted);
+  bool saw_assistant = false;
+  bool saw_tool = false;
+  bool saw_old_user = false;
+  for (const auto &message : paired_window.value().messages) {
+    saw_assistant = saw_assistant || message.id == "assistant-1";
+    saw_tool = saw_tool || message.id == "tool-1";
+    saw_old_user = saw_old_user || message.id == "old-user";
+  }
+  assert(saw_assistant);
+  assert(saw_tool);
+  assert(!saw_old_user);
+
+  PartialToolContextController partial_controller;
+  BasicContextManager controlled_compaction(compaction_estimator,
+                                            &partial_controller);
+  const std::vector<Message> partially_selected_history{
+      {"partial-system", Role::system, "system", {}, std::nullopt},
+      {"partial-old", Role::user, std::string(400, 'x'), {}, std::nullopt},
+      {"partial-assistant",
+       Role::assistant,
+       {},
+       {{"partial-call", "echo", R"({"purpose":"test"})"}},
+       std::nullopt},
+      {"partial-tool", Role::tool, "result", {}, "partial-call"},
+      {"partial-current", Role::user, "current", {}, std::nullopt},
+  };
+  const auto controlled_window = controlled_compaction.build(
+      partially_selected_history, {80, 10, 10, true}, {});
+  assert(controlled_window);
+  bool controlled_assistant = false;
+  bool controlled_tool = false;
+  for (const auto &message : controlled_window.value().messages) {
+    controlled_assistant =
+        controlled_assistant || message.id == "partial-assistant";
+    controlled_tool = controlled_tool || message.id == "partial-tool";
+  }
+  assert(controlled_assistant);
+  assert(controlled_tool);
+
+  const std::vector<Message> oversized_pair{
+      {"sys", Role::system, "sys", {}, std::nullopt},
+      {"assistant-huge",
+       Role::assistant,
+       {},
+       {{"call-huge", "echo", std::string(400, 'b')}},
+       std::nullopt},
+      {"tool-huge", Role::tool, "ok", {}, "call-huge"},
+  };
+  const auto oversized_window =
+      compaction_manager.build(oversized_pair, {40, 8, 8, true}, {});
+  assert(!oversized_window);
+  assert(oversized_window.error().code == ErrorCode::context_error);
+
+  CancellingContextController cancelling_controller;
+  BasicContextManager cancelling_manager(compaction_estimator,
+                                         &cancelling_controller);
+  const std::vector<Message> cancellable_history{
+      {"task", Role::user, std::string(400, 'z'), {}, std::nullopt}};
+  const auto cancelled_window =
+      cancelling_manager.build(cancellable_history, {80, 10, 10, true}, {});
+  assert(!cancelled_window);
+  assert(cancelled_window.error().code == ErrorCode::cancelled);
+
+  CancellationSource pre_cancelled;
+  pre_cancelled.cancel();
+  FakeModel cancelled_model;
+  ToolRegistry cancelled_tools;
+  assert(cancelled_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore cancelled_session;
+  BasicContextManager cancelled_context(estimator);
+  AgentLoop cancelled_loop(cancelled_model, cancelled_tools, cancelled_session,
+                           cancelled_context, config);
+  const auto cancelled_run =
+      cancelled_loop.run("cancel immediately", pre_cancelled.token());
+  assert(!cancelled_run);
+  assert(cancelled_run.error().code == ErrorCode::cancelled);
+  assert(cancelled_model.calls() == 0);
+
+  SlowCancelModel slow_model;
+  ToolRegistry slow_tools;
+  assert(slow_tools.register_tool(std::make_unique<SlowCancelTool>()));
+  InMemorySessionStore slow_session;
+  BasicContextManager slow_context(estimator);
+  AgentLoop slow_loop(slow_model, slow_tools, slow_session, slow_context,
+                      config);
+  CancellationSource slow_cancellation;
+  std::optional<Result<std::string>> slow_result;
+  std::size_t slow_error_events = 0;
+  std::thread slow_worker([&] {
+    slow_result =
+        slow_loop.run("cancel during the tool", slow_cancellation.token(),
+                      [&](const AgentEvent &event) {
+                        if (event.type == AgentEventType::error)
+                          ++slow_error_events;
+                      });
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  slow_cancellation.cancel();
+  slow_worker.join();
+  assert(slow_result.has_value());
+  assert(!slow_result.value());
+  assert(slow_result->error().code == ErrorCode::cancelled);
+  assert(slow_error_events >= 1);
+  assert(slow_model.calls() == 1);
+
   return 0;
 }

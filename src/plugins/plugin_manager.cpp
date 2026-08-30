@@ -1,6 +1,7 @@
 #include "zed/plugins/plugin_manager.hpp"
 
 #include "zed/plugins/plugin_sdk.h"
+#include "zed/support/unique_library.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -274,7 +275,7 @@ public:
 
   struct LoadedPlugin {
     Manifest manifest;
-    void *library{};
+    support::UniqueLibrary library;
     const ZedaPluginDescriptorV1 *descriptor{};
     void *instance{};
     HostContext host_context;
@@ -304,8 +305,6 @@ public:
         } catch (...) {
         }
       }
-      if (plugin.library != nullptr)
-        dlclose(plugin.library);
     }
   }
 
@@ -336,9 +335,9 @@ public:
 
     auto plugin = std::make_unique<LoadedPlugin>();
     plugin->manifest = manifest.value();
-    plugin->library =
-        dlopen(plugin->manifest.library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (plugin->library == nullptr) {
+    plugin->library.reset(
+        dlopen(plugin->manifest.library_path.c_str(), RTLD_NOW | RTLD_LOCAL));
+    if (!plugin->library) {
       const char *load_error = dlerror();
       status.detail =
           "cannot load plugin library: " +
@@ -347,10 +346,9 @@ public:
       return;
     }
     const auto entry = reinterpret_cast<ZedaPluginEntryV1>(
-        dlsym(plugin->library, ZEDA_PLUGIN_ENTRY_SYMBOL));
+        dlsym(plugin->library.get(), ZEDA_PLUGIN_ENTRY_SYMBOL));
     if (entry == nullptr) {
       status.detail = "plugin entry symbol is missing";
-      dlclose(plugin->library);
       statuses_.push_back(std::move(status));
       return;
     }
@@ -364,7 +362,6 @@ public:
         copy_string(plugin->descriptor->id) != plugin->manifest.id ||
         copy_string(plugin->descriptor->version) != plugin->manifest.version) {
       status.detail = "plugin descriptor does not match manifest";
-      dlclose(plugin->library);
       statuses_.push_back(std::move(status));
       return;
     }
@@ -372,7 +369,6 @@ public:
         plugin->descriptor->initialize == nullptr ||
         plugin->descriptor->destroy == nullptr) {
       status.detail = "plugin lifecycle is incomplete";
-      dlclose(plugin->library);
       statuses_.push_back(std::move(status));
       return;
     }
@@ -393,6 +389,22 @@ public:
         clangd_query,
     };
 
+    const auto destroy_instance = [&](bool shutdown) noexcept {
+      if (plugin->instance == nullptr)
+        return;
+      if (shutdown && plugin->descriptor->shutdown != nullptr) {
+        try {
+          plugin->descriptor->shutdown(plugin->instance);
+        } catch (...) {
+        }
+      }
+      try {
+        plugin->descriptor->destroy(plugin->instance);
+      } catch (...) {
+      }
+      plugin->instance = nullptr;
+    };
+
     std::string error;
     try {
       plugin->instance = plugin->descriptor->create();
@@ -404,16 +416,12 @@ public:
       }
     } catch (const std::exception &exception) {
       status.detail = exception.what();
-      if (plugin->instance != nullptr)
-        plugin->descriptor->destroy(plugin->instance);
-      dlclose(plugin->library);
+      destroy_instance(false);
       statuses_.push_back(std::move(status));
       return;
     } catch (...) {
       status.detail = "plugin initialization threw an unknown exception";
-      if (plugin->instance != nullptr)
-        plugin->descriptor->destroy(plugin->instance);
-      dlclose(plugin->library);
+      destroy_instance(false);
       statuses_.push_back(std::move(status));
       return;
     }
@@ -421,12 +429,25 @@ public:
     const auto validation = validate_staged(plugin->host_context);
     if (!validation) {
       status.detail = validation.error().message;
-      plugin->descriptor->shutdown(plugin->instance);
-      plugin->descriptor->destroy(plugin->instance);
-      dlclose(plugin->library);
+      destroy_instance(true);
       statuses_.push_back(std::move(status));
       return;
     }
+    std::vector<std::string_view> registered_commands;
+    std::vector<std::string_view> registered_tools;
+    registered_commands.reserve(plugin->host_context.commands.size());
+    registered_tools.reserve(plugin->host_context.tools.size());
+    const auto rollback = [&] {
+      for (auto iterator = registered_tools.rbegin();
+           iterator != registered_tools.rend(); ++iterator) {
+        static_cast<void>(tools_.unregister_tool(*iterator));
+      }
+      for (auto iterator = registered_commands.rbegin();
+           iterator != registered_commands.rend(); ++iterator) {
+        static_cast<void>(extensions_.unregister_command(*iterator));
+      }
+      destroy_instance(true);
+    };
     for (const auto &command : plugin->host_context.commands) {
       std::vector<extensions::CommandOption> options;
       if (!command.options_json.empty()) {
@@ -493,18 +514,22 @@ public:
       });
       if (!registered) {
         status.detail = registered.error().message;
+        rollback();
         statuses_.push_back(std::move(status));
         return;
       }
+      registered_commands.push_back(command.name);
     }
     for (const auto &tool : plugin->host_context.tools) {
       const auto registered =
           tools_.register_tool(std::make_unique<PluginTool>(tool));
       if (!registered) {
         status.detail = registered.error().message;
+        rollback();
         statuses_.push_back(std::move(status));
         return;
       }
+      registered_tools.push_back(tool.name);
     }
     plugin->initialized = true;
     status.loaded = true;
@@ -530,6 +555,40 @@ public:
           return core::Result<void>::failure(
               {ErrorCode::invalid_argument,
                "plugin command options must be a JSON array: " + command.name});
+        std::vector<extensions::CommandOption> options;
+        for (const auto &option : parsed) {
+          if (!option.is_object() || !option.contains("value") ||
+              !option.at("value").is_string() ||
+              (option.contains("description") &&
+               !option.at("description").is_string())) {
+            return core::Result<void>::failure(
+                {ErrorCode::invalid_argument,
+                 "plugin command option is invalid: " + command.name});
+          }
+          options.push_back({option.at("value").get<std::string>(),
+                             option.value("description", "")});
+        }
+        const auto exact_validation = extensions_.validate_command(
+            {command.name,
+             command.description,
+             [](std::string_view) {
+               return core::Result<std::string>::success({});
+             },
+             std::move(options),
+             {}});
+        if (!exact_validation)
+          return exact_validation;
+      } else {
+        const auto exact_validation = extensions_.validate_command(
+            {command.name,
+             command.description,
+             [](std::string_view) {
+               return core::Result<std::string>::success({});
+             },
+             {},
+             {}});
+        if (!exact_validation)
+          return exact_validation;
       }
     }
     std::set<std::string> tool_names;
@@ -547,6 +606,11 @@ public:
         return core::Result<void>::failure(
             {ErrorCode::invalid_argument,
              "plugin tool schema is invalid: " + tool.name});
+      const PluginTool candidate(tool);
+      const auto exact_validation =
+          tools_.validate_tool(candidate.definition());
+      if (!exact_validation)
+        return exact_validation;
     }
     return core::Result<void>::success();
   }

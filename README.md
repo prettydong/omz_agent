@@ -4,8 +4,25 @@
 
 ## 构建
 
+### Ubuntu
+
+在 Ubuntu 22.04 或更高版本安装构建和运行依赖：
+
 ```bash
-cmake -S . -B build -DBUILD_TESTING=ON
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake ninja-build pkg-config libsqlite3-dev \
+  ca-certificates curl clangd
+```
+
+项目会在配置阶段通过 CMake FetchContent 下载并校验固定版本的 C++ 和 Web
+依赖，不需要手工安装 nlohmann/json、FTXUI、cpp-httplib、marked、DOMPurify 或
+Mermaid。
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
@@ -295,8 +312,18 @@ zeda 只集成本机 `clangd`，不下载或启动其他语言服务器。C/C++ 
 
 zeda 启动时从安装前缀的 `lib/zeda/plugins/` 发现版本化 C ABI 插件。开发时也会
 检查可执行文件旁的 `plugins/`，并可用冒号分隔的 `ZED_PLUGIN_PATH` 追加目录。
-`/plugins` 会列出成功加载和加载失败的插件；ABI 不匹配、manifest 错误和命令或工具
-冲突都会显示为可见错误。插件是受信任的本机动态库，首版不提供进程隔离或热卸载。
+搜索根保留声明顺序；同一插件 ID 由更早的根获胜，后续副本显示为 `shadowed`。
+`/plugins` 会显示 `active`、`pending`、`shadowed` 和 `failed` 等状态；ABI 不匹配、
+manifest 错误、缺失依赖以及命令或工具冲突都不会静默丢失。Manifest 可用
+`"requires":["plugin-id"]` 声明必需插件，宿主先解析完整依赖图，再按拓扑顺序加载；
+缺失、失败或成环的依赖保持可诊断的 `pending`。
+
+插件注册的命令和工具归属于插件生命周期。退出时宿主先停止接收新调用并发出取消，
+反向注销全部贡献，等待在途调用退出，再执行 `shutdown`、`destroy` 和 `dlclose`。
+插件输出受 Agent 的命令输出字节预算限制，截断时带有明确标记。插件仍是受信任的本机
+动态库，不提供进程隔离或运行时热重载；同进程依赖声明不是权限或 sandbox 边界。完整
+manifest、状态机和卸载契约见 [插件运行时设计](docs/plugin_system.md)。
+
 命令的 `options_json` 项可以用 `"view":"document"` 声明交互式文档选项；该选项的
 执行结果必须是 `schema_version: 1` 的 JSON，包含标题和非空页面数组。宿主会在工作
 线程中解析并限制快照为 16 MiB、单页为 2 MiB、最多 128 页，普通非 TTY 输出不会

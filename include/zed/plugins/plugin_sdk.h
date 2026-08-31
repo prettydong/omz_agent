@@ -18,11 +18,13 @@ typedef struct ZedaStringView {
 
 typedef struct ZedaTextSinkV1 {
   void *context;
+  /* Host-provided sinks may truncate after their configured byte budget. */
   int (*write)(void *context, ZedaStringView text);
 } ZedaTextSinkV1;
 
 typedef struct ZedaCancellationV1 {
   void *context;
+  /* Long-running callbacks must poll this function and return promptly. */
   int (*is_cancelled)(void *context);
 } ZedaCancellationV1;
 
@@ -85,6 +87,7 @@ typedef struct ZedaPluginDescriptorV1 {
   ZedaStringView name;
   ZedaStringView version;
   void *(*create)(void);
+  /* Commands and tools may only be registered before initialize returns. */
   int (*initialize)(void *instance, const ZedaHostApiV1 *host,
                     ZedaTextSinkV1 error);
   void (*shutdown)(void *instance);

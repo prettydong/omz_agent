@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,9 +35,7 @@ public:
   core::Result<void> register_command(Command command);
   bool unregister_command(std::string_view name);
 
-  [[nodiscard]] const std::vector<Command> &commands() const {
-    return commands_;
-  }
+  [[nodiscard]] std::vector<Command> commands_snapshot() const;
 
   core::Result<std::string>
   execute(std::string_view name, std::string_view arguments,
@@ -44,6 +43,7 @@ public:
           core::AgentEventCallback on_event = {}) const;
 
 private:
+  mutable std::mutex mutex_;
   std::vector<Command> commands_;
 };
 

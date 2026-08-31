@@ -365,7 +365,7 @@ bool BuiltinCommandRegistrar::register_commands() {
           "Show available commands.",
           [&](std::string_view) {
             std::string result = "commands:\n";
-            for (const auto &command : extensions.commands()) {
+            for (const auto &command : extensions.commands_snapshot()) {
               result +=
                   "  /" + command.name + " — " + command.description + "\n";
             }

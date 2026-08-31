@@ -2,12 +2,14 @@
 #include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -151,6 +153,46 @@ public:
     content += "after";
     return Result<ToolResult>::success({call.id, std::move(content), false});
   }
+};
+
+struct BlockingExecutionState {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool started{false};
+  bool released{false};
+  bool tool_destroyed{false};
+};
+
+class BlockingTool final : public Tool {
+public:
+  explicit BlockingTool(std::shared_ptr<BlockingExecutionState> state)
+      : state_(std::move(state)) {}
+
+  ~BlockingTool() override {
+    std::scoped_lock lock(state_->mutex);
+    state_->tool_destroyed = true;
+  }
+
+  [[nodiscard]] const ToolDefinition &definition() const override {
+    static const ToolDefinition definition{
+        "blocking",
+        "Block until the test releases execution.",
+        R"({"type":"object","properties":{}})",
+    };
+    return definition;
+  }
+
+  Result<ToolResult> execute(const ToolCall &call, CancellationToken) override {
+    const auto state = state_;
+    std::unique_lock lock(state->mutex);
+    state->started = true;
+    state->condition.notify_all();
+    state->condition.wait(lock, [&] { return state->released; });
+    return Result<ToolResult>::success({call.id, "completed", false});
+  }
+
+private:
+  std::shared_ptr<BlockingExecutionState> state_;
 };
 
 } // namespace
@@ -386,6 +428,36 @@ int main() {
       std::make_unique<zed::tools::EditFileTool>(root))));
   require(static_cast<bool>(
       registry.register_tool(std::make_unique<InvalidUtf8Tool>())));
+
+  auto blocking_tool_state = std::make_shared<BlockingExecutionState>();
+  zed::core::ToolRegistry concurrent_tool_registry;
+  assert(concurrent_tool_registry.register_tool(
+      std::make_unique<BlockingTool>(blocking_tool_state)));
+  bool blocking_tool_succeeded = false;
+  std::thread blocking_tool_thread([&] {
+    blocking_tool_succeeded =
+        static_cast<bool>(concurrent_tool_registry.execute(
+            call("blocking-call", "blocking", R"({})"), {}));
+  });
+  {
+    std::unique_lock lock(blocking_tool_state->mutex);
+    assert(blocking_tool_state->condition.wait_for(
+        lock, std::chrono::seconds(5),
+        [&] { return blocking_tool_state->started; }));
+  }
+  assert(concurrent_tool_registry.unregister_tool("blocking"));
+  {
+    std::scoped_lock lock(blocking_tool_state->mutex);
+    assert(!blocking_tool_state->tool_destroyed);
+    blocking_tool_state->released = true;
+  }
+  blocking_tool_state->condition.notify_all();
+  blocking_tool_thread.join();
+  assert(blocking_tool_succeeded);
+  {
+    std::scoped_lock lock(blocking_tool_state->mutex);
+    assert(blocking_tool_state->tool_destroyed);
+  }
 
   for (const auto &definition : registry.definitions()) {
     const auto schema = nlohmann::json::parse(definition.input_schema_json);
@@ -889,7 +961,7 @@ int main() {
       },
       {{"short", "Use short output."}, {"long", "Use long output."}},
   }));
-  assert(extensions.commands().front().options.size() == 2);
+  assert(extensions.commands_snapshot().front().options.size() == 2);
   const auto echo = extensions.execute("echo", "hello");
   assert(echo);
   assert(echo.value() == "hello");
@@ -908,6 +980,45 @@ int main() {
       },
       {{"same", "First."}, {"same", "Second."}},
   }));
+
+  auto blocking_command_state = std::make_shared<BlockingExecutionState>();
+  auto command_lifetime = std::make_shared<int>(0);
+  zed::extensions::ExtensionRegistry concurrent_extensions;
+  assert(concurrent_extensions.register_command({
+      "blocking",
+      "Block until the test releases execution.",
+      [blocking_command_state, command_lifetime](std::string_view arguments) {
+        static_cast<void>(command_lifetime);
+        std::unique_lock lock(blocking_command_state->mutex);
+        blocking_command_state->started = true;
+        blocking_command_state->condition.notify_all();
+        blocking_command_state->condition.wait(
+            lock, [&] { return blocking_command_state->released; });
+        return zed::core::Result<std::string>::success(std::string(arguments));
+      },
+  }));
+  bool blocking_command_succeeded = false;
+  std::thread blocking_command_thread([&] {
+    blocking_command_succeeded =
+        static_cast<bool>(concurrent_extensions.execute("blocking", "done"));
+  });
+  {
+    std::unique_lock lock(blocking_command_state->mutex);
+    assert(blocking_command_state->condition.wait_for(
+        lock, std::chrono::seconds(5),
+        [&] { return blocking_command_state->started; }));
+  }
+  assert(concurrent_extensions.unregister_command("blocking"));
+  assert(command_lifetime.use_count() == 2);
+  {
+    std::scoped_lock lock(blocking_command_state->mutex);
+    blocking_command_state->released = true;
+  }
+  blocking_command_state->condition.notify_all();
+  blocking_command_thread.join();
+  assert(blocking_command_succeeded);
+  assert(command_lifetime.use_count() == 1);
+  assert(concurrent_extensions.commands_snapshot().empty());
 
   std::stringstream terminal_output;
   zed::ui::TerminalRenderer renderer(terminal_output, {false});

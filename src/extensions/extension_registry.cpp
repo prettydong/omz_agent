@@ -37,6 +37,7 @@ ExtensionRegistry::validate_command(const Command &command) const {
       });
     }
   }
+  std::scoped_lock lock(mutex_);
   const auto duplicate = std::find_if(
       commands_.begin(), commands_.end(),
       [&](const Command &existing) { return existing.name == command.name; });
@@ -53,11 +54,23 @@ core::Result<void> ExtensionRegistry::register_command(Command command) {
   const auto validation = validate_command(command);
   if (!validation)
     return validation;
+
+  std::scoped_lock lock(mutex_);
+  const auto duplicate = std::find_if(
+      commands_.begin(), commands_.end(),
+      [&](const Command &existing) { return existing.name == command.name; });
+  if (duplicate != commands_.end()) {
+    return core::Result<void>::failure({
+        core::ErrorCode::conflict,
+        "extension command already registered: " + command.name,
+    });
+  }
   commands_.push_back(std::move(command));
   return core::Result<void>::success();
 }
 
 bool ExtensionRegistry::unregister_command(std::string_view name) {
+  std::scoped_lock lock(mutex_);
   const auto iterator = std::find_if(
       commands_.begin(), commands_.end(),
       [&](const Command &command) { return command.name == name; });
@@ -67,23 +80,34 @@ bool ExtensionRegistry::unregister_command(std::string_view name) {
   return true;
 }
 
+std::vector<Command> ExtensionRegistry::commands_snapshot() const {
+  std::scoped_lock lock(mutex_);
+  return commands_;
+}
+
 core::Result<std::string>
 ExtensionRegistry::execute(std::string_view name, std::string_view arguments,
                            core::CancellationToken cancellation,
                            core::AgentEventCallback on_event) const {
-  const auto iterator = std::find_if(
-      commands_.begin(), commands_.end(),
-      [&](const Command &command) { return command.name == name; });
-  if (iterator == commands_.end()) {
-    return core::Result<std::string>::failure({
-        core::ErrorCode::not_found,
-        "extension command not found: " + std::string(name),
-    });
+  Command handlers;
+  {
+    std::scoped_lock lock(mutex_);
+    const auto iterator = std::find_if(
+        commands_.begin(), commands_.end(),
+        [&](const Command &command) { return command.name == name; });
+    if (iterator == commands_.end()) {
+      return core::Result<std::string>::failure({
+          core::ErrorCode::not_found,
+          "extension command not found: " + std::string(name),
+      });
+    }
+    handlers.execute = iterator->execute;
+    handlers.execute_with_events = iterator->execute_with_events;
   }
-  if (iterator->execute_with_events)
-    return iterator->execute_with_events(arguments, cancellation,
-                                         std::move(on_event));
-  return iterator->execute(arguments);
+  if (handlers.execute_with_events)
+    return handlers.execute_with_events(arguments, cancellation,
+                                        std::move(on_event));
+  return handlers.execute(arguments);
 }
 
 } // namespace zed::extensions

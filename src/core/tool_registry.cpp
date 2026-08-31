@@ -167,10 +167,11 @@ Result<void> ToolRegistry::register_tool(std::unique_ptr<Tool> tool) {
 
   auto prepared_definition = definition;
   prepared_definition.input_schema_json = prepared_schema.value().dump();
+  auto shared_tool = std::shared_ptr<Tool>(std::move(tool));
   tools_.reserve(tools_.size() + 1);
   prepared_definitions_.reserve(prepared_definitions_.size() + 1);
   prepared_definitions_.push_back(std::move(prepared_definition));
-  tools_.push_back(std::move(tool));
+  tools_.push_back(std::move(shared_tool));
   return Result<void>::success();
 }
 
@@ -226,7 +227,7 @@ ToolRegistry::execute(const ToolCall &call, CancellationToken cancellation,
   if (!purpose)
     return Result<ToolResult>::failure(purpose.error());
 
-  Tool *target = nullptr;
+  std::shared_ptr<Tool> target;
   {
     std::scoped_lock lock(mutex_);
     const auto iterator =
@@ -239,7 +240,7 @@ ToolRegistry::execute(const ToolCall &call, CancellationToken cancellation,
           "tool not found: " + call.name,
       });
     }
-    target = iterator->get();
+    target = *iterator;
   }
 
   auto execution =

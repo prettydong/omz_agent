@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(zeda VERSION 0.2 LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -129,6 +131,10 @@ target_include_directories(zed_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_BINARY_DIR}/generated
+)
+
+target_compile_definitions(zed_core PRIVATE
+    ZEDA_INSTALL_LIBDIR="${CMAKE_INSTALL_LIBDIR}"
 )
 
 target_link_libraries(zed_core
@@ -260,7 +266,6 @@ if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
         ${ZEDA_DEEPWIKI_BUILD_RESOURCES}/licenses/cpp-httplib-LICENSE COPYONLY)
 endif()
 
-include(GNUInstallDirs)
 install(TARGETS zeda RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES ${ZEDA_DEFAULT_SYSTEM_PROMPT_FILE}
         DESTINATION ${CMAKE_INSTALL_DATADIR}/zeda)
@@ -330,6 +335,39 @@ if (BUILD_TESTING)
     add_dependencies(zed_subagent_smoke zed_fake_clangd zed_fake_opencode)
     add_test(NAME zed_subagent_smoke COMMAND zed_subagent_smoke)
 
+    add_library(zed_runtime_provider_plugin SHARED
+        tests/runtime_plugin_fixture.cpp)
+    add_library(zed_runtime_consumer_plugin SHARED
+        tests/runtime_plugin_fixture.cpp)
+    target_compile_definitions(zed_runtime_consumer_plugin PRIVATE
+        ZEDA_RUNTIME_FIXTURE_CONSUMER=1)
+    foreach(runtime_plugin_target IN ITEMS
+            zed_runtime_provider_plugin
+            zed_runtime_consumer_plugin)
+        target_include_directories(${runtime_plugin_target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_link_libraries(${runtime_plugin_target} PRIVATE
+            nlohmann_json::nlohmann_json)
+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(${runtime_plugin_target} PRIVATE
+                -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+        elseif (MSVC)
+            target_compile_options(${runtime_plugin_target} PRIVATE /W4)
+        endif()
+    endforeach()
+
+    add_executable(zed_plugin_runtime_smoke tests/plugin_runtime_smoke.cpp)
+    target_link_libraries(zed_plugin_runtime_smoke PRIVATE zed_core)
+    target_compile_definitions(zed_plugin_runtime_smoke PRIVATE
+        ZED_TEST_RUNTIME_PROVIDER_PATH="$<TARGET_FILE:zed_runtime_provider_plugin>"
+        ZED_TEST_RUNTIME_CONSUMER_PATH="$<TARGET_FILE:zed_runtime_consumer_plugin>"
+    )
+    add_dependencies(zed_plugin_runtime_smoke
+        zed_runtime_provider_plugin
+        zed_runtime_consumer_plugin)
+    add_test(NAME zed_plugin_runtime_smoke COMMAND zed_plugin_runtime_smoke)
+    set_tests_properties(zed_plugin_runtime_smoke PROPERTIES TIMEOUT 30)
+
     if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
         set(ZEDA_FAULTY_PLUGIN_ROOT
             ${CMAKE_CURRENT_BINARY_DIR}/plugins/faulty)
@@ -386,6 +424,7 @@ if (BUILD_TESTING)
         zed_opencode_go_smoke
         zed_support_smoke
         zed_subagent_smoke
+        zed_plugin_runtime_smoke
     )
     if (TARGET zed_plugin_smoke)
         list(APPEND ZED_ASSERTING_TEST_TARGETS zed_plugin_smoke)

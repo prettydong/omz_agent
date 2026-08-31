@@ -94,10 +94,11 @@ int main() {
     assert(manager.discover_and_load());
     assert(manager.statuses().size() == 1);
     assert(manager.statuses().front().loaded);
+    const auto command_snapshot = extensions.commands_snapshot();
     const auto deepwiki_command = std::find_if(
-        extensions.commands().begin(), extensions.commands().end(),
+        command_snapshot.begin(), command_snapshot.end(),
         [](const auto &command) { return command.name == "deepwiki"; });
-    assert(deepwiki_command != extensions.commands().end());
+    assert(deepwiki_command != command_snapshot.end());
     const auto tui_option = std::find_if(
         deepwiki_command->options.begin(), deepwiki_command->options.end(),
         [](const auto &option) { return option.value == "tui"; });
@@ -267,7 +268,7 @@ int main() {
     assert(!faulty_manager.statuses().front().loaded);
     assert(faulty_manager.statuses().front().detail.find("properties") !=
            std::string::npos);
-    assert(faulty_extensions.commands().empty());
+    assert(faulty_extensions.commands_snapshot().empty());
     assert(faulty_tools.definitions().empty());
     const auto missing = faulty_extensions.execute("faulty_command", "");
     assert(!missing);

@@ -34,7 +34,7 @@ private:
   [[nodiscard]] bool allowed(std::string_view name) const;
 
   mutable std::mutex mutex_;
-  std::vector<std::unique_ptr<Tool>> tools_;
+  std::vector<std::shared_ptr<Tool>> tools_;
   std::vector<ToolDefinition> prepared_definitions_;
   std::optional<std::unordered_set<std::string>> allowed_tools_;
 };

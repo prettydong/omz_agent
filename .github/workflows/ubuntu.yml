@@ -1,0 +1,48 @@
+name: Ubuntu
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            ca-certificates \
+            clangd \
+            cmake \
+            curl \
+            libsqlite3-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install to staging directory
+        run: cmake --install build --prefix "$RUNNER_TEMP/zeda"
+
+      - name: Verify installed binary
+        run: "$RUNNER_TEMP/zeda/bin/zeda" --version

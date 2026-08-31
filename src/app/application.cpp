@@ -278,7 +278,8 @@ int run_application(std::string_view executable, std::string_view version) {
   zed::extensions::ExtensionRegistry extensions;
   zed::plugins::PluginManager plugins(
       {runtime_config.workspace, zed::plugins::default_plugin_search_paths(),
-       active_model, active_reasoning_effort},
+       active_model, active_reasoning_effort,
+       runtime_config.tool_limits.max_command_output_bytes},
       extensions, tools, model, clangd);
   BuiltinCommandRegistrar command_registrar(
       extensions, runtime_config, model_catalog, built_in_agents,
@@ -295,8 +296,10 @@ int run_application(std::string_view executable, std::string_view version) {
               << plugin_discovery.error().message << "\n";
   }
   for (const auto &status : plugins.statuses()) {
-    if (!status.loaded) {
-      std::cerr << "plugin warning: " << status.detail << " ("
+    if (status.state == zed::plugins::PluginState::failed ||
+        status.state == zed::plugins::PluginState::pending) {
+      std::cerr << "plugin " << zed::plugins::plugin_state_name(status.state)
+                << ": " << status.detail << " ("
                 << status.manifest_path.string() << ")\n";
     }
   }
@@ -345,8 +348,9 @@ int run_application(std::string_view executable, std::string_view version) {
     return zed::ui::TerminalActivity::thinking;
   };
   std::vector<zed::ui::TerminalCommandHint> command_hints;
-  command_hints.reserve(extensions.commands().size() + 1);
-  for (const auto &command : extensions.commands()) {
+  const auto command_snapshot = extensions.commands_snapshot();
+  command_hints.reserve(command_snapshot.size() + 1);
+  for (const auto &command : command_snapshot) {
     std::vector<zed::ui::TerminalCommandOption> options;
     options.reserve(command.options.size());
     for (const auto &option : command.options) {
@@ -377,13 +381,19 @@ int run_application(std::string_view executable, std::string_view version) {
       elapsed(plugins_ready_at, startup_ready_at),
   };
 
-  return run_user_interface(
+  const int interface_result = run_user_interface(
       runtime_config.workspace.string(), active_model.model,
       std::string(version), startup, active_context_limits.max_context_tokens,
       active_reasoning_effort, active_theme,
       [&] { return quick_bash.enabled(); }, active_session_label,
       [&] { return session.load(); }, initial_activity,
       std::move(command_hints), submit_handler, command_handler);
+  const auto plugin_shutdown = plugins.shutdown();
+  if (!plugin_shutdown) {
+    std::cerr << plugin_shutdown.error().message << '\n';
+    return interface_result == 0 ? 3 : interface_result;
+  }
+  return interface_result;
 }
 
 } // namespace zed::app

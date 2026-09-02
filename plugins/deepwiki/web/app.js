@@ -6,7 +6,6 @@
   const toc = document.querySelector("#toc");
   const tocFilter = document.querySelector("#toc-filter");
   const tocCount = document.querySelector("#toc-count");
-  const themeToggle = document.querySelector("#theme-toggle");
   const answerCard = document.querySelector("#answer-card");
   const answer = document.querySelector("#answer");
   const question = document.querySelector("#question");
@@ -14,11 +13,13 @@
   const askButton = document.querySelector("#ask-btn");
   const dialog = document.querySelector("#source-dialog");
   const toastEl = document.querySelector("#toast");
-
-  const SUN = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
-  const MOON = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>';
+  const termsToggle = document.querySelector("#terms-toggle");
+  const viewTitle = document.querySelector("#view-title");
+  const viewTag = document.querySelector("#view-tag");
 
   let currentPageMarkdown = "";
+  let terms = [];
+  const termByProgram = new Map();
   let toastTimer = 0;
 
   const emptyIcon = '<svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>';
@@ -30,42 +31,128 @@
     toastTimer = setTimeout(() => { toastEl.hidden = true; }, 4200);
   }
 
-  function isDark() {
-    return document.documentElement.dataset.theme === "dark";
-  }
-
   function configureMermaid() {
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: "strict",
-      theme: isDark() ? "dark" : "default",
+      theme: "default",
       fontFamily: "Inter, PingFang SC, system-ui, sans-serif",
     });
   }
 
-  function refreshThemeIcons() {
-    themeToggle.innerHTML = isDark() ? SUN : MOON;
-    themeToggle.title = isDark() ? "切换到浅色主题" : "切换到深色主题";
-  }
-
-  async function rerenderIfPossible() {
-    configureMermaid();
-    if (currentPageMarkdown && !answerCard.hidden) await renderMarkdown(answer, currentPageMarkdown);
-  }
-
-  themeToggle.addEventListener("click", () => {
-    const next = isDark() ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    try { localStorage.setItem("deepwiki-theme", next); } catch (error) {}
-    refreshThemeIcons();
-    rerenderIfPossible().catch(() => {});
-  });
-
   configureMermaid();
-  refreshThemeIcons();
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+  }
+
+  const languageAliases = new Map([
+    ["cc", "cpp"], ["cxx", "cpp"], ["hpp", "cpp"], ["h", "cpp"],
+    ["shell", "bash"], ["sh", "bash"], ["zsh", "bash"],
+    ["yml", "yaml"],
+  ]);
+  const languageNames = new Set(["c", "cpp", "cmake", "json", "bash", "yaml"]);
+  const keywords = new Set([
+    "alignas", "alignof", "and", "asm", "auto", "break", "case", "catch",
+    "class", "concept", "const", "consteval", "constexpr", "constinit",
+    "continue", "co_await", "co_return", "co_yield", "decltype", "default",
+    "delete", "do", "else", "enum", "explicit", "export", "extern", "for",
+    "friend", "goto", "if", "inline", "namespace", "new", "noexcept", "not",
+    "operator", "or", "private", "protected", "public", "requires", "return",
+    "sizeof", "static", "static_assert", "struct", "switch", "template", "this",
+    "thread_local", "throw", "try", "typedef", "typeid", "typename", "union",
+    "using", "virtual", "volatile", "while", "xor",
+  ]);
+  const types = new Set([
+    "bool", "char", "char8_t", "char16_t", "char32_t", "double", "float", "int",
+    "long", "short", "signed", "unsigned", "void", "wchar_t", "size_t", "string",
+  ]);
+  const literals = new Set(["true", "false", "null", "nullptr"]);
+  const tokenPattern = /\/\/[^\n]*|\/\*[\s\S]*?\*\/|#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:0[xX][\da-fA-F]+|0[bB][01]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b|\b[A-Za-z_]\w*\b/g;
+
+  function normalizeLanguage(value) {
+    const normalized = String(value || "").toLowerCase().replace(/^language-/, "");
+    return languageAliases.get(normalized) || normalized;
+  }
+
+  function languageFromPath(value) {
+    const path = String(value || "")
+      .replace(/^\[/, "")
+      .replace(/\]$/, "")
+      .replace(/:\d+(?:-\d+)?$/, "");
+    const name = path.split("/").pop()?.toLowerCase() || "";
+    if (name === "cmakelists.txt" || name.endsWith(".cmake")) return "cmake";
+    return normalizeLanguage(name.includes(".") ? name.split(".").pop() : "");
+  }
+
+  function tokenClass(token, language, source, end) {
+    if (token.startsWith("//") || token.startsWith("/*")) return "tok-comment";
+    if (token.startsWith("#")) return language === "bash" || language === "yaml" ? "tok-comment" : "tok-meta";
+    if (token.startsWith('"') || token.startsWith("'")) {
+      const rest = source.slice(end);
+      return (language === "json" && /^\s*:/.test(rest)) ? "tok-property" : "tok-string";
+    }
+    if (/^(?:0[xX][\da-fA-F]+|0[bB][01]+|\d)/.test(token)) return "tok-number";
+    if (literals.has(token)) return "tok-literal";
+    if ((language === "yaml" || language === "json") && /^\s*:/.test(source.slice(end))) return "tok-property";
+    if (types.has(token)) return "tok-type";
+    if (keywords.has(token)) return "tok-keyword";
+    if (/^\s*\(/.test(source.slice(end))) return "tok-call";
+    return "";
+  }
+
+  function highlightText(source, language, target) {
+    target.replaceChildren();
+    tokenPattern.lastIndex = 0;
+    let offset = 0;
+    for (let match = tokenPattern.exec(source); match; match = tokenPattern.exec(source)) {
+      if (match.index > offset) target.append(document.createTextNode(source.slice(offset, match.index)));
+      const className = tokenClass(match[0], language, source, tokenPattern.lastIndex);
+      if (className) {
+        const span = document.createElement("span");
+        span.className = className;
+        span.textContent = match[0];
+        target.append(span);
+      } else {
+        target.append(document.createTextNode(match[0]));
+      }
+      offset = tokenPattern.lastIndex;
+    }
+    if (offset < source.length) target.append(document.createTextNode(source.slice(offset)));
+  }
+
+  function highlightCodeBlocks(target) {
+    for (const code of target.querySelectorAll("pre code:not(.language-mermaid)")) {
+      const languageClass = [...code.classList].find((name) => name.startsWith("language-"));
+      const language = normalizeLanguage(languageClass);
+      if (!languageNames.has(language)) continue;
+      const source = code.textContent;
+      highlightText(source, language, code);
+      code.parentElement.classList.add("syntax-highlighted");
+      code.parentElement.dataset.language = language.toUpperCase();
+    }
+  }
+
+  function expandTerms(markdown) {
+    return markdown.replace(
+      /\[([^\]\n]+)\]\(deepwiki-term:([^\s)]+)\)/g,
+      (whole, chineseName, encodedProgramName) => {
+        let programName = encodedProgramName;
+        try { programName = decodeURIComponent(encodedProgramName); } catch (error) {}
+        const term = termByProgram.get(programName);
+        const explanation = term?.description ? `\n${term.description}` : "";
+        const title = `程序名：${programName}${explanation}`;
+        return `<abbr class="term-ref" title="${escapeHtml(title)}">${escapeHtml(chineseName)}</abbr>`;
+      },
+    );
+  }
 
   async function renderMarkdown(target, markdown) {
-    const linked = markdown.replace(
+    const linked = expandTerms(markdown).replace(
       /\[([^\]\n]+):(\d+)(?:-(\d+))?\]/g,
       (whole, path, line) => {
         const url = withToken(`/api/source?path=${encodeURIComponent(path)}&line=${line}`);
@@ -79,6 +166,7 @@
       container.textContent = code.textContent;
       code.parentElement.replaceWith(container);
     }
+    highlightCodeBlocks(target);
     await mermaid.run({ nodes: target.querySelectorAll(".mermaid"), suppressErrors: true });
     for (const link of target.querySelectorAll("a[href^='/api/source']")) {
       link.classList.add("cite");
@@ -95,14 +183,14 @@
       if (!response.ok) throw new Error(`源码读取失败 (${response.status})`);
       const line = Number(new URL(url, location.href).searchParams.get("line")) || 1;
       document.querySelector("#source-title").textContent = title;
-      renderSource(await response.text(), line);
+      renderSource(await response.text(), line, languageFromPath(title));
       dialog.showModal();
     } catch (error) {
       toast(error.message);
     }
   }
 
-  function renderSource(content, targetLine) {
+  function renderSource(content, targetLine, language) {
     const view = document.querySelector("#source-content");
     view.replaceChildren();
     let active = null;
@@ -117,13 +205,13 @@
       text.className = "tx";
       if (match) {
         number.textContent = match[1];
-        text.textContent = match[2];
+        highlightText(match[2], language, text);
         if (Number(match[1]) === targetLine) {
           line.classList.add("active");
           active = line;
         }
       } else {
-        text.textContent = raw;
+        highlightText(raw, language, text);
       }
       line.append(number, text);
       view.append(line);
@@ -145,6 +233,9 @@
   }
 
   async function loadPage(id, button) {
+    termsToggle.classList.remove("active");
+    viewTitle.textContent = "DOCUMENT";
+    viewTag.textContent = "MARKDOWN";
     page.innerHTML = DOMPurify.sanitize(
       '<div class="skeleton" aria-hidden="true"><div class="sk sk-title"></div><div class="sk sk-line w92"></div><div class="sk sk-line w78"></div><div class="sk sk-line w85"></div><div class="sk sk-line w60"></div><div class="sk sk-line w92"></div><div class="sk sk-line w70"></div></div>',
     );
@@ -194,6 +285,89 @@
     updateTocCount(entries.length, entries.length);
     loadPage(entries[0].id, toc.firstElementChild);
   }
+
+  async function loadTerms() {
+    const response = await fetch(withToken("/api/terms"));
+    if (!response.ok) throw new Error(`名词 Wiki 读取失败 (${response.status})`);
+    const payload = await response.json();
+    terms = Array.isArray(payload) ? payload.filter((term) =>
+      term && typeof term.program_name === "string" &&
+      typeof term.chinese_name === "string" &&
+      typeof term.description === "string") : [];
+    termByProgram.clear();
+    for (const term of terms) termByProgram.set(term.program_name, term);
+  }
+
+  function sourceParts(source) {
+    const separator = source.lastIndexOf(":");
+    if (separator <= 0) return null;
+    const line = Number(source.slice(separator + 1));
+    if (!Number.isInteger(line) || line < 1) return null;
+    return { path: source.slice(0, separator), line };
+  }
+
+  function showTerms() {
+    termsToggle.classList.add("active");
+    viewTitle.textContent = "GLOSSARY";
+    viewTag.textContent = `${terms.length} TERMS`;
+    toc.querySelectorAll("button").forEach((item) => item.classList.remove("active"));
+    page.replaceChildren();
+
+    const title = document.createElement("h1");
+    title.textContent = "名词 Wiki";
+    const intro = document.createElement("p");
+    intro.className = "glossary-intro";
+    intro.textContent = "主要程序名与中文作用名的对应关系。Wiki 正文优先显示中文名，悬停即可查看源码中的准确叫法。";
+    page.append(title, intro);
+    if (terms.length === 0) {
+      const empty = document.createElement("p");
+      empty.textContent = "尚未生成术语表，请运行 /deepwiki generate。";
+      page.append(empty);
+      return;
+    }
+
+    const table = document.createElement("table");
+    table.className = "glossary-table";
+    const head = document.createElement("thead");
+    head.innerHTML = "<tr><th>中文作用名</th><th>程序名</th><th>类型</th><th>解释</th><th>源码</th></tr>";
+    const body = document.createElement("tbody");
+    for (const term of terms) {
+      const row = document.createElement("tr");
+      const chinese = document.createElement("td");
+      const strong = document.createElement("strong");
+      strong.textContent = term.chinese_name;
+      chinese.append(strong);
+      const program = document.createElement("td");
+      const code = document.createElement("code");
+      code.textContent = term.program_name;
+      program.append(code);
+      const kind = document.createElement("td");
+      kind.className = "term-kind";
+      kind.textContent = term.kind || "symbol";
+      const description = document.createElement("td");
+      description.textContent = term.description;
+      const source = document.createElement("td");
+      const location = sourceParts(term.source || "");
+      if (location) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "glossary-source";
+        button.textContent = term.source;
+        button.addEventListener("click", () => openSource(
+          withToken(`/api/source?path=${encodeURIComponent(location.path)}&line=${location.line}`),
+          term.source,
+        ));
+        source.append(button);
+      }
+      row.append(chinese, program, kind, description, source);
+      body.append(row);
+    }
+    table.append(head, body);
+    page.append(table);
+    document.querySelector("main").scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  termsToggle.addEventListener("click", showTerms);
 
   tocFilter.addEventListener("input", () => {
     const needle = tocFilter.value.trim().toLowerCase();
@@ -271,6 +445,12 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      tocFilter.focus();
+      tocFilter.select();
+      return;
+    }
     if (event.key === "/" && !event.metaKey && !event.ctrlKey && !event.altKey &&
         !["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName) && !dialog.open) {
       event.preventDefault();
@@ -278,5 +458,10 @@
     }
   });
 
-  loadToc().catch((error) => showError(error.message));
+  async function bootstrap() {
+    await loadTerms();
+    await loadToc();
+  }
+
+  bootstrap().catch((error) => showError(error.message));
 })();

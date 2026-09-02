@@ -335,14 +335,20 @@ clangd 符号、`#include` 关系和 CMake target/link 关系。首次使用：
 
 ```text
 /deepwiki generate
+/deepwiki regen
 /deepwiki status
 /deepwiki tui
 /deepwiki open
 ```
 
-代码变化后执行 `/deepwiki update`。无变化时不会调用模型；普通变化只重新索引文件并
+需要删除当前 `.zed/deepwiki/` 缓存并从零重建索引、目录、术语表和全部页面时执行
+`/deepwiki regen`。代码变化后执行 `/deepwiki update`。无变化时不会调用模型；普通变化只重新索引文件并
 生成引用了这些文件的页面。Wiki、索引和状态保存在当前仓库的 `.zed/deepwiki/`，插件
 不会修改源码或 `.gitignore`，因此未忽略 `.zed/` 的仓库会把它显示为未跟踪目录。
+
+生成目录时 DeepWiki 还会为主要类、函数、变量和模块建立中文作用名，映射及解释保存
+在 `.zed/deepwiki/terms.json`。生成的正文优先使用中文作用名；网页中悬停名称可查看
+源码里的准确程序名和职责解释。“名词 Wiki”集中展示中文名、程序名、类型、解释和源码位置。
 
 在全屏终端中执行 `/deepwiki tui` 会进入内置双栏浏览器：左侧是页面目录，右侧渲染
 Markdown。用 `↑/↓` 或 `j/k` 选页，`Tab` 或 `←/→` 在目录和正文之间切换焦点，正文
@@ -351,8 +357,8 @@ Markdown。用 `↑/↓` 或 `j/k` 选页，`Tab` 或 `←/→` 在目录和正�
 
 `/deepwiki open` 只在 `127.0.0.1` 随机端口启动网页，并自动打开浏览器。网页提供目录、
 Markdown、Mermaid 图、源码引用预览和流式问答；进程退出时服务停止。普通 Agent 也可
-使用插件注册的 `deepwiki_structure`、`deepwiki_contents` 和 `deepwiki_search` 三个
-只读工具。
+使用插件注册的 `deepwiki_structure`、`deepwiki_contents`、`deepwiki_terms` 和
+`deepwiki_search` 四个只读工具。
 
 没有 `compile_commands.json` 时仍可建立文本索引，但 `/deepwiki status` 会显示
 `degraded`；正常状态还会显示当前提交和过期页面数。CMake 项目建议先生成编译数据库：
@@ -395,7 +401,7 @@ plugins/deepwiki/       C/C++ DeepWiki 插件与本地网页资源
 startup: 23.000 ms = config 2.000 + session 3.000 + setup 5.000 + plugins 10.000 + ui 2.000 + other 1.000
 ```
 
-欢迎页与消息记录位于同一个可滚动区域，因此向下浏览后不会固定占用屏幕。鼠标滚轮每次固定滚动 3 行；默认自动跟随最新消息，向上滚动后暂停跟随，滚回底部、执行命令或提交新请求时恢复。输入框在没有命令补全列表时支持使用上下方向键切换本进程中已发送的模型 prompt，回到最新位置时恢复未发送草稿。底部固定输入框、运行状态和 token 指标。底栏左侧根据 Agent 事件显示紧凑状态；思考时会显示当前强度（例如 `low think`），活动状态带旋转动画，空闲时显示静态 `idle`。用户、助手、工具和错误消息分别渲染，只有助手内容会进入 Markdown 解析，避免输入或工具输出意外破坏对话布局。
+欢迎页与消息记录位于同一个可滚动区域，因此向下浏览后不会固定占用屏幕。鼠标滚轮每次固定滚动 3 行；默认自动跟随最新消息，向上滚动后暂停跟随，滚回底部、执行命令或提交新请求时恢复。输入框在没有命令补全列表时支持使用上下方向键切换本进程中已发送的模型 prompt，回到最新位置时恢复未发送草稿。底部固定输入框、运行状态和 token 指标。底栏左侧根据 Agent 事件显示紧凑状态；思考时会显示当前强度（例如 `low thinking`），并在后方滚动预览最新 5 个英文单词或 10 个中文字符。预览只在底栏短暂显示，不进入回答或 Session。活动状态带旋转动画，空闲时显示静态 `idle`。用户、助手、工具和错误消息分别渲染，只有助手内容会进入 Markdown 解析，避免输入或工具输出意外破坏对话布局。
 
 底栏右侧显示 token 指标：`ctx` 是最近一次模型请求的 input tokens，`↑` 和 `↓` 分别是本次进程内所有模型调用的累计 input 与 output，`Σ` 后的值是两者之和。数值达到千级或百万级时使用 `k` 或 `m` 紧凑显示。一次 Agent 请求包含多轮工具调用时，每轮模型 usage 都会计入。`ctx` 可以点击，打开 Context analysis 面板；面板外的聊天页面会变暗，面板自身保持不透明。总量采用供应商返回的精确 usage，页面会显示容量、剩余空间、缓存命中，以及系统指令、用户消息、助手消息、工具往返、工具定义和协议开销的估算分布。再次点击 `ctx` 或按 Esc 关闭。
 

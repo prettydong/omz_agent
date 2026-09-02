@@ -1,6 +1,7 @@
 #include "zed/app/application.hpp"
 #include "zed/subagents/worker.hpp"
 
+#include <exception>
 #include <iostream>
 #include <string_view>
 
@@ -20,7 +21,9 @@ void print_usage(std::ostream &output) {
 
 } // namespace
 
-int main(int argc, char *argv[]) {
+namespace {
+
+int run(int argc, char *argv[]) {
   if (argc > 1) {
     const std::string_view argument(argv[1]);
     if (argc == 2 && argument == "--subagent-worker") {
@@ -40,4 +43,18 @@ int main(int argc, char *argv[]) {
     return 2;
   }
   return zed::app::run_application(argv[0], kVersion);
+}
+
+} // namespace
+
+int main(int argc, char *argv[]) {
+  try {
+    return run(argc, argv);
+  } catch (const std::exception &error) {
+    std::cerr << "zeda failed: " << error.what() << '\n';
+    return 2;
+  } catch (...) {
+    std::cerr << "zeda failed: unknown error\n";
+    return 2;
+  }
 }

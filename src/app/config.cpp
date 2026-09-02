@@ -1226,12 +1226,49 @@ save_agent_management(const std::filesystem::path &workspace,
       "agent management configuration");
 }
 
+namespace {
+
+core::Result<std::filesystem::path> resolve_workspace() {
+  std::filesystem::path workspace;
+  const char *configured_workspace = std::getenv("ZED_WORKSPACE");
+  if (configured_workspace != nullptr && configured_workspace[0] != '\0') {
+    workspace = configured_workspace;
+  } else {
+    std::error_code error;
+    workspace = std::filesystem::current_path(error);
+    if (error) {
+      return core::Result<std::filesystem::path>::failure({
+          core::ErrorCode::invalid_argument,
+          "cannot determine the current working directory: " + error.message() +
+              ". The directory may have been removed or disconnected; change "
+              "to an existing directory or set ZED_WORKSPACE",
+      });
+    }
+  }
+
+  std::error_code error;
+  auto canonical_workspace =
+      std::filesystem::weakly_canonical(workspace, error);
+  if (error) {
+    return core::Result<std::filesystem::path>::failure({
+        core::ErrorCode::invalid_argument,
+        "cannot resolve workspace " + workspace.string() + ": " +
+            error.message(),
+    });
+  }
+  return core::Result<std::filesystem::path>::success(
+      std::move(canonical_workspace));
+}
+
+} // namespace
+
 core::Result<RuntimeConfig>
 load_runtime_config(RuntimeConfigLoadOptions options) {
   RuntimeConfig config;
-  config.workspace =
-      environment_or("ZED_WORKSPACE", std::filesystem::current_path().string());
-  config.workspace = std::filesystem::weakly_canonical(config.workspace);
+  const auto workspace = resolve_workspace();
+  if (!workspace)
+    return core::Result<RuntimeConfig>::failure(workspace.error());
+  config.workspace = workspace.value();
   config.workspace_config_path = workspace_config_path(config.workspace);
   const auto workspace_settings = load_workspace_config(config.workspace);
   if (!workspace_settings)

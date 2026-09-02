@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -75,6 +76,32 @@ int main() {
   const auto stored_key = zed::app::load_runtime_config();
   assert(stored_key);
   assert(stored_key.value().opencode_go_api_key == "stored-key");
+
+  const auto removed_working_directory =
+      std::filesystem::temp_directory_path() /
+      ("zeda-removed-working-directory-" + std::to_string(getpid()));
+  std::filesystem::remove_all(removed_working_directory);
+  std::filesystem::create_directories(removed_working_directory);
+  const int original_working_directory = open(".", O_RDONLY);
+  assert(original_working_directory >= 0);
+  assert(chdir(removed_working_directory.c_str()) == 0);
+  assert(rmdir(removed_working_directory.c_str()) == 0);
+
+  clear_environment("ZED_WORKSPACE");
+  const auto missing_working_directory = zed::app::load_runtime_config();
+  assert(!missing_working_directory);
+  assert(missing_working_directory.error().message.find(
+             "cannot determine the current working directory") !=
+         std::string::npos);
+
+  set_environment("ZED_WORKSPACE", config_workspace.c_str());
+  const auto configured_workspace_without_working_directory =
+      zed::app::load_runtime_config();
+  assert(configured_workspace_without_working_directory);
+  assert(configured_workspace_without_working_directory.value().workspace ==
+         stored_key.value().workspace);
+  assert(fchdir(original_working_directory) == 0);
+  assert(close(original_working_directory) == 0);
 
   set_environment("ZED_MODEL", "gpt-5.6-luna");
   const auto inherited_context_model = zed::app::load_runtime_config();

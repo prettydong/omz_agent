@@ -25,6 +25,7 @@
 
 ### Fixed
 
+- 修复 Shell 当前目录被删除、重命名或断开后启动时抛出未捕获的 `filesystem_error`；现在会显示可操作的诊断，并允许有效的 `ZED_WORKSPACE` 覆盖失效目录。
 - 修复 TUI 中 `/session list`、`rename` 以及切换 Session 后的命令结果不显示。
 - 修复 `write`/`edit` 临时文件跟随符号链接，并在原子替换时保留普通权限位和取消语义。
 - 修复并发 `multi_bash`、clangd、模型进程和 Sub Agent 之间继承管道描述符导致的挂起。

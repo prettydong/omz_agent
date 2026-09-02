@@ -84,6 +84,18 @@ core::Result<void> require_version(const Json &value) {
   return core::Result<void>::success();
 }
 
+core::Result<std::string> require_request_id(const Json &value) {
+  const auto request_id = required_string(value, "id");
+  if (!request_id)
+    return request_id;
+  if (request_id.value().size() > 64) {
+    return core::Result<std::string>::failure(
+        {ErrorCode::invalid_argument,
+         "subagent worker request id exceeds 64 bytes"});
+  }
+  return request_id;
+}
+
 std::string_view event_type_name(WorkerEventType type) {
   switch (type) {
   case WorkerEventType::started:
@@ -139,38 +151,69 @@ std::string safe_text(std::string_view value) {
 
 } // namespace
 
-core::Result<WorkerRequest> parse_worker_request(std::string_view json_line) {
+core::Result<WorkerCommand> parse_worker_command(std::string_view json_line) {
   if (json_line.size() > kMaximumTaskBytes + 1024) {
-    return core::Result<WorkerRequest>::failure(
+    return core::Result<WorkerCommand>::failure(
         {ErrorCode::invalid_argument, "subagent worker request is too large"});
   }
-  const auto parsed = parse_object(json_line, "subagent worker request");
+  const auto parsed = parse_object(json_line, "subagent worker command");
   if (!parsed)
-    return core::Result<WorkerRequest>::failure(parsed.error());
-  const auto fields = require_exact_fields(
-      parsed.value(), {"version", "agent", "task"}, "worker request");
-  if (!fields)
-    return core::Result<WorkerRequest>::failure(fields.error());
+    return core::Result<WorkerCommand>::failure(parsed.error());
   const auto version = require_version(parsed.value());
   if (!version)
-    return core::Result<WorkerRequest>::failure(version.error());
+    return core::Result<WorkerCommand>::failure(version.error());
+  const auto type = required_string(parsed.value(), "type");
+  if (!type)
+    return core::Result<WorkerCommand>::failure(type.error());
+  const auto request_id = require_request_id(parsed.value());
+  if (!request_id)
+    return core::Result<WorkerCommand>::failure(request_id.error());
+  if (type.value() == "cancel") {
+    const auto fields = require_exact_fields(
+        parsed.value(), {"version", "type", "id"}, "worker cancellation");
+    if (!fields)
+      return core::Result<WorkerCommand>::failure(fields.error());
+    return core::Result<WorkerCommand>::success(
+        {WorkerCommandType::cancel, {request_id.value(), {}, {}}});
+  }
+  if (type.value() != "run") {
+    return core::Result<WorkerCommand>::failure(
+        {ErrorCode::invalid_argument,
+         "unknown subagent worker command type: " + type.value()});
+  }
+  const auto fields = require_exact_fields(
+      parsed.value(), {"version", "type", "id", "agent", "task"},
+      "worker request");
+  if (!fields)
+    return core::Result<WorkerCommand>::failure(fields.error());
   const auto agent = required_string(parsed.value(), "agent");
   const auto task = required_string(parsed.value(), "task");
   if (!agent)
-    return core::Result<WorkerRequest>::failure(agent.error());
+    return core::Result<WorkerCommand>::failure(agent.error());
   if (!task)
-    return core::Result<WorkerRequest>::failure(task.error());
+    return core::Result<WorkerCommand>::failure(task.error());
   if (task.value().size() > kMaximumTaskBytes) {
-    return core::Result<WorkerRequest>::failure(
+    return core::Result<WorkerCommand>::failure(
         {ErrorCode::invalid_argument, "subagent task exceeds 32 KiB"});
   }
-  return core::Result<WorkerRequest>::success({agent.value(), task.value()});
+  return core::Result<WorkerCommand>::success(
+      {WorkerCommandType::run,
+       {request_id.value(), agent.value(), task.value()}});
 }
 
 std::string serialize_worker_request(const WorkerRequest &request) {
   return Json{{"version", kWorkerProtocolVersion},
+              {"type", "run"},
+              {"id", safe_text(request.request_id)},
               {"agent", safe_text(request.agent)},
               {"task", safe_text(request.task)}}
+      .dump();
+}
+
+std::string serialize_worker_cancellation(std::string_view request_id) {
+  return Json{{"version", kWorkerProtocolVersion},
+              {"type", "cancel"},
+              {"id", safe_text(request_id)}}
       .dump();
 }
 
@@ -181,6 +224,9 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
   const auto version = require_version(parsed.value());
   if (!version)
     return core::Result<WorkerEvent>::failure(version.error());
+  const auto request_id = require_request_id(parsed.value());
+  if (!request_id)
+    return core::Result<WorkerEvent>::failure(request_id.error());
   const auto type_name = required_string(parsed.value(), "type");
   if (!type_name)
     return core::Result<WorkerEvent>::failure(type_name.error());
@@ -190,11 +236,12 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
 
   WorkerEvent event;
   event.type = type.value();
+  event.request_id = request_id.value();
   core::Result<void> fields = core::Result<void>::success();
   switch (event.type) {
   case WorkerEventType::started: {
-    fields = require_exact_fields(parsed.value(), {"version", "type", "agent"},
-                                  "started event");
+    fields = require_exact_fields(
+        parsed.value(), {"version", "type", "id", "agent"}, "started event");
     if (!fields)
       break;
     const auto agent = required_string(parsed.value(), "agent");
@@ -205,7 +252,7 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
   }
   case WorkerEventType::tool_start: {
     fields = require_exact_fields(parsed.value(),
-                                  {"version", "type", "tool", "purpose"},
+                                  {"version", "type", "id", "tool", "purpose"},
                                   "tool_start event");
     if (!fields)
       break;
@@ -221,7 +268,7 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
   }
   case WorkerEventType::completed: {
     fields = require_exact_fields(parsed.value(),
-                                  {"version", "type", "content", "usage"},
+                                  {"version", "type", "id", "content", "usage"},
                                   "completed event");
     if (!fields)
       break;
@@ -254,8 +301,9 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
     break;
   }
   case WorkerEventType::failed: {
-    fields = require_exact_fields(
-        parsed.value(), {"version", "type", "error", "usage"}, "failed event");
+    fields = require_exact_fields(parsed.value(),
+                                  {"version", "type", "id", "error", "usage"},
+                                  "failed event");
     if (!fields)
       break;
     const auto error = required_string(parsed.value(), "error");
@@ -287,7 +335,7 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
     break;
   }
   case WorkerEventType::cancelled:
-    fields = require_exact_fields(parsed.value(), {"version", "type"},
+    fields = require_exact_fields(parsed.value(), {"version", "type", "id"},
                                   "cancelled event");
     break;
   }
@@ -298,7 +346,8 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
 
 std::string serialize_worker_event(const WorkerEvent &event) {
   Json value{{"version", kWorkerProtocolVersion},
-             {"type", event_type_name(event.type)}};
+             {"type", event_type_name(event.type)},
+             {"id", safe_text(event.request_id)}};
   switch (event.type) {
   case WorkerEventType::started:
     value["agent"] = safe_text(event.agent);

@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -403,7 +404,7 @@ public:
     cache_ = workspace_ / ".zed" / "deepwiki";
 
     const std::string options =
-        R"([{"value":"generate","description":"建立索引并生成 Wiki。"},{"value":"update","description":"增量更新索引和过期页面。"},{"value":"status","description":"查看索引和 clangd 状态。"},{"value":"tui","description":"在终端内浏览 Wiki。","view":"document"},{"value":"open","description":"启动并打开本地网页。"}])";
+        R"([{"value":"generate","description":"建立索引、重新规划并生成 Wiki。"},{"value":"regen","description":"清空 DeepWiki 缓存并从零重建。"},{"value":"update","description":"增量更新索引和过期页面。"},{"value":"status","description":"查看索引和 clangd 状态。"},{"value":"tui","description":"在终端内浏览 Wiki。","view":"document"},{"value":"open","description":"启动并打开本地网页。"}])";
     const ZedaCommandV1 command{
         view("deepwiki"),
         view("Generate, update, inspect, or browse the local C/C++ DeepWiki."),
@@ -424,6 +425,9 @@ public:
          view(
              R"({"type":"object","required":["page"],"properties":{"page":{"type":"string","minLength":1}}})"),
          this, execute_contents},
+        {view("deepwiki_terms"),
+         view("Read the DeepWiki program-name to Chinese-name glossary."),
+         view(R"({"type":"object","properties":{}})"), this, execute_terms},
         {view("deepwiki_search"),
          view("Search the local C/C++ DeepWiki source index and return cited "
               "excerpts."),
@@ -463,6 +467,11 @@ private:
                                                             output, error);
   }
 
+  static int execute_terms(void *context, ZedaStringView, ZedaCancellationV1,
+                           ZedaTextSinkV1 output, ZedaTextSinkV1 error) {
+    return static_cast<DeepWikiPlugin *>(context)->terms(output, error);
+  }
+
   static int execute_search(void *context, ZedaStringView arguments,
                             ZedaCancellationV1, ZedaTextSinkV1 output,
                             ZedaTextSinkV1 error) {
@@ -479,8 +488,9 @@ private:
       return tui_document(cancellation, output, error);
     if (action == "open")
       return open_web(output, error);
-    if (action != "generate" && action != "update") {
-      write_sink(error, "usage: /deepwiki <generate|update|status|tui|open>");
+    if (action != "generate" && action != "regen" && action != "update") {
+      write_sink(error,
+                 "usage: /deepwiki <generate|regen|update|status|tui|open>");
       return 1;
     }
 
@@ -489,9 +499,17 @@ private:
       write_sink(error, "another DeepWiki task is already running");
       return 1;
     }
+    std::string detail;
+    if (action == "regen") {
+      event(on_event, event_context, ZEDA_EVENT_STATUS,
+            "正在清空 DeepWiki 缓存并从零重建…");
+      if (!clear_cache(detail)) {
+        write_sink(error, detail);
+        return 1;
+      }
+    }
     event(on_event, event_context, ZEDA_EVENT_STATUS,
           "正在扫描 C/C++ 仓库并更新本地索引…");
-    std::string detail;
     const auto refreshed =
         refresh(cancellation, on_event, event_context, detail);
     if (!refreshed.has_value()) {
@@ -509,9 +527,10 @@ private:
     }
 
     std::optional<std::vector<PagePlan>> plans;
+    const bool has_toc = std::filesystem::is_regular_file(cache_ / "toc.json");
     const bool replace_toc =
-        action == "generate" || refreshed->topology_changed ||
-        !std::filesystem::is_regular_file(cache_ / "toc.json");
+        action == "generate" || action == "regen" || !has_toc ||
+        (action == "update" && refreshed->topology_changed);
     if (replace_toc) {
       event(on_event, event_context, ZEDA_EVENT_STATUS,
             "正在规划 4–6 个中文 Wiki 页面…");
@@ -555,6 +574,26 @@ private:
         << "使用 /deepwiki tui 在终端浏览，或用 /deepwiki open 打开网页。\n";
     write_sink(output, summary.str());
     return 0;
+  }
+
+  bool clear_cache(std::string &error) {
+    if (database_ != nullptr) {
+      const auto result = sqlite3_close(database_);
+      if (result != SQLITE_OK) {
+        error = "cannot close DeepWiki index before regen: " +
+                std::string(sqlite3_errstr(result));
+        return false;
+      }
+      database_ = nullptr;
+    }
+    std::error_code filesystem_error;
+    std::filesystem::remove_all(cache_, filesystem_error);
+    if (filesystem_error) {
+      error = "cannot clear DeepWiki cache before regen: " +
+              filesystem_error.message();
+      return false;
+    }
+    return true;
   }
 
   bool ensure_database(std::string &error) {
@@ -1037,21 +1076,39 @@ private:
   std::optional<std::vector<PagePlan>>
   plan_pages(ZedaCancellationV1 cancellation, std::string &error) {
     const std::string system =
-        "你是 C++ 代码库文档规划器。根据仓库地图设计 4 到 6 个互不重复的中文 "
-        "Wiki 页面。"
-        "只输出 JSON 数组。每项必须包含 "
-        "id、title、description、queries；queries 是 2 到 5 个英文源码检索词。"
+        "你是 C++ 代码库文档与术语规划器。根据仓库地图设计 4 到 6 "
+        "个互不重复的中文 "
+        "Wiki 页面，并为 8 到 24 个主要类、函数、变量或模块建立中文作用名。"
+        "只输出 JSON 对象，格式为 {\"pages\":[],\"terms\":[]}。pages "
+        "每项必须包含 "
+        "id、title、description、queries；queries 是 2 到 5 "
+        "个英文源码检索词。terms "
+        "每项必须包含 program_name、chinese_name、description、kind、source；"
+        "program_name 必须是源码中的准确名字，chinese_name 是简短中文作用名，"
+        "description 解释其职责，kind 是 class、function、variable 或 "
+        "module，source "
+        "使用相对路径:行号。只选择理解系统所必需的主要名字。"
         "必须覆盖总体架构和至少一条关键运行路径。id 只能使用小写 "
         "ASCII、数字和连字符。";
     std::string response;
-    if (!complete(system, repository_map(), 4096, cancellation, nullptr,
+    if (!complete(system, repository_map(), 6144, cancellation, nullptr,
                   nullptr, response, error))
       return std::nullopt;
     auto parsed = Json::parse(strip_code_fence(response), nullptr, false);
+    const Json *page_items = &parsed;
+    Json terms = Json::array();
+    if (parsed.is_object()) {
+      const auto pages = parsed.find("pages");
+      if (pages != parsed.end())
+        page_items = &*pages;
+      const auto generated_terms = parsed.find("terms");
+      if (generated_terms != parsed.end())
+        terms = *generated_terms;
+    }
     std::vector<PagePlan> plans;
-    if (parsed.is_array()) {
+    if (page_items->is_array()) {
       std::set<std::string> ids;
-      for (const auto &item : parsed) {
+      for (const auto &item : *page_items) {
         if (!item.is_object())
           continue;
         PagePlan plan;
@@ -1096,7 +1153,64 @@ private:
            {"plugin config CMake target"}},
       };
     }
+    if (!save_terms(terms, error))
+      return std::nullopt;
     return plans;
+  }
+
+  bool save_terms(const Json &terms, std::string &error) const {
+    Json normalized = Json::array();
+    std::set<std::string> names;
+    if (terms.is_array()) {
+      for (const auto &term : terms) {
+        if (normalized.size() == 64)
+          break;
+        if (!term.is_object())
+          continue;
+        const auto program_name =
+            trim(term.value("program_name", std::string{}));
+        const auto chinese_name =
+            trim(term.value("chinese_name", std::string{}));
+        const auto description = trim(term.value("description", std::string{}));
+        const auto kind = trim(term.value("kind", std::string{}));
+        const auto source = trim(term.value("source", std::string{}));
+        const auto separator = source.rfind(':');
+        if (program_name.empty() || program_name.size() > 160 ||
+            chinese_name.empty() || chinese_name.size() > 96 ||
+            description.empty() || description.size() > 1024 ||
+            separator == std::string::npos || separator == 0 ||
+            !names.insert(program_name).second)
+          continue;
+        const auto relative = source.substr(0, separator);
+        const auto line_text = source.substr(separator + 1);
+        std::size_t line = 0;
+        const auto converted = std::from_chars(
+            line_text.data(), line_text.data() + line_text.size(), line);
+        const auto resolved =
+            std::filesystem::weakly_canonical(workspace_ / relative);
+        const auto content = read_file(resolved);
+        const auto line_count = static_cast<std::size_t>(std::count(
+                                    content.begin(), content.end(), '\n')) +
+                                1;
+        if (converted.ec != std::errc{} ||
+            converted.ptr != line_text.data() + line_text.size() || line == 0 ||
+            !path_is_inside(workspace_, resolved) || content.empty() ||
+            line > line_count)
+          continue;
+        normalized.push_back({{"program_name", program_name},
+                              {"chinese_name", chinese_name},
+                              {"description", description},
+                              {"kind", kind.empty() ? "symbol" : kind},
+                              {"source", source}});
+      }
+    }
+    return atomic_write(cache_ / "terms.json", normalized.dump(2) + "\n",
+                        error);
+  }
+
+  std::string terms_context() const {
+    const auto terms = read_file(cache_ / "terms.json", 256 * 1024);
+    return terms.empty() ? "[]" : terms;
   }
 
   std::optional<std::vector<PagePlan>> existing_plans(std::string &error) {
@@ -1165,15 +1279,21 @@ private:
         evidence.resize(kMaximumEvidenceBytes);
       const std::string system =
           "你是严谨的 C++ 架构文档作者。只使用提供的证据写中文 Markdown。"
+          "正文优先解释职责、数据流和设计意图，不要堆砌函数名、变量名或类名。"
+          "引用术语表中的程序名时，正文只展示其中文作用名，并写成 "
+          "[中文作用名](deepwiki-term:程序名)"
+          "；程序名含括号或空格时必须进行 URL percent encoding。"
+          "不要在链接文字或周围正文重复程序名。"
+          "代码块、源码引用和术语表未收录且确有必要的名字可以保留原文。"
           "每个技术事实都要紧邻 [相对路径:行号] "
           "引用；禁止编造不存在的类型、调用关系或行为。"
           "页面必须以一级标题开始，包含用途、关键组件、执行流程和限制。"
           "如果证据足够，加入一个 ```mermaid "
           "图，并在图后列出支持图中关系的源码引用。"
           "不要输出 JSON，不要使用仓库外部知识。";
-      const std::string prompt = "页面标题：" + plan.title + "\n页面目标：" +
-                                 plan.description + "\n\n源码证据：\n" +
-                                 evidence;
+      const std::string prompt =
+          "页面标题：" + plan.title + "\n页面目标：" + plan.description +
+          "\n\n术语表：\n" + terms_context() + "\n\n源码证据：\n" + evidence;
       std::string page;
       if (!complete(system, prompt, 8192, cancellation, nullptr, nullptr, page,
                     error))
@@ -1591,6 +1711,18 @@ private:
     return 0;
   }
 
+  int terms(ZedaTextSinkV1 output, ZedaTextSinkV1 error) {
+    const auto content = read_file(cache_ / "terms.json", 256 * 1024);
+    if (content.empty()) {
+      write_sink(error,
+                 "DeepWiki glossary has not been generated; run /deepwiki "
+                 "generate");
+      return 1;
+    }
+    write_sink(output, content);
+    return 0;
+  }
+
   int search_tool(const std::string &arguments, ZedaTextSinkV1 output,
                   ZedaTextSinkV1 error) {
     std::string database_error;
@@ -1674,6 +1806,16 @@ private:
         return;
       }
       const auto content = read_file(cache_ / "toc.json", 1024 * 1024);
+      response.set_content(content.empty() ? "[]" : content,
+                           "application/json; charset=utf-8");
+    });
+    server_->Get("/api/terms", [this](const httplib::Request &request,
+                                      httplib::Response &response) {
+      if (!authorized(request)) {
+        response.status = 403;
+        return;
+      }
+      const auto content = read_file(cache_ / "terms.json", 256 * 1024);
       response.set_content(content.empty() ? "[]" : content,
                            "application/json; charset=utf-8");
     });
@@ -1825,9 +1967,13 @@ private:
             evidence.resize(kMaximumEvidenceBytes);
           const std::string system =
               "你是本地 C++ 代码库问答助手。只能依据给定源码证据回答中文。"
+              "优先使用术语表中的中文作用名，避免堆砌函数、变量和类名；引用术语"
+              "时写成 "
+              "[中文作用名](deepwiki-term:程序名)，代码和源码引用除外。"
               "所有技术结论必须带 [相对路径:行号] 引用；证据不足时明确说明。";
-          const std::string prompt =
-              "问题：" + question + "\n\n源码证据：\n" + evidence;
+          const std::string prompt = "问题：" + question + "\n\n术语表：\n" +
+                                     terms_context() + "\n\n源码证据：\n" +
+                                     evidence;
           struct StreamContext {
             httplib::DataSink *sink{};
           } stream{&sink};

@@ -26,9 +26,8 @@ namespace {
 int run(int argc, char *argv[]) {
   if (argc > 1) {
     const std::string_view argument(argv[1]);
-    if (argc == 2 && argument == "--subagent-worker") {
-      return zed::subagents::run_explorer_worker(std::cin, std::cout,
-                                                 std::cerr);
+    if (argc == 2 && argument == "--subagent-worker-host") {
+      return zed::subagents::run_worker_host(std::cin, std::cout, std::cerr);
     }
     if (argc == 2 && (argument == "--help" || argument == "-h")) {
       print_usage(std::cout);

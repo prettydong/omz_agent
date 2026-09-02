@@ -11,8 +11,8 @@
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  build-essential cmake ninja-build pkg-config libsqlite3-dev \
-  ca-certificates curl clangd
+  build-essential cmake ninja-build pkg-config libcurl4-openssl-dev \
+  libsqlite3-dev ca-certificates clangd
 ```
 
 项目会在配置阶段通过 CMake FetchContent 下载并校验固定版本的 C++ 和 Web
@@ -68,6 +68,10 @@ OpenCode 登录后，后续启动无需再输入。`OPENCODE_GO_API_KEY` 仍可�
 - [nlohmann/json 3.12.0](https://github.com/nlohmann/json)：JSON 解析和序列化
 - [FTXUI 7.0.3](https://github.com/ArthurSonzogni/FTXUI)：交互式终端 UI 和 DOM 渲染
 - [cpp-httplib 0.51.0](https://github.com/yhirose/cpp-httplib)：仅绑定本机回环地址的配置页和 DeepWiki HTTP 服务
+
+模型请求通过系统 `libcurl` 在进程内发送和增量解析，不再为每次请求启动 `curl`
+子进程，构建和运行也不要求安装命令行 `curl`。传输产生的大块空闲堆页达到阈值时会
+主动归还操作系统，避免常驻 WorkerHost 保留请求期间的内存峰值。
 
 默认模型是 `muse-spark-1.2-contributor`，也可以通过环境变量切换：
 
@@ -261,10 +265,11 @@ Session v2 不兼容早期 beta 的 message-only JSONL。旧文件不会被删�
 `*` 和 `?` glob 搜索文件或目录，不扫描 `.git` 且不跟随符号链接；`ls` 只列出
 指定目录的一层内容，并用 `/` 和 `@` 标记目录与符号链接。
 
-外部命令、`clangd`、模型 HTTP 客户端和模型目录发现统一通过 `posix_spawn` 启动。
-子进程默认只继承 `PATH`、locale、临时目录和编译工具链等明确允许的环境变量，不会
-自动获得任意 Token、数据库连接串或云凭证；确有需要的可信 Worker 必须逐项声明。
-Shell 超时或取消会终止整个进程组，即使主 Shell 已退出也不会继续等待后台进程管道。
+外部命令、`clangd` 和模型目录发现统一通过 `posix_spawn` 启动；模型 HTTP 请求使用
+进程内 `libcurl`，不会为每个 Agent 请求创建额外的 `curl` 进程。子进程默认只继承
+`PATH`、locale、临时目录和编译工具链等明确允许的环境变量，不会自动获得任意
+Token、数据库连接串或云凭证；确有需要的可信 Worker 必须逐项声明。Shell 超时或
+取消会终止整个进程组，即使主 Shell 已退出也不会继续等待后台进程管道。
 
 ## Sub Agent
 
@@ -280,11 +285,14 @@ Explorer 默认使用 `opencode-go/muse-spark-1.2-contributor` 和 `low` reasoni
 不可放宽。Worker 注册的工具白名单固定为只读工具；修改提示词不能获得 Shell、写文件、
 插件、Skill 或嵌套 Sub Agent 权限。
 
-每个 Sub Agent 任务在独立的 `zeda --subagent-worker` 子进程和新上下文中运行，
-只注册 `read`、`grep`、`find`、`ls` 和只读 `lsp`。Worker 不加载 Shell、写入工具、
-Quick Bash、Skill、插件或 `subagent` 本身，也不创建 Session 文件。主 Session 仅
-保存一次 `subagent` 调用及其最终结果；运行中的 queued、running、completed 和
-failed 状态只显示在当前工具卡片中。
+首次委派时会按需启动一个常驻的 `zeda --subagent-worker-host` 子进程；同一主进程的
+后续及并行任务复用这个 Host，不再为每个任务复制一份 `zeda`。Host 只加载一次配置、
+模型目录、provider 和 `clangd` 客户端；每个任务仍使用独立的新上下文、内存 Session
+和工具注册表。任务通过带 ID 的 JSONL 协议并发复用 Host，超时或取消只终止对应任务；
+Host 异常退出时当前任务会明确失败，下一次委派会自动重启。Host 不加载 Shell、写入
+工具、Quick Bash、Skill、插件或 `subagent` 本身，也不创建 Session 文件；任务只注册
+`read`、`grep`、`find`、`ls` 和只读 `lsp`。主 Session 仅保存一次 `subagent` 调用及其
+最终结果；运行中的 queued、running、completed 和 failed 状态只显示在当前工具卡片中。
 
 模型可使用三种互斥调用形式：
 
@@ -296,9 +304,9 @@ failed 状态只显示在当前工具卡片中。
 
 Parallel 和 Chain 都接受 2–8 个任务；Parallel 默认最多同时运行 4 个并按输入顺序返回，
 单个失败不会丢弃其他结果。Chain 用上一步结果替换 `{previous}`，首个失败后停止。
-一次调用默认总超时为 10 分钟，每个 Worker 默认最多执行 12 个 Agent Loop 回合；每个任务的
+一次调用默认总超时为 10 分钟，每个任务默认最多执行 12 个 Agent Loop 回合；每个任务的
 输入和最终输出上限都是 32 KiB，聚合工具结果上限是 256 KiB。取消会终止所有活动
-及排队任务。并发数、总超时、聚合输出、Worker 回合数和模型最终输出 Token 上限可在
+及排队任务。并发数、总超时、聚合输出、任务回合数和模型最终输出 Token 上限可在
 配置页调整，但单任务输入和协议最终输出的 32 KiB 限制保持不变。子任务的模型 token
 会计入终端累计用量，但不会覆盖主 Agent 的当前上下文占用。
 
@@ -335,14 +343,20 @@ clangd 符号、`#include` 关系和 CMake target/link 关系。首次使用：
 
 ```text
 /deepwiki generate
+/deepwiki regen
 /deepwiki status
 /deepwiki tui
 /deepwiki open
 ```
 
-代码变化后执行 `/deepwiki update`。无变化时不会调用模型；普通变化只重新索引文件并
+需要删除当前 `.zed/deepwiki/` 缓存并从零重建索引、目录、术语表和全部页面时执行
+`/deepwiki regen`。代码变化后执行 `/deepwiki update`。无变化时不会调用模型；普通变化只重新索引文件并
 生成引用了这些文件的页面。Wiki、索引和状态保存在当前仓库的 `.zed/deepwiki/`，插件
 不会修改源码或 `.gitignore`，因此未忽略 `.zed/` 的仓库会把它显示为未跟踪目录。
+
+生成目录时 DeepWiki 还会为主要类、函数、变量和模块建立中文作用名，映射及解释保存
+在 `.zed/deepwiki/terms.json`。生成的正文优先使用中文作用名；网页中悬停名称可查看
+源码里的准确程序名和职责解释。“名词 Wiki”集中展示中文名、程序名、类型、解释和源码位置。
 
 在全屏终端中执行 `/deepwiki tui` 会进入内置双栏浏览器：左侧是页面目录，右侧渲染
 Markdown。用 `↑/↓` 或 `j/k` 选页，`Tab` 或 `←/→` 在目录和正文之间切换焦点，正文
@@ -351,8 +365,8 @@ Markdown。用 `↑/↓` 或 `j/k` 选页，`Tab` 或 `←/→` 在目录和正�
 
 `/deepwiki open` 只在 `127.0.0.1` 随机端口启动网页，并自动打开浏览器。网页提供目录、
 Markdown、Mermaid 图、源码引用预览和流式问答；进程退出时服务停止。普通 Agent 也可
-使用插件注册的 `deepwiki_structure`、`deepwiki_contents` 和 `deepwiki_search` 三个
-只读工具。
+使用插件注册的 `deepwiki_structure`、`deepwiki_contents`、`deepwiki_terms` 和
+`deepwiki_search` 四个只读工具。
 
 没有 `compile_commands.json` 时仍可建立文本索引，但 `/deepwiki status` 会显示
 `degraded`；正常状态还会显示当前提交和过期页面数。CMake 项目建议先生成编译数据库：

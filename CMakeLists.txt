@@ -4,6 +4,8 @@ project(zeda VERSION 0.2 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
+find_package(CURL REQUIRED)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -141,6 +143,7 @@ target_link_libraries(zed_core
     PUBLIC
         nlohmann_json::nlohmann_json
     PRIVATE
+        CURL::libcurl
         httplib::httplib
         ${CMAKE_DL_LIBS}
 )

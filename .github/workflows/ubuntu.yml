@@ -24,7 +24,7 @@ jobs:
             ca-certificates \
             clangd \
             cmake \
-            curl \
+            libcurl4-openssl-dev \
             libsqlite3-dev \
             ninja-build \
             pkg-config

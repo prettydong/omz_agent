@@ -1,23 +1,26 @@
 #include "zed/providers/opencode_go_model.hpp"
 
-#include "zed/support/child_process.hpp"
-#include "zed/support/unique_fd.hpp"
-
-#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdint>
-#include <cstring>
-#include <fcntl.h>
-#include <filesystem>
 #include <functional>
-#include <poll.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <curl/curl.h>
 #include <nlohmann/json.hpp>
+
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace zed::providers {
 
@@ -350,19 +353,6 @@ void append_tool_call_arguments(std::vector<ToolCall> &calls, std::string id,
     }
   }
   calls.push_back({std::move(id), std::move(name), std::move(delta)});
-}
-
-std::string curl_config_escape(std::string_view value) {
-  std::string escaped;
-  escaped.reserve(value.size());
-  for (const char character : value) {
-    if (character == '\\' || character == '"')
-      escaped.push_back('\\');
-    if (character == '\n' || character == '\r')
-      continue;
-    escaped.push_back(character);
-  }
-  return escaped;
 }
 
 void parse_output_item(const Json &item, std::vector<ToolCall> &calls) {
@@ -919,62 +909,6 @@ core::Result<void> validate_tool_calls(const std::vector<ToolCall> &calls) {
   return core::Result<void>::success();
 }
 
-bool write_all(int descriptor, std::string_view content) {
-  std::size_t offset = 0;
-  while (offset < content.size()) {
-    const auto written =
-        write(descriptor, content.data() + offset, content.size() - offset);
-    if (written > 0) {
-      offset += static_cast<std::size_t>(written);
-      continue;
-    }
-    if (written < 0 && errno == EINTR)
-      continue;
-    return false;
-  }
-  return true;
-}
-
-class TemporaryRequestFile {
-public:
-  static core::Result<TemporaryRequestFile> create(std::string_view body) {
-    std::string path_template =
-        (std::filesystem::temp_directory_path() / "zed-request-XXXXXX")
-            .string();
-    std::vector<char> path(path_template.begin(), path_template.end());
-    path.push_back('\0');
-    support::UniqueFd descriptor(mkstemp(path.data()));
-    if (!descriptor.valid()) {
-      return core::Result<TemporaryRequestFile>::failure(
-          {ErrorCode::model_error, "cannot create request file"});
-    }
-    TemporaryRequestFile file(std::string(path.data()));
-    if (!write_all(descriptor.get(), body)) {
-      return core::Result<TemporaryRequestFile>::failure(
-          {ErrorCode::model_error, "cannot write request body"});
-    }
-    return core::Result<TemporaryRequestFile>::success(std::move(file));
-  }
-
-  TemporaryRequestFile(const TemporaryRequestFile &) = delete;
-  TemporaryRequestFile &operator=(const TemporaryRequestFile &) = delete;
-
-  TemporaryRequestFile(TemporaryRequestFile &&other) noexcept
-      : path_(std::exchange(other.path_, {})) {}
-
-  ~TemporaryRequestFile() {
-    if (!path_.empty())
-      static_cast<void>(unlink(path_.c_str()));
-  }
-
-  [[nodiscard]] const std::string &path() const { return path_; }
-
-private:
-  explicit TemporaryRequestFile(std::string path) : path_(std::move(path)) {}
-
-  std::string path_;
-};
-
 class LineBuffer {
 public:
   explicit LineBuffer(
@@ -1037,168 +971,278 @@ private:
   std::size_t total_bytes_{};
 };
 
-core::Result<void>
-run_curl(const OpenCodeGoConfig &config, std::string_view endpoint,
-         const std::vector<std::string> &extra_headers, std::string_view body,
-         core::CancellationToken cancellation,
-         const std::function<core::Result<void>(std::string_view)> &on_line) {
-  auto request_file = TemporaryRequestFile::create(body);
-  if (!request_file)
-    return core::Result<void>::failure(request_file.error());
+struct CurlTransfer {
+  CurlTransfer() = default;
 
-  auto spawn_lock = support::lock_process_spawn();
-  int output_pipe[2];
-  if (!support::create_cloexec_pipe(output_pipe))
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot create HTTP output pipe"});
-  support::UniqueFd output_read(output_pipe[0]);
-  support::UniqueFd output_write(output_pipe[1]);
-
-  int config_pipe[2];
-  if (!support::create_cloexec_pipe(config_pipe))
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot create curl config pipe"});
-  support::UniqueFd config_read(config_pipe[0]);
-  support::UniqueFd config_write(config_pipe[1]);
-
-  support::UniqueFd error_output(open("/dev/null", O_WRONLY | O_CLOEXEC));
-  support::SpawnOptions spawn_options;
-  spawn_options.executable = "curl";
-  spawn_options.arguments = {
-      "-sS", "--no-buffer", "--fail-with-body", "--config", "-",
-  };
-  spawn_options.duplicate_descriptors = {
-      {output_write.get(), STDOUT_FILENO},
-      {config_read.get(), STDIN_FILENO},
-  };
-  if (error_output.valid()) {
-    spawn_options.duplicate_descriptors.push_back(
-        {error_output.get(), STDERR_FILENO});
-  }
-  spawn_options.close_descriptors = {
-      output_read.get(),
-      output_write.get(),
-      config_read.get(),
-      config_write.get(),
-  };
-  if (error_output.valid())
-    spawn_options.close_descriptors.push_back(error_output.get());
-  pid_t child = -1;
-  const int spawn_error = support::spawn_process(spawn_options, child);
-  if (spawn_error != 0) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error,
-         "cannot start curl: " + std::string(std::strerror(spawn_error))});
+  ~CurlTransfer() {
+    if (added && multi != nullptr && easy != nullptr)
+      static_cast<void>(curl_multi_remove_handle(multi, easy));
+    if (headers != nullptr)
+      curl_slist_free_all(headers);
+    if (easy != nullptr)
+      curl_easy_cleanup(easy);
+    if (multi != nullptr)
+      curl_multi_cleanup(multi);
   }
 
-  spawn_lock.unlock();
+  CurlTransfer(const CurlTransfer &) = delete;
+  CurlTransfer &operator=(const CurlTransfer &) = delete;
 
-  output_write.reset();
-  config_read.reset();
-  bool child_finished = false;
-  int status = 0;
-  const auto terminate_child = [&] {
-    support::terminate_process_group(child, std::chrono::milliseconds(250),
-                                     child_finished, status);
-  };
-  std::string curl_config = "url = \"" + curl_config_escape(endpoint) + "\"\n" +
-                            "request = \"POST\"\n" +
-                            "header = \"Authorization: Bearer " +
-                            curl_config_escape(config.api_key) + "\"\n" +
-                            "header = \"Content-Type: application/json\"\n";
+  CURL *easy{nullptr};
+  CURLM *multi{nullptr};
+  curl_slist *headers{nullptr};
+  bool added{false};
+};
+
+void release_unused_heap_memory() noexcept {
+#if defined(__APPLE__)
+  constexpr std::size_t kMinimumReclaimableBytes = 8 * 1024 * 1024;
+  auto *zone = malloc_default_zone();
+  malloc_statistics_t statistics{};
+  malloc_zone_statistics(zone, &statistics);
+  if (statistics.size_allocated >= statistics.size_in_use &&
+      statistics.size_allocated - statistics.size_in_use >=
+          kMinimumReclaimableBytes) {
+    static_cast<void>(malloc_zone_pressure_relief(
+        zone, statistics.size_allocated - statistics.size_in_use));
+  }
+#elif defined(__GLIBC__)
+  constexpr std::size_t kMinimumReclaimableBytes = 8 * 1024 * 1024;
+  const auto statistics = mallinfo2();
+  if (statistics.fordblks >= kMinimumReclaimableBytes)
+    static_cast<void>(malloc_trim(0));
+#endif
+}
+
+struct HeapPressureRelief {
+  ~HeapPressureRelief() { release_unused_heap_memory(); }
+};
+
+struct CurlTransferState {
+  LineBuffer &lines;
+  core::CancellationToken cancellation;
+  std::chrono::steady_clock::time_point deadline;
+  std::optional<core::Error> callback_error;
+};
+
+core::Result<void> initialize_libcurl() {
+  static std::once_flag once;
+  static CURLcode result = CURLE_FAILED_INIT;
+  std::call_once(once, [] { result = curl_global_init(CURL_GLOBAL_DEFAULT); });
+  if (result != CURLE_OK) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error, "cannot initialize in-process HTTP client"});
+  }
+  return core::Result<void>::success();
+}
+
+bool append_header(CurlTransfer &transfer, std::string_view header) {
+  if (header.find_first_of("\r\n") != std::string_view::npos)
+    return false;
+  const std::string owned(header);
+  auto *updated = curl_slist_append(transfer.headers, owned.c_str());
+  if (updated == nullptr)
+    return false;
+  transfer.headers = updated;
+  return true;
+}
+
+std::size_t receive_http_body(char *data, std::size_t size, std::size_t count,
+                              void *user_data) noexcept {
+  auto &state = *static_cast<CurlTransferState *>(user_data);
+  if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) {
+    state.callback_error =
+        core::Error{ErrorCode::model_error, "OpenCode response size overflow"};
+    return 0;
+  }
+  const auto bytes = size * count;
+  try {
+    const auto processed = state.lines.append(std::string_view(data, bytes));
+    if (!processed) {
+      state.callback_error = processed.error();
+      return 0;
+    }
+    return bytes;
+  } catch (...) {
+    state.callback_error =
+        core::Error{ErrorCode::model_error,
+                    "OpenCode response callback failed with an unknown error"};
+    return 0;
+  }
+}
+
+int inspect_http_progress(void *user_data, curl_off_t, curl_off_t, curl_off_t,
+                          curl_off_t) noexcept {
+  const auto &state = *static_cast<CurlTransferState *>(user_data);
+  return state.cancellation.is_cancelled() ||
+                 std::chrono::steady_clock::now() >= state.deadline
+             ? 1
+             : 0;
+}
+
+core::Result<void> run_http_request(
+    const OpenCodeGoConfig &config, std::string_view endpoint,
+    const std::vector<std::string> &extra_headers, std::string_view body,
+    core::CancellationToken cancellation,
+    const std::function<core::Result<void>(std::string_view)> &on_line) {
+  const auto initialized = initialize_libcurl();
+  if (!initialized)
+    return initialized;
+  if (body.size() >
+      static_cast<std::size_t>(std::numeric_limits<curl_off_t>::max())) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error, "OpenCode request body is too large"});
+  }
+
+  HeapPressureRelief heap_pressure_relief;
+  CurlTransfer transfer;
+  transfer.easy = curl_easy_init();
+  transfer.multi = curl_multi_init();
+  if (transfer.easy == nullptr || transfer.multi == nullptr) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error, "cannot create in-process HTTP request"});
+  }
+  const std::string owned_endpoint(endpoint);
+  const std::string authorization = "Authorization: Bearer " + config.api_key;
+  if (!append_header(transfer, authorization) ||
+      !append_header(transfer, "Content-Type: application/json") ||
+      !append_header(transfer, "Accept: text/event-stream") ||
+      !append_header(transfer, "Expect:")) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error, "cannot configure HTTP request headers"});
+  }
   for (const auto &header : extra_headers) {
-    curl_config += "header = \"" + curl_config_escape(header) + "\"\n";
-  }
-  curl_config += "data-binary = \"@" +
-                 curl_config_escape(request_file.value().path()) + "\"\n";
-  const bool wrote_config = write_all(config_write.get(), curl_config);
-  config_write.reset();
-  if (!wrote_config) {
-    terminate_child();
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot write curl config"});
-  }
-  const int flags = fcntl(output_read.get(), F_GETFL, 0);
-  if (flags < 0 || fcntl(output_read.get(), F_SETFL, flags | O_NONBLOCK) < 0) {
-    terminate_child();
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot configure curl output"});
-  }
-
-  bool cancelled = false;
-  bool timed_out = false;
-  bool pipe_closed = false;
-  bool termination_requested = false;
-  LineBuffer line_buffer(on_line);
-  const auto started_at = std::chrono::steady_clock::now();
-  while (!pipe_closed || !child_finished) {
-    if (cancellation.is_cancelled()) {
-      cancelled = true;
-    }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - started_at)
-                             .count();
-    if (elapsed >= static_cast<long long>(config.request_timeout_ms)) {
-      timed_out = true;
-    }
-
-    pollfd descriptor{output_read.get(), POLLIN | POLLHUP, 0};
-    const int poll_result = poll(&descriptor, 1, 50);
-    if (poll_result < 0 && errno != EINTR) {
-      terminate_child();
+    if (!append_header(transfer, header)) {
       return core::Result<void>::failure(
-          {ErrorCode::model_error, "cannot poll curl output"});
-    }
-    if (poll_result > 0 && (descriptor.revents & (POLLIN | POLLHUP)) != 0) {
-      char buffer[8192];
-      while (true) {
-        const ssize_t read_count =
-            read(output_read.get(), buffer, sizeof(buffer));
-        if (read_count > 0) {
-          const auto processed = line_buffer.append(
-              std::string_view(buffer, static_cast<std::size_t>(read_count)));
-          if (!processed) {
-            terminate_child();
-            return processed;
-          }
-          continue;
-        }
-        if (read_count == 0) {
-          pipe_closed = true;
-          break;
-        }
-        if (errno == EINTR)
-          continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-          break;
-        pipe_closed = true;
-        break;
-      }
-    }
-
-    if (!child_finished)
-      child_finished = support::try_reap_child(child, status);
-    if ((cancelled || timed_out) && !termination_requested) {
-      terminate_child();
-      termination_requested = true;
-      output_read.reset();
-      pipe_closed = true;
+          {ErrorCode::model_error, "cannot configure HTTP request headers"});
     }
   }
 
-  const auto processed = line_buffer.flush();
-  if (!processed)
-    return processed;
-  if (cancelled || cancellation.is_cancelled())
+  const auto timeout_value =
+      std::max<std::size_t>(1, config.request_timeout_ms);
+  const auto timeout_ms = static_cast<long>(
+      std::min(timeout_value, static_cast<std::size_t>(LONG_MAX)));
+  LineBuffer line_buffer(on_line);
+  CurlTransferState state{
+      line_buffer,
+      std::move(cancellation),
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms),
+      std::nullopt,
+  };
+  const auto configured =
+      curl_easy_setopt(transfer.easy, CURLOPT_URL, owned_endpoint.c_str()) ==
+          CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_POST, 1L) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_POSTFIELDS, body.data()) ==
+          CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_POSTFIELDSIZE_LARGE,
+                       static_cast<curl_off_t>(body.size())) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_HTTPHEADER, transfer.headers) ==
+          CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_WRITEFUNCTION,
+                       receive_http_body) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_WRITEDATA, &state) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_XFERINFOFUNCTION,
+                       inspect_http_progress) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_XFERINFODATA, &state) ==
+          CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_NOPROGRESS, 0L) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_NOSIGNAL, 1L) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_TIMEOUT_MS, timeout_ms) ==
+          CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_HTTP_VERSION,
+                       CURL_HTTP_VERSION_2TLS) == CURLE_OK;
+  if (!configured) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error, "cannot configure in-process HTTP request"});
+  }
+
+  const auto added = curl_multi_add_handle(transfer.multi, transfer.easy);
+  if (added != CURLM_OK) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error, "cannot start in-process HTTP request"});
+  }
+  transfer.added = true;
+
+  int running = 0;
+  CURLMcode multi_result = CURLM_OK;
+  auto next_memory_relief =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  do {
+    multi_result = curl_multi_perform(transfer.multi, &running);
+  } while (multi_result == CURLM_CALL_MULTI_PERFORM);
+  while (multi_result == CURLM_OK && running > 0 &&
+         !state.cancellation.is_cancelled() &&
+         std::chrono::steady_clock::now() < state.deadline) {
+    int descriptors = 0;
+    multi_result =
+        curl_multi_poll(transfer.multi, nullptr, 0, 50, &descriptors);
+    if (multi_result != CURLM_OK)
+      break;
+    do {
+      multi_result = curl_multi_perform(transfer.multi, &running);
+    } while (multi_result == CURLM_CALL_MULTI_PERFORM);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_memory_relief) {
+      release_unused_heap_memory();
+      next_memory_relief = now + std::chrono::seconds(1);
+    }
+  }
+
+  if (state.callback_error.has_value())
+    return core::Result<void>::failure(*state.callback_error);
+  if (state.cancellation.is_cancelled()) {
     return core::Result<void>::failure(
         {ErrorCode::cancelled, "model request cancelled"});
-  if (timed_out)
+  }
+  if (std::chrono::steady_clock::now() >= state.deadline) {
     return core::Result<void>::failure(
         {ErrorCode::timeout, "OpenCode request timed out"});
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+  }
+  if (multi_result != CURLM_OK) {
     return core::Result<void>::failure(
-        {ErrorCode::model_error, "OpenCode HTTP request failed"});
-  return core::Result<void>::success();
+        {ErrorCode::model_error, "in-process HTTP polling failed"});
+  }
+
+  CURLcode transfer_result = CURLE_FAILED_INIT;
+  bool transfer_finished = false;
+  int messages_remaining = 0;
+  while (const auto *message =
+             curl_multi_info_read(transfer.multi, &messages_remaining)) {
+    if (message->msg == CURLMSG_DONE && message->easy_handle == transfer.easy) {
+      transfer_result = message->data.result;
+      transfer_finished = true;
+      break;
+    }
+  }
+  if (!transfer_finished) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error,
+         "in-process HTTP request ended without a completion status"});
+  }
+  if (transfer_result == CURLE_OPERATION_TIMEDOUT) {
+    return core::Result<void>::failure(
+        {ErrorCode::timeout, "OpenCode request timed out"});
+  }
+  if (transfer_result != CURLE_OK) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error,
+         "OpenCode HTTP request failed: " +
+             std::string(curl_easy_strerror(transfer_result))});
+  }
+
+  long status = 0;
+  if (curl_easy_getinfo(transfer.easy, CURLINFO_RESPONSE_CODE, &status) !=
+      CURLE_OK) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error, "cannot read OpenCode HTTP status"});
+  }
+  if (status < 200 || status >= 300) {
+    return core::Result<void>::failure(
+        {ErrorCode::model_error,
+         "OpenCode HTTP request failed with status " + std::to_string(status)});
+  }
+  return line_buffer.flush();
 }
 
 } // namespace
@@ -1245,23 +1289,23 @@ OpenCodeGoModel::complete(const ModelRequest &request,
   AssistantResponse response;
   core::Result<void> result = core::Result<void>::success();
   if (protocol == OpenCodeProtocol::responses) {
-    result = run_curl(config_, endpoint, {},
-                      responses_request_json(request, model_info), cancellation,
-                      [&](std::string_view line) {
-                        return process_responses_sse(line, response, on_delta);
-                      });
+    result = run_http_request(
+        config_, endpoint, {}, responses_request_json(request, model_info),
+        cancellation, [&](std::string_view line) {
+          return process_responses_sse(line, response, on_delta);
+        });
   } else if (protocol == OpenCodeProtocol::chat_completions) {
     ChatStreamState state;
-    result =
-        run_curl(config_, endpoint, {}, chat_request_json(request, model_info),
-                 cancellation, [&](std::string_view line) {
-                   return process_chat_sse(line, state, on_delta);
-                 });
+    result = run_http_request(config_, endpoint, {},
+                              chat_request_json(request, model_info),
+                              cancellation, [&](std::string_view line) {
+                                return process_chat_sse(line, state, on_delta);
+                              });
     state.response.tool_calls = std::move(state.indexed_calls);
     response = std::move(state.response);
   } else {
     MessagesStreamState state;
-    result = run_curl(
+    result = run_http_request(
         config_, endpoint,
         {"x-api-key: " + config_.api_key, "anthropic-version: 2023-06-01"},
         messages_request_json(request, model_info), cancellation,

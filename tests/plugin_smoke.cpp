@@ -28,13 +28,18 @@ public:
     ++calls;
     const auto &system = request.messages.front().content;
     std::string response;
-    if (system.find("文档规划器") != std::string::npos) {
-      response = R"([
-        {"id":"overview","title":"总览","description":"总体结构","queries":["foo architecture"]},
-        {"id":"flow","title":"运行流程","description":"关键流程","queries":["foo run"]},
-        {"id":"async","title":"异步模型","description":"异步边界","queries":["foo async"]},
-        {"id":"build","title":"构建系统","description":"构建组织","queries":["foo CMake"]}
-      ])";
+    if (system.find("文档与术语规划器") != std::string::npos) {
+      response = R"({
+        "pages":[
+          {"id":"overview","title":"总览","description":"总体结构","queries":["foo architecture"]},
+          {"id":"flow","title":"运行流程","description":"关键流程","queries":["foo run"]},
+          {"id":"async","title":"异步模型","description":"异步边界","queries":["foo async"]},
+          {"id":"build","title":"构建系统","description":"构建组织","queries":["foo CMake"]}
+        ],
+        "terms":[
+          {"program_name":"foo","chinese_name":"数值提供器","description":"提供固定测试值。","kind":"function","source":"src/foo.cpp:2"}
+        ]
+      })";
     } else if (system.find("检索关键词") != std::string::npos) {
       response = "foo";
     } else if (system.find("问答助手") != std::string::npos) {
@@ -44,7 +49,9 @@ public:
       if (on_delta)
         on_delta({response});
     } else {
-      response = "# 测试页面\n\n这个页面基于真实源码。[src/foo.cpp:1]\n";
+      response = "# "
+                 "测试页面\n\n[数值提供器](deepwiki-term:foo)基于真实源码。["
+                 "src/foo.cpp:1]\n";
     }
     return zed::core::Result<zed::core::AssistantResponse>::success(
         {std::move(response), {}, zed::core::FinishReason::stop, {}});
@@ -104,6 +111,11 @@ int main() {
         [](const auto &option) { return option.value == "tui"; });
     assert(tui_option != deepwiki_command->options.end());
     assert(tui_option->opens_document_view);
+    const auto regen_option = std::find_if(
+        deepwiki_command->options.begin(), deepwiki_command->options.end(),
+        [](const auto &option) { return option.value == "regen"; });
+    assert(regen_option != deepwiki_command->options.end());
+    assert(!regen_option->opens_document_view);
     const auto missing_tui = extensions.execute("deepwiki", "tui");
     assert(!missing_tui);
     assert(missing_tui.error().message.find("has not been generated") !=
@@ -116,6 +128,8 @@ int main() {
                                             "index.sqlite"));
     assert(std::filesystem::is_regular_file(workspace / ".zed" / "deepwiki" /
                                             "toc.json"));
+    assert(std::filesystem::is_regular_file(workspace / ".zed" / "deepwiki" /
+                                            "terms.json"));
     const auto tui = extensions.execute("deepwiki", "tui");
     assert(tui);
     const auto tui_document =
@@ -132,20 +146,44 @@ int main() {
                .find("测试页面") != std::string::npos);
     assert(model.calls == 5);
 
+    const auto discarded = workspace / ".zed" / "deepwiki" / "discarded";
+    {
+      std::ofstream marker(discarded);
+      marker << "regen must remove this file\n";
+    }
+    const auto regenerated = extensions.execute("deepwiki", "regen");
+    assert(regenerated);
+    assert(regenerated.value().find("生成 4 个页面") != std::string::npos);
+    assert(model.calls == 10);
+    assert(!std::filesystem::exists(discarded));
+    assert(std::filesystem::is_regular_file(workspace / ".zed" / "deepwiki" /
+                                            "index.sqlite"));
+    assert(std::filesystem::is_regular_file(workspace / ".zed" / "deepwiki" /
+                                            "toc.json"));
+    assert(std::filesystem::is_regular_file(workspace / ".zed" / "deepwiki" /
+                                            "terms.json"));
+
     const auto unchanged = extensions.execute("deepwiki", "update");
     assert(unchanged);
     assert(unchanged.value().find("未调用模型") != std::string::npos);
-    assert(model.calls == 5);
+    assert(model.calls == 10);
 
     write_fixture(workspace, "// changed\n");
     const auto updated = extensions.execute("deepwiki", "update");
     assert(updated);
-    assert(model.calls == 9);
+    assert(model.calls == 14);
 
     const auto definitions = tools.definitions();
     assert(std::any_of(
         definitions.begin(), definitions.end(),
         [](const auto &item) { return item.name == "deepwiki_search"; }));
+    assert(std::any_of(
+        definitions.begin(), definitions.end(),
+        [](const auto &item) { return item.name == "deepwiki_terms"; }));
+    const auto glossary = tools.execute(
+        {"terms-1", "deepwiki_terms", R"({"purpose":"read glossary"})"}, {});
+    assert(glossary);
+    assert(glossary.value().content.find("数值提供器") != std::string::npos);
     const auto search = tools.execute(
         {"search-1", "deepwiki_search",
          R"({"purpose":"verify local index","query":"foo","limit":4})"},
@@ -176,6 +214,9 @@ int main() {
     const auto toc = client.Get("/api/toc?token=" + token);
     assert(toc && toc->status == 200);
     assert(toc->body.find("overview") != std::string::npos);
+    const auto terms = client.Get("/api/terms?token=" + token);
+    assert(terms && terms->status == 200);
+    assert(terms->body.find("数值提供器") != std::string::npos);
     const auto source =
         client.Get("/api/source?token=" + token + "&path=src/foo.cpp&line=1");
     assert(source && source->status == 200);

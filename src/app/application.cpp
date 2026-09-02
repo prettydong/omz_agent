@@ -49,7 +49,7 @@ zed::core::Result<zed::tools::SubagentTool *>
 register_builtin_tools(zed::core::ToolRegistry &tools,
                        const zed::app::RuntimeConfig &config,
                        zed::lsp::ClangdClient &clangd,
-                       zed::subagents::ProcessSubagentRunner &subagent_runner,
+                       zed::subagents::WorkerHostRunner &subagent_runner,
                        std::vector<zed::subagents::AgentDefinition> &agents) {
   const auto add = [&](std::unique_ptr<zed::core::Tool> tool) {
     return tools.register_tool(std::move(tool));
@@ -173,7 +173,7 @@ int run_application(std::string_view executable, std::string_view version) {
   zed::app::ConfigureWebServer configure_web(runtime_config.workspace);
   auto built_in_agents = zed::subagents::configured_agents(
       model_catalog, runtime_config.subagents);
-  zed::subagents::ProcessSubagentRunner subagent_runner({
+  zed::subagents::WorkerHostRunner subagent_runner({
       subagent_worker_executable(executable),
       runtime_config.workspace,
   });

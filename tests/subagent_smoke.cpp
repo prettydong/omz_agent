@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 #include <nlohmann/json.hpp>
 
 #include "zed/app/config.hpp"
@@ -98,103 +100,144 @@ private:
   std::vector<std::string> tasks_;
 };
 
-int run_fake_worker() {
-  std::string line;
-  if (!std::getline(std::cin, line))
-    return 2;
-  const auto request = zed::subagents::parse_worker_request(line);
-  if (!request)
-    return 2;
+int run_fake_worker_host() {
   const auto emit = [](const zed::subagents::WorkerEvent &event) {
     std::cout << zed::subagents::serialize_worker_event(event) << '\n'
               << std::flush;
   };
-  emit({zed::subagents::WorkerEventType::started, request.value().agent});
-  if (request.value().task == "runner-ok") {
-    emit({zed::subagents::WorkerEventType::tool_start,
+  std::vector<zed::subagents::WorkerRequest> paired_requests;
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    const auto command = zed::subagents::parse_worker_command(line);
+    if (!command)
+      return 2;
+    const auto &request = command.value().request;
+    if (command.value().type == zed::subagents::WorkerCommandType::cancel) {
+      emit({zed::subagents::WorkerEventType::cancelled, request.request_id});
+      continue;
+    }
+    emit({zed::subagents::WorkerEventType::started, request.request_id,
+          request.agent});
+    if (request.task == "runner-ok") {
+      emit({zed::subagents::WorkerEventType::tool_start,
+            request.request_id,
+            {},
+            "read",
+            "inspect runner fixture"});
+      zed::subagents::WorkerEvent completed;
+      completed.type = zed::subagents::WorkerEventType::completed;
+      completed.request_id = request.request_id;
+      completed.content = "runner result";
+      completed.usage = {11, 2, 3};
+      emit(completed);
+      continue;
+    }
+    if (request.task == "runner-pid") {
+      zed::subagents::WorkerEvent completed;
+      completed.type = zed::subagents::WorkerEventType::completed;
+      completed.request_id = request.request_id;
+      completed.content = std::to_string(getpid());
+      emit(completed);
+      continue;
+    }
+    if (request.task == "runner-pair-a" || request.task == "runner-pair-b") {
+      paired_requests.push_back(request);
+      if (paired_requests.size() == 2) {
+        for (auto iterator = paired_requests.rbegin();
+             iterator != paired_requests.rend(); ++iterator) {
+          zed::subagents::WorkerEvent completed;
+          completed.type = zed::subagents::WorkerEventType::completed;
+          completed.request_id = iterator->request_id;
+          completed.content = iterator->task;
+          emit(completed);
+        }
+        paired_requests.clear();
+      }
+      continue;
+    }
+    if (request.task == "runner-failed") {
+      zed::subagents::WorkerEvent failed;
+      failed.type = zed::subagents::WorkerEventType::failed;
+      failed.request_id = request.request_id;
+      failed.error = "fixture worker failure";
+      failed.usage = {7, 1, 2};
+      emit(failed);
+      continue;
+    }
+    if (request.task == "runner-no-terminal" || request.task == "runner-slow")
+      continue;
+    if (request.task == "runner-nonzero") {
+      std::cerr << "safe fixture diagnostic\n" << std::flush;
+      _exit(7);
+    }
+    if (request.task == "runner-sensitive-stderr") {
+      std::cerr << "Authorization: supersecret\n" << std::flush;
+      _exit(7);
+    }
+    if (request.task == "runner-stderr-large") {
+      std::cerr << std::string(1024, 'd') << std::flush;
+      _exit(7);
+    }
+    if (request.task == "runner-malformed") {
+      std::cout << "not-json\n" << std::flush;
+      continue;
+    }
+    if (request.task == "runner-oversized") {
+      zed::subagents::WorkerEvent completed;
+      completed.type = zed::subagents::WorkerEventType::completed;
+      completed.request_id = request.request_id;
+      completed.content.assign(zed::subagents::kMaximumFinalOutputBytes + 1,
+                               'x');
+      emit(completed);
+      continue;
+    }
+    emit({zed::subagents::WorkerEventType::failed,
+          request.request_id,
           {},
-          "read",
-          "inspect runner fixture"});
-    zed::subagents::WorkerEvent completed;
-    completed.type = zed::subagents::WorkerEventType::completed;
-    completed.content = "runner result";
-    completed.usage = {11, 2, 3};
-    emit(completed);
-    return 0;
+          {},
+          {},
+          {},
+          "unknown fake task"});
   }
-  if (request.value().task == "runner-failed") {
-    zed::subagents::WorkerEvent failed;
-    failed.type = zed::subagents::WorkerEventType::failed;
-    failed.error = "fixture worker failure";
-    failed.usage = {7, 1, 2};
-    emit(failed);
-    return 0;
-  }
-  if (request.value().task == "runner-no-terminal")
-    return 0;
-  if (request.value().task == "runner-nonzero") {
-    std::cerr << "safe fixture diagnostic\n";
-    return 7;
-  }
-  if (request.value().task == "runner-sensitive-stderr") {
-    std::cerr << "Authorization: supersecret\n";
-    return 7;
-  }
-  if (request.value().task == "runner-stderr-large") {
-    std::cerr << std::string(1024, 'd');
-    return 7;
-  }
-  if (request.value().task == "runner-malformed") {
-    std::cout << "not-json\n" << std::flush;
-    return 0;
-  }
-  if (request.value().task == "runner-oversized") {
-    zed::subagents::WorkerEvent completed;
-    completed.type = zed::subagents::WorkerEventType::completed;
-    completed.content.assign(zed::subagents::kMaximumFinalOutputBytes + 1, 'x');
-    emit(completed);
-    return 0;
-  }
-  if (request.value().task == "runner-slow") {
-    std::this_thread::sleep_for(2s);
-    return 0;
-  }
-  emit({zed::subagents::WorkerEventType::failed,
-        {},
-        {},
-        {},
-        {},
-        "unknown fake task"});
   return 0;
 }
 
 void test_protocol() {
   const auto encoded = zed::subagents::serialize_worker_request(
-      {"explorer", "inspect the project"});
-  const auto decoded = zed::subagents::parse_worker_request(encoded);
+      {"request-1", "explorer", "inspect the project"});
+  const auto decoded = zed::subagents::parse_worker_command(encoded);
   assert(decoded);
-  assert(decoded.value().agent == "explorer");
-  assert(decoded.value().task == "inspect the project");
-  assert(!zed::subagents::parse_worker_request(
-      R"({"version":1,"agent":"explorer","task":"x","extra":true})"));
-  assert(!zed::subagents::parse_worker_request(
-      R"({"version":2,"agent":"explorer","task":"x"})"));
-  assert(!zed::subagents::parse_worker_request(
-      R"({"version":1,"agent":"explorer","task":"   "})"));
+  assert(decoded.value().type == zed::subagents::WorkerCommandType::run);
+  assert(decoded.value().request.request_id == "request-1");
+  assert(decoded.value().request.agent == "explorer");
+  assert(decoded.value().request.task == "inspect the project");
+  assert(!zed::subagents::parse_worker_command(
+      R"({"version":2,"type":"run","id":"1","agent":"explorer","task":"x","extra":true})"));
+  assert(!zed::subagents::parse_worker_command(
+      R"({"version":1,"type":"run","id":"1","agent":"explorer","task":"x"})"));
+  assert(!zed::subagents::parse_worker_command(
+      R"({"version":2,"type":"run","id":"1","agent":"explorer","task":"   "})"));
+  const auto cancellation = zed::subagents::parse_worker_command(
+      zed::subagents::serialize_worker_cancellation("request-1"));
+  assert(cancellation);
+  assert(cancellation.value().type ==
+         zed::subagents::WorkerCommandType::cancel);
 
   zed::subagents::WorkerEvent completed;
   completed.type = zed::subagents::WorkerEventType::completed;
+  completed.request_id = "request-1";
   completed.content = "done";
   completed.usage = {12, 3, 4};
   const auto parsed = zed::subagents::parse_worker_event(
       zed::subagents::serialize_worker_event(completed));
   assert(parsed);
+  assert(parsed.value().request_id == "request-1");
   assert(parsed.value().content == "done");
   assert(parsed.value().usage.input_tokens == 12);
   assert(!zed::subagents::parse_worker_event(
-      R"({"version":1,"type":"cancelled","extra":true})"));
+      R"({"version":2,"type":"cancelled","id":"1","extra":true})"));
   assert(!zed::subagents::parse_worker_event(
-      R"({"version":1,"type":"completed","content":"x","usage":{"input_tokens":"1","cached_input_tokens":0,"output_tokens":1}})"));
+      R"({"version":2,"type":"completed","id":"1","content":"x","usage":{"input_tokens":"1","cached_input_tokens":0,"output_tokens":1}})"));
 }
 
 void test_registry_and_read_only_tools(const std::filesystem::path &root) {
@@ -461,7 +504,7 @@ void test_tool_orchestration() {
 
 void test_process_runner(const std::filesystem::path &executable,
                          const std::filesystem::path &root) {
-  zed::subagents::ProcessSubagentRunner runner({
+  zed::subagents::WorkerHostRunner runner({
       executable.string(),
       root,
       256 * 1024,
@@ -478,6 +521,27 @@ void test_process_runner(const std::filesystem::path &executable,
   assert(progress.size() == 1);
   assert(progress[0].find("inspect runner fixture") != std::string::npos);
 
+  const auto first_pid = runner.run({"explorer", "runner-pid"}, {}, 2s, {});
+  const auto second_pid = runner.run({"explorer", "runner-pid"}, {}, 2s, {});
+  assert(first_pid && second_pid);
+  assert(first_pid.value().content == second_pid.value().content);
+
+  auto pair_a = std::async(std::launch::async, [&] {
+    return runner.run({"explorer", "runner-pair-a"}, {}, 2s, {});
+  });
+  auto pair_b = std::async(std::launch::async, [&] {
+    return runner.run({"explorer", "runner-pair-b"}, {}, 2s, {});
+  });
+  const auto paired_a = pair_a.get();
+  const auto paired_b = pair_b.get();
+  if (!paired_a)
+    std::cerr << "paired_a failed: " << paired_a.error().message << '\n';
+  if (!paired_b)
+    std::cerr << "paired_b failed: " << paired_b.error().message << '\n';
+  assert(paired_a && paired_b);
+  assert(paired_a.value().content == "runner-pair-a");
+  assert(paired_b.value().content == "runner-pair-b");
+
   const auto failed = runner.run({"explorer", "runner-failed"}, {}, 2s, {});
   assert(failed);
   assert(failed.value().is_error);
@@ -486,10 +550,9 @@ void test_process_runner(const std::filesystem::path &executable,
          std::string::npos);
 
   const auto missing_terminal =
-      runner.run({"explorer", "runner-no-terminal"}, {}, 2s, {});
+      runner.run({"explorer", "runner-no-terminal"}, {}, 75ms, {});
   assert(!missing_terminal);
-  assert(missing_terminal.error().message.find("terminal event") !=
-         std::string::npos);
+  assert(missing_terminal.error().code == ErrorCode::timeout);
 
   const auto nonzero = runner.run({"explorer", "runner-nonzero"}, {}, 2s, {});
   assert(!nonzero);
@@ -506,7 +569,7 @@ void test_process_runner(const std::filesystem::path &executable,
   const auto large_stderr =
       runner.run({"explorer", "runner-stderr-large"}, {}, 2s, {});
   assert(!large_stderr);
-  assert(large_stderr.error().message.find("worker stderr truncated") !=
+  assert(large_stderr.error().message.find("worker host stderr truncated") !=
          std::string::npos);
   assert(large_stderr.error().message.size() < 512);
 
@@ -524,6 +587,9 @@ void test_process_runner(const std::filesystem::path &executable,
   const auto timed_out = runner.run({"explorer", "runner-slow"}, {}, 75ms, {});
   assert(!timed_out);
   assert(timed_out.error().code == ErrorCode::timeout);
+  const auto pid_before_cancel =
+      runner.run({"explorer", "runner-pid"}, {}, 2s, {});
+  assert(pid_before_cancel);
 
   zed::core::CancellationSource cancellation;
   auto future = std::async(std::launch::async, [&] {
@@ -535,13 +601,17 @@ void test_process_runner(const std::filesystem::path &executable,
   const auto cancelled = future.get();
   assert(!cancelled);
   assert(cancelled.error().code == ErrorCode::cancelled);
+  const auto pid_after_cancel =
+      runner.run({"explorer", "runner-pid"}, {}, 2s, {});
+  assert(pid_after_cancel);
+  assert(pid_before_cancel.value().content == pid_after_cancel.value().content);
 }
 
 } // namespace
 
 int main(int argc, char *argv[]) {
-  if (argc == 2 && std::string_view(argv[1]) == "--subagent-worker")
-    return run_fake_worker();
+  if (argc == 2 && std::string_view(argv[1]) == "--subagent-worker-host")
+    return run_fake_worker_host();
 
   const auto root =
       std::filesystem::temp_directory_path() / "zed-subagent-smoke";

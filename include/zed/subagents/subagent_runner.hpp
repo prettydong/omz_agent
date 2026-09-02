@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -36,7 +37,7 @@ public:
       const SubagentProgressCallback &on_progress) = 0;
 };
 
-struct ProcessSubagentRunnerConfig {
+struct WorkerHostRunnerConfig {
   std::string executable;
   std::filesystem::path workspace_root;
   std::size_t max_protocol_output_bytes{256 * 1024};
@@ -44,9 +45,13 @@ struct ProcessSubagentRunnerConfig {
   std::chrono::milliseconds termination_grace{2'000};
 };
 
-class ProcessSubagentRunner final : public SubagentRunner {
+class WorkerHostRunner final : public SubagentRunner {
 public:
-  explicit ProcessSubagentRunner(ProcessSubagentRunnerConfig config);
+  explicit WorkerHostRunner(WorkerHostRunnerConfig config);
+  ~WorkerHostRunner() override;
+
+  WorkerHostRunner(const WorkerHostRunner &) = delete;
+  WorkerHostRunner &operator=(const WorkerHostRunner &) = delete;
 
   core::Result<SubagentRunResult>
   run(const SubagentTask &task, core::CancellationToken cancellation,
@@ -54,7 +59,8 @@ public:
       const SubagentProgressCallback &on_progress) override;
 
 private:
-  ProcessSubagentRunnerConfig config_;
+  class Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 } // namespace zed::subagents

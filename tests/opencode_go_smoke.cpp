@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -33,7 +34,8 @@ struct FixtureServer {
 
 FixtureServer start_server(
     std::string response_body,
-    std::function<void(std::string_view, const nlohmann::json &)> validate) {
+    std::function<void(std::string_view, const nlohmann::json &)> validate,
+    int status = 200) {
   const int server_socket = socket(AF_INET, SOCK_STREAM, 0);
   require(server_socket >= 0);
   int reuse = 1;
@@ -52,7 +54,7 @@ FixtureServer start_server(
   const auto port = ntohs(address.sin_port);
 
   std::thread server([server_socket, response_body = std::move(response_body),
-                      validate = std::move(validate)]() {
+                      validate = std::move(validate), status]() {
     const int client = accept(server_socket, nullptr, nullptr);
     require(client >= 0);
     std::string request;
@@ -84,7 +86,9 @@ FixtureServer start_server(
     const auto body = nlohmann::json::parse(request.substr(body_start + 4));
     validate(std::string_view(request).substr(0, first_line_end), body);
 
-    const std::string response = "HTTP/1.1 200 OK\r\nContent-Type: "
+    const std::string response = "HTTP/1.1 " + std::to_string(status) +
+                                 (status == 200 ? " OK" : " Error") +
+                                 "\r\nContent-Type: "
                                  "text/event-stream\r\nContent-Length: " +
                                  std::to_string(response_body.size()) +
                                  "\r\nConnection: close\r\n\r\n" +
@@ -98,6 +102,34 @@ FixtureServer start_server(
       require(count > 0);
       sent += static_cast<std::size_t>(count);
     }
+    close(client);
+    close(server_socket);
+  });
+  return {port, std::move(server)};
+}
+
+FixtureServer start_stalling_server(std::chrono::milliseconds duration) {
+  const int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+  require(server_socket >= 0);
+  int reuse = 1;
+  require(setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                     sizeof(reuse)) == 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;
+  require(bind(server_socket, reinterpret_cast<const sockaddr *>(&address),
+               sizeof(address)) == 0);
+  socklen_t address_length = sizeof(address);
+  require(getsockname(server_socket, reinterpret_cast<sockaddr *>(&address),
+                      &address_length) == 0);
+  require(listen(server_socket, 1) == 0);
+  const auto port = ntohs(address.sin_port);
+
+  std::thread server([server_socket, duration]() {
+    const int client = accept(server_socket, nullptr, nullptr);
+    require(client >= 0);
+    std::this_thread::sleep_for(duration);
     close(client);
     close(server_socket);
   });
@@ -227,6 +259,56 @@ opencode-go/responses-model
   assert(!invalid_index_response);
   assert(invalid_index_response.error().message.find("index above the limit") !=
          std::string::npos);
+
+  auto unavailable_server = start_server(
+      "upstream unavailable\n", [](std::string_view, const nlohmann::json &) {},
+      503);
+  zed::providers::OpenCodeGoModel unavailable_model({
+      "fixture-key",
+      "http://127.0.0.1:" + std::to_string(unavailable_server.port) + "/v1",
+      5'000,
+      parsed.value(),
+  });
+  const auto unavailable_response = unavailable_model.complete(
+      request_for("chat-model", ReasoningEffort::max), {}, {});
+  unavailable_server.thread.join();
+  assert(!unavailable_response);
+  assert(unavailable_response.error().message.find("status 503") !=
+         std::string::npos);
+
+  auto cancellation_server =
+      start_stalling_server(std::chrono::milliseconds(300));
+  zed::providers::OpenCodeGoModel cancellation_model({
+      "fixture-key",
+      "http://127.0.0.1:" + std::to_string(cancellation_server.port) + "/v1",
+      5'000,
+      parsed.value(),
+  });
+  CancellationSource cancellation;
+  std::thread cancel_request([&cancellation]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    cancellation.cancel();
+  });
+  const auto cancelled_response = cancellation_model.complete(
+      request_for("chat-model", ReasoningEffort::max), {},
+      cancellation.token());
+  cancel_request.join();
+  cancellation_server.thread.join();
+  assert(!cancelled_response);
+  assert(cancelled_response.error().code == ErrorCode::cancelled);
+
+  auto timeout_server = start_stalling_server(std::chrono::milliseconds(300));
+  zed::providers::OpenCodeGoModel timeout_model({
+      "fixture-key",
+      "http://127.0.0.1:" + std::to_string(timeout_server.port) + "/v1",
+      50,
+      parsed.value(),
+  });
+  const auto timeout_response = timeout_model.complete(
+      request_for("chat-model", ReasoningEffort::max), {}, {});
+  timeout_server.thread.join();
+  assert(!timeout_response);
+  assert(timeout_response.error().code == ErrorCode::timeout);
 
   const std::string oversized_line =
       "data: " + std::string(1024 * 1024 + 1, 'x') + "\n";

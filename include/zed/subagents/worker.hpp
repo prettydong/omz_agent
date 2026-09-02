@@ -22,7 +22,7 @@ core::Result<void> register_explorer_tools(core::ToolRegistry &registry,
                                            const app::RuntimeConfig &runtime,
                                            lsp::ClangdClient &clangd);
 
-int run_explorer_worker(std::istream &input, std::ostream &output,
-                        std::ostream &diagnostics);
+int run_worker_host(std::istream &input, std::ostream &output,
+                    std::ostream &diagnostics);
 
 } // namespace zed::subagents

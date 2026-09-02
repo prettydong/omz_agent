@@ -86,6 +86,7 @@ public:
     }
 
     if (on_delta) {
+      on_delta({"checking context", ModelDeltaKind::reasoning});
       on_delta({"done"});
     }
     return Result<AssistantResponse>::success({
@@ -414,6 +415,7 @@ int main() {
   std::vector<ModelUsage> observed_usage;
   std::vector<std::string> observed_tool_purposes;
   std::vector<std::string> observed_tool_updates;
+  std::vector<std::string> observed_reasoning;
   std::optional<ModelUsage> observed_tool_usage;
   const auto result = loop.run("run echo", {}, [&](const AgentEvent &event) {
     if (event.type == AgentEventType::assistant_message &&
@@ -425,6 +427,8 @@ int main() {
     }
     if (event.type == AgentEventType::tool_update)
       observed_tool_updates.push_back(event.text);
+    if (event.type == AgentEventType::reasoning_delta)
+      observed_reasoning.push_back(event.text);
     if (event.type == AgentEventType::tool_result &&
         event.model_usage.has_value()) {
       observed_tool_usage = event.model_usage;
@@ -453,6 +457,7 @@ int main() {
   assert(observed_tool_purposes.size() == 1);
   assert(observed_tool_purposes[0] == "Verify the echo workflow");
   assert(observed_tool_updates.size() == 1);
+  assert(observed_reasoning == std::vector<std::string>{"checking context"});
   assert(observed_tool_updates[0] == "echo is running");
   assert(observed_tool_usage.has_value());
   assert(observed_tool_usage->input_tokens == 3);

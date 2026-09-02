@@ -128,8 +128,14 @@ struct ModelUsage {
   std::optional<ContextTokenBreakdown> context_breakdown;
 };
 
+enum class ModelDeltaKind {
+  output_text,
+  reasoning,
+};
+
 struct ModelDelta {
   std::string text;
+  ModelDeltaKind kind{ModelDeltaKind::output_text};
 };
 
 struct AssistantResponse {

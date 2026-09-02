@@ -14,6 +14,7 @@ namespace zed::core {
 enum class AgentEventType {
   agent_start,
   user_message,
+  reasoning_delta,
   assistant_delta,
   assistant_message,
   tool_start,

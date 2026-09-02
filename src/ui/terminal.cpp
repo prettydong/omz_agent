@@ -39,6 +39,48 @@ using Json = nlohmann::json;
 constexpr std::size_t kMaximumDocumentViewBytes = 16 * 1024 * 1024;
 constexpr std::size_t kMaximumDocumentPages = 128;
 constexpr std::size_t kMaximumDocumentPageBytes = 2 * 1024 * 1024;
+constexpr std::size_t kMaximumThinkingBufferBytes = 4 * 1024;
+
+std::size_t utf8_sequence_size(unsigned char byte) {
+  if (byte <= 0x7FU)
+    return 1;
+  if (byte <= 0xDFU)
+    return 2;
+  if (byte <= 0xEFU)
+    return 3;
+  return 4;
+}
+
+std::uint32_t decode_utf8(std::string_view text, std::size_t offset,
+                          std::size_t size) {
+  const auto first = static_cast<unsigned char>(text[offset]);
+  if (size == 1)
+    return first;
+  std::uint32_t value = first & static_cast<unsigned char>(0x7FU >> size);
+  for (std::size_t index = 1; index < size; ++index) {
+    value = (value << 6U) |
+            (static_cast<unsigned char>(text[offset + index]) & 0x3FU);
+  }
+  return value;
+}
+
+bool is_han_character(std::uint32_t codepoint) {
+  return (codepoint >= 0x3400U && codepoint <= 0x4DBFU) ||
+         (codepoint >= 0x4E00U && codepoint <= 0x9FFFU) ||
+         (codepoint >= 0xF900U && codepoint <= 0xFAFFU) ||
+         (codepoint >= 0x20000U && codepoint <= 0x323AFU);
+}
+
+void cap_thinking_buffer(std::string &text) {
+  if (text.size() <= kMaximumThinkingBufferBytes)
+    return;
+  std::size_t offset = text.size() - kMaximumThinkingBufferBytes;
+  while (offset < text.size() &&
+         (static_cast<unsigned char>(text[offset]) & 0xC0U) == 0x80U) {
+    ++offset;
+  }
+  text.erase(0, offset);
+}
 
 class LayoutBoxCapture final : public ftxui::Node {
 public:
@@ -448,6 +490,7 @@ CommandCompletionInput parse_command_completion_input(std::string_view input) {
 
 ftxui::Element render_activity(TerminalActivity activity,
                                core::ReasoningEffort reasoning_effort,
+                               std::string_view thinking_preview,
                                std::size_t frame, const TerminalTheme &theme) {
   ftxui::Color color;
   switch (activity) {
@@ -467,7 +510,11 @@ ftxui::Element render_activity(TerminalActivity activity,
     color = theme.error;
     break;
   }
-  const auto label = terminal_activity_label(activity, reasoning_effort);
+  auto label = terminal_activity_label(activity, reasoning_effort);
+  if (activity == TerminalActivity::thinking && !thinking_preview.empty()) {
+    label += "  ";
+    label += thinking_preview;
+  }
   if (activity == TerminalActivity::idle) {
     return ftxui::text("○ " + label) | ftxui::bold | ftxui::color(color);
   }
@@ -769,7 +816,7 @@ std::string terminal_activity_label(TerminalActivity activity,
     return "idle";
   case TerminalActivity::thinking:
     return std::string(core::reasoning_effort_name(reasoning_effort)) +
-           " think";
+           " thinking";
   case TerminalActivity::action:
     return "tool";
   case TerminalActivity::stream:
@@ -778,6 +825,59 @@ std::string terminal_activity_label(TerminalActivity activity,
     return "cancel";
   }
   return "idle";
+}
+
+std::string terminal_thinking_preview(std::string_view thinking_text) {
+  const auto sanitized = core::sanitize_utf8(thinking_text).text;
+  std::string normalized;
+  normalized.reserve(sanitized.size());
+  bool previous_space = true;
+  bool contains_han = false;
+  std::vector<std::size_t> character_offsets;
+  for (std::size_t offset = 0; offset < sanitized.size();) {
+    const auto byte = static_cast<unsigned char>(sanitized[offset]);
+    const auto size = utf8_sequence_size(byte);
+    const auto codepoint = decode_utf8(sanitized, offset, size);
+    const bool whitespace = codepoint == ' ' || codepoint == '\t' ||
+                            codepoint == '\n' || codepoint == '\r';
+    if (whitespace) {
+      if (!previous_space) {
+        normalized.push_back(' ');
+        previous_space = true;
+      }
+    } else {
+      character_offsets.push_back(normalized.size());
+      normalized.append(sanitized, offset, size);
+      previous_space = false;
+      contains_han = contains_han || is_han_character(codepoint);
+    }
+    offset += size;
+  }
+  if (!normalized.empty() && normalized.back() == ' ')
+    normalized.pop_back();
+  if (normalized.empty())
+    return {};
+
+  if (contains_han) {
+    if (character_offsets.size() <= 10)
+      return normalized;
+    return normalized.substr(character_offsets[character_offsets.size() - 10]);
+  }
+
+  std::size_t start = normalized.size();
+  for (std::size_t words = 0; words < 5 && start > 0; ++words) {
+    const auto separator = normalized.rfind(' ', start - 1);
+    if (separator == std::string::npos) {
+      start = 0;
+      break;
+    }
+    start = separator;
+    while (start > 0 && normalized[start - 1] == ' ')
+      --start;
+  }
+  if (start > 0 && normalized[start] == ' ')
+    ++start;
+  return normalized.substr(start);
 }
 
 std::string terminal_token_summary(const TerminalTokenMetrics &metrics,
@@ -1006,6 +1106,7 @@ void TerminalTranscript::begin_request(std::string user_input,
   active_direct_command_.reset();
   request_ended_ = false;
   request_error_seen_ = false;
+  thinking_text_.clear();
   activity_ = initial_activity;
   if (initial_activity == TerminalActivity::action) {
     active_direct_command_ =
@@ -1025,6 +1126,12 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
   switch (event.type) {
   case AgentEventType::agent_start:
     activity_ = TerminalActivity::thinking;
+    thinking_text_.clear();
+    break;
+  case AgentEventType::reasoning_delta:
+    activity_ = TerminalActivity::thinking;
+    thinking_text_ += core::sanitize_utf8(event.text).text;
+    cap_thinking_buffer(thinking_text_);
     break;
   case AgentEventType::assistant_delta:
     activity_ = TerminalActivity::stream;
@@ -1072,6 +1179,7 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
     break;
   case AgentEventType::tool_result:
     activity_ = TerminalActivity::thinking;
+    thinking_text_.clear();
     if (event.model_usage.has_value()) {
       token_metrics_.input_tokens += event.model_usage->input_tokens;
       token_metrics_.output_tokens += event.model_usage->output_tokens;
@@ -1106,6 +1214,7 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
     active_direct_command_.reset();
     request_ended_ = true;
     activity_ = TerminalActivity::idle;
+    thinking_text_.clear();
     break;
   case AgentEventType::error:
     if (active_direct_command_.has_value()) {
@@ -1120,6 +1229,7 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
     active_direct_command_.reset();
     request_error_seen_ = true;
     activity_ = TerminalActivity::idle;
+    thinking_text_.clear();
     break;
   default:
     break;
@@ -1208,6 +1318,10 @@ const std::vector<TerminalMessage> &TerminalTranscript::messages() const {
 }
 
 TerminalActivity TerminalTranscript::activity() const { return activity_; }
+
+std::string TerminalTranscript::thinking_preview() const {
+  return terminal_thinking_preview(thinking_text_);
+}
 
 TerminalTokenMetrics TerminalTranscript::token_metrics() const {
   return token_metrics_;
@@ -1351,6 +1465,8 @@ void TerminalRenderer::prompt() {
 void TerminalRenderer::render(const core::AgentEvent &event) {
   using core::AgentEventType;
   switch (event.type) {
+  case AgentEventType::reasoning_delta:
+    break;
   case AgentEventType::assistant_delta:
     if (!event.text.empty()) {
       output_ << event.text << std::flush;
@@ -1587,8 +1703,8 @@ ftxui::Element TerminalApplication::render_page() {
   const bool command_guide_visible =
       command_help != nullptr || !command_suggestions.empty();
   ftxui::Elements footer_elements{
-      render_activity(activity, displayed_reasoning_effort_, spinner_frame,
-                      theme),
+      render_activity(activity, displayed_reasoning_effort_,
+                      transcript_.thinking_preview(), spinner_frame, theme),
       ftxui::filler(),
   };
   if (copy_status_visible) {
@@ -2117,6 +2233,7 @@ void TerminalApplication::submit_line() {
   worker_ = std::thread([this, line = std::string(trimmed_line), cancellation] {
     constexpr auto kFrameInterval = std::chrono::milliseconds(33);
     std::string pending_delta;
+    auto pending_delta_type = core::AgentEventType::assistant_delta;
     auto last_delta_post = std::chrono::steady_clock::time_point{};
     bool delta_posted = false;
 
@@ -2128,16 +2245,19 @@ void TerminalApplication::submit_line() {
     const auto flush_delta = [&] {
       if (pending_delta.empty())
         return;
-      post_event({core::AgentEventType::assistant_delta,
-                  std::exchange(pending_delta, {}), std::nullopt,
-                  std::nullopt});
+      post_event({pending_delta_type, std::exchange(pending_delta, {}),
+                  std::nullopt, std::nullopt});
       last_delta_post = std::chrono::steady_clock::now();
       delta_posted = true;
     };
 
     const auto result = submit_(
         line, cancellation->token(), [&](const core::AgentEvent &event) {
-          if (event.type == core::AgentEventType::assistant_delta) {
+          if (event.type == core::AgentEventType::assistant_delta ||
+              event.type == core::AgentEventType::reasoning_delta) {
+            if (!pending_delta.empty() && event.type != pending_delta_type)
+              flush_delta();
+            pending_delta_type = event.type;
             pending_delta += event.text;
             const auto now = std::chrono::steady_clock::now();
             if (!delta_posted || now - last_delta_post >= kFrameInterval)

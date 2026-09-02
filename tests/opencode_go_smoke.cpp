@@ -167,6 +167,8 @@ opencode-go/responses-model
                                                    ReasoningEffort::automatic));
 
   const std::string chat_events =
+      "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"consider "
+      "carefully\"},\"finish_reason\":null}]}\n\n"
       "data: {\"choices\":[{\"delta\":{\"content\":\"hello "
       "\"},\"finish_reason\":null}]}\n\n"
       "data: "
@@ -195,12 +197,20 @@ opencode-go/responses-model
       parsed.value(),
   });
   std::string chat_streamed;
+  std::string chat_reasoning;
   const auto chat_response = chat_model.complete(
       request_for("chat-model", ReasoningEffort::max),
-      [&](const ModelDelta &delta) { chat_streamed += delta.text; }, {});
+      [&](const ModelDelta &delta) {
+        if (delta.kind == zed::core::ModelDeltaKind::reasoning)
+          chat_reasoning += delta.text;
+        else
+          chat_streamed += delta.text;
+      },
+      {});
   chat_server.thread.join();
   assert(chat_response);
   assert(chat_streamed == "hello world");
+  assert(chat_reasoning == "consider carefully");
   assert(chat_response.value().finish_reason == FinishReason::tool_calls);
   assert(chat_response.value().tool_calls.size() == 1);
   assert(chat_response.value().tool_calls[0].id == "call-chat");
@@ -208,6 +218,43 @@ opencode-go/responses-model
          R"({"purpose":"Read fixture","path":"x.txt"})");
   assert(chat_response.value().usage.input_tokens == 12);
   assert(chat_response.value().usage.cached_input_tokens == 7);
+
+  const std::string responses_events =
+      "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":"
+      "\"inspect context\"}\n\n"
+      "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}"
+      "\n\n"
+      "data: {\"type\":\"response.completed\",\"response\":{\"status\":"
+      "\"completed\",\"usage\":{\"input_tokens\":8,\"output_tokens\":2}}}"
+      "\n\n";
+  auto responses_server =
+      start_server(responses_events, [](std::string_view request_line,
+                                        const nlohmann::json &body) {
+        assert(request_line == "POST /v1/responses HTTP/1.1");
+        assert(body.at("model") == "responses-model");
+      });
+  zed::providers::OpenCodeGoModel responses_model({
+      "fixture-key",
+      "http://127.0.0.1:" + std::to_string(responses_server.port) + "/v1",
+      5'000,
+      parsed.value(),
+  });
+  std::string responses_streamed;
+  std::string responses_reasoning;
+  const auto responses_response = responses_model.complete(
+      request_for("responses-model", ReasoningEffort::xhigh),
+      [&](const ModelDelta &delta) {
+        if (delta.kind == zed::core::ModelDeltaKind::reasoning)
+          responses_reasoning += delta.text;
+        else
+          responses_streamed += delta.text;
+      },
+      {});
+  responses_server.thread.join();
+  assert(responses_response);
+  assert(responses_streamed == "done");
+  assert(responses_reasoning == "inspect context");
+  assert(responses_response.value().content == "done");
 
   const std::string invalid_index_events =
       R"(data: {"choices":[{"delta":{"tool_calls":[{"index":128,"id":"too-large","function":{"name":"read","arguments":"{}"}}]}}]}
@@ -251,12 +298,20 @@ opencode-go/responses-model
       "\"cache_read_input_tokens\":5}}}\n\n"
       "event: content_block_start\ndata: "
       "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{"
-      "\"type\":\"text\",\"text\":\"\"}}\n\n"
+      "\"type\":\"thinking\",\"thinking\":\"\"}}\n\n"
       "event: content_block_delta\ndata: "
       "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":"
-      "\"text_delta\",\"text\":\"done\"}}\n\n"
+      "\"thinking_delta\",\"thinking\":\"分析上下文\"}}\n\n"
       "event: content_block_stop\ndata: "
       "{\"type\":\"content_block_stop\",\"index\":0}\n\n"
+      "event: content_block_start\ndata: "
+      "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{"
+      "\"type\":\"text\",\"text\":\"\"}}\n\n"
+      "event: content_block_delta\ndata: "
+      "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":"
+      "\"text_delta\",\"text\":\"done\"}}\n\n"
+      "event: content_block_stop\ndata: "
+      "{\"type\":\"content_block_stop\",\"index\":1}\n\n"
       "event: message_delta\ndata: "
       "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
       "\"usage\":{\"output_tokens\":3}}\n\n"
@@ -277,8 +332,14 @@ opencode-go/responses-model
       5'000,
       parsed.value(),
   });
+  std::string messages_reasoning;
   const auto messages_response = messages_model.complete(
-      request_for("messages-model", ReasoningEffort::thinking), {}, {});
+      request_for("messages-model", ReasoningEffort::thinking),
+      [&](const ModelDelta &delta) {
+        if (delta.kind == zed::core::ModelDeltaKind::reasoning)
+          messages_reasoning += delta.text;
+      },
+      {});
   messages_server.thread.join();
   assert(messages_response);
   assert(messages_response.value().content == "done");
@@ -286,5 +347,6 @@ opencode-go/responses-model
   assert(messages_response.value().usage.input_tokens == 9);
   assert(messages_response.value().usage.output_tokens == 3);
   assert(messages_response.value().usage.cached_input_tokens == 5);
+  assert(messages_reasoning == "分析上下文");
   return 0;
 }

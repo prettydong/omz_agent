@@ -255,10 +255,15 @@ int main() {
 
   assert(zed::ui::terminal_activity_label(zed::ui::TerminalActivity::thinking,
                                           zed::core::ReasoningEffort::low) ==
-         "low think");
+         "low thinking");
   assert(zed::ui::terminal_activity_label(zed::ui::TerminalActivity::thinking,
                                           zed::core::ReasoningEffort::high) ==
-         "high think");
+         "high thinking");
+  assert(
+      zed::ui::terminal_thinking_preview("one two three four five six seven") ==
+      "three four five six seven");
+  assert(zed::ui::terminal_thinking_preview("甲乙丙丁戊己庚辛壬癸子丑") ==
+         "丙丁戊己庚辛壬癸子丑");
   assert(zed::ui::terminal_activity_label(zed::ui::TerminalActivity::action,
                                           zed::core::ReasoningEffort::low) ==
          "tool");
@@ -509,6 +514,14 @@ int main() {
   transcript.begin_request(
       "This is user text, not Markdown:\n| input | only |\n| --- | --- |");
   assert(transcript.activity() == zed::ui::TerminalActivity::thinking);
+  transcript.append_event({zed::core::AgentEventType::reasoning_delta,
+                           "one two three four ",
+                           {},
+                           {}});
+  transcript.append_event(
+      {zed::core::AgentEventType::reasoning_delta, "five six", {}, {}});
+  assert(transcript.activity() == zed::ui::TerminalActivity::thinking);
+  assert(transcript.thinking_preview() == "two three four five six");
   transcript.append_event({
       zed::core::AgentEventType::assistant_delta,
       "| Name | Value |\n| --- | ---: |\n| alpha |",
@@ -904,6 +917,13 @@ int main() {
 
   std::stringstream fallback_output;
   zed::ui::TerminalRenderer fallback_renderer(fallback_output, {false});
+  fallback_renderer.render({
+      zed::core::AgentEventType::reasoning_delta,
+      "private reasoning",
+      {},
+      {},
+  });
+  assert(fallback_output.str().empty());
   fallback_renderer.render({
       zed::core::AgentEventType::assistant_delta,
       "streamed ",

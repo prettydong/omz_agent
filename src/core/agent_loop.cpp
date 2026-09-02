@@ -365,9 +365,10 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
     auto response = model_.complete(
         request,
         [&](const ModelDelta &delta) {
-          emit({AgentEventType::assistant_delta, delta.text, std::nullopt,
-                std::nullopt},
-               on_event);
+          const auto event_type = delta.kind == ModelDeltaKind::reasoning
+                                      ? AgentEventType::reasoning_delta
+                                      : AgentEventType::assistant_delta;
+          emit({event_type, delta.text, std::nullopt, std::nullopt}, on_event);
         },
         cancellation);
     const auto model_elapsed =

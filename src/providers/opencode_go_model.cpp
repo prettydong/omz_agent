@@ -466,6 +466,12 @@ core::Result<void> process_responses_sse(std::string_view line,
       if (on_delta)
         on_delta({delta->get<std::string>()});
     }
+  } else if (type == "response.reasoning_summary_text.delta" ||
+             type == "response.reasoning_text.delta") {
+    const auto *delta = field(event, "delta");
+    if (delta != nullptr && delta->is_string() && on_delta) {
+      on_delta({delta->get<std::string>(), core::ModelDeltaKind::reasoning});
+    }
   } else if (type == "response.output_item.done") {
     if (const auto *item = field(event, "item"); item != nullptr)
       parse_output_item(*item, response.tool_calls);
@@ -646,6 +652,13 @@ core::Result<void> process_chat_sse(std::string_view line,
         state.response.content += text;
         if (on_delta)
           on_delta({text});
+      }
+      const auto *reasoning = field(*delta, "reasoning_content");
+      if (reasoning == nullptr)
+        reasoning = field(*delta, "reasoning");
+      if (reasoning != nullptr && reasoning->is_string() && on_delta) {
+        on_delta(
+            {reasoning->get<std::string>(), core::ModelDeltaKind::reasoning});
       }
       if (const auto *calls = field(*delta, "tool_calls");
           calls != nullptr && calls->is_array()) {
@@ -836,6 +849,12 @@ core::Result<void> process_messages_sse(std::string_view line,
           state.response.content += value;
           if (on_delta)
             on_delta({value});
+        }
+      } else if (delta_name == "thinking_delta") {
+        if (const auto *thinking = field(*delta, "thinking");
+            thinking != nullptr && thinking->is_string() && on_delta) {
+          on_delta(
+              {thinking->get<std::string>(), core::ModelDeltaKind::reasoning});
         }
       } else if (delta_name == "input_json_delta") {
         if (const auto *partial = field(*delta, "partial_json");

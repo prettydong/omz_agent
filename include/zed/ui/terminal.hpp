@@ -55,6 +55,9 @@ enum class TerminalActivity {
 terminal_activity_label(TerminalActivity activity,
                         core::ReasoningEffort reasoning_effort);
 
+[[nodiscard]] std::string
+terminal_thinking_preview(std::string_view thinking_text);
+
 struct TerminalTokenMetrics {
   core::TokenCount context_tokens{};
   core::TokenCount input_tokens{};
@@ -192,6 +195,7 @@ public:
 
   [[nodiscard]] const std::vector<TerminalMessage> &messages() const;
   [[nodiscard]] TerminalActivity activity() const;
+  [[nodiscard]] std::string thinking_preview() const;
   [[nodiscard]] TerminalTokenMetrics token_metrics() const;
   bool toggle_message_expansion(std::size_t index);
 
@@ -205,6 +209,7 @@ private:
   bool request_ended_{false};
   bool request_error_seen_{false};
   TerminalActivity activity_{TerminalActivity::idle};
+  std::string thinking_text_;
   TerminalTokenMetrics token_metrics_;
 };
 

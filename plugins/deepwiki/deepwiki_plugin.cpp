@@ -2094,6 +2094,12 @@ const ZedaPluginDescriptorV1 kDescriptor{
 
 } // namespace
 
-extern "C" const ZedaPluginDescriptorV1 *zeda_plugin_entry_v1() {
+extern "C" const ZedaPluginDescriptorV1 *zeda_deepwiki_entry_v1() {
   return &kDescriptor;
 }
+
+#if defined(ZEDA_DEEPWIKI_DYNAMIC_ENTRY)
+extern "C" const ZedaPluginDescriptorV1 *zeda_plugin_entry_v1() {
+  return zeda_deepwiki_entry_v1();
+}
+#endif

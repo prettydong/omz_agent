@@ -12,6 +12,7 @@
 #include "zed/core/tool_registry.hpp"
 #include "zed/extensions/extension_registry.hpp"
 #include "zed/lsp/clangd_client.hpp"
+#include "zed/plugins/plugin_sdk.h"
 
 namespace zed::plugins {
 
@@ -39,12 +40,18 @@ struct PluginStatus {
   std::string detail;
 };
 
+struct BuiltinPlugin {
+  const ZedaPluginDescriptorV1 *descriptor{};
+  std::filesystem::path resource_path;
+};
+
 struct PluginManagerConfig {
   std::filesystem::path workspace_root;
   std::vector<std::filesystem::path> search_paths;
   core::ModelRef model;
   core::ReasoningEffort reasoning_effort{core::ReasoningEffort::low};
   std::size_t max_output_bytes{256 * 1024};
+  std::vector<BuiltinPlugin> builtin_plugins;
 };
 
 [[nodiscard]] std::vector<std::filesystem::path> default_plugin_search_paths();

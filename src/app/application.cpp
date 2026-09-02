@@ -20,6 +20,9 @@
 #include "zed/extensions/quick_bash_input.hpp"
 #include "zed/lsp/clangd_client.hpp"
 #include "zed/plugins/plugin_manager.hpp"
+#if defined(ZEDA_STATIC_DEEPWIKI)
+#include "zed/plugins/deepwiki.hpp"
+#endif
 #include "zed/providers/opencode_go_model.hpp"
 #include "zed/session/jsonl_session_store.hpp"
 #include "zed/skills/skill_registry.hpp"
@@ -44,6 +47,20 @@ std::string subagent_worker_executable(std::string_view argument_zero) {
   auto canonical = std::filesystem::weakly_canonical(absolute, error);
   return error ? absolute.string() : canonical.string();
 }
+
+#if defined(ZEDA_STATIC_DEEPWIKI)
+std::filesystem::path bundled_deepwiki_resources(
+    const std::vector<std::filesystem::path> &plugin_search_paths) {
+  std::error_code error;
+  for (const auto &root : plugin_search_paths) {
+    const auto candidate = root / "deepwiki" / "resources";
+    if (std::filesystem::is_directory(candidate, error) && !error)
+      return candidate;
+    error.clear();
+  }
+  return {};
+}
+#endif
 
 zed::core::Result<zed::tools::SubagentTool *>
 register_builtin_tools(zed::core::ToolRegistry &tools,
@@ -276,11 +293,21 @@ int run_application(std::string_view executable, std::string_view version) {
 
   zed::core::AgentLoop loop(model, tools, session, context, loop_config);
   zed::extensions::ExtensionRegistry extensions;
-  zed::plugins::PluginManager plugins(
-      {runtime_config.workspace, zed::plugins::default_plugin_search_paths(),
-       active_model, active_reasoning_effort,
-       runtime_config.tool_limits.max_command_output_bytes},
-      extensions, tools, model, clangd);
+  auto plugin_search_paths = zed::plugins::default_plugin_search_paths();
+  zed::plugins::PluginManagerConfig plugin_config{
+      runtime_config.workspace,
+      plugin_search_paths,
+      active_model,
+      active_reasoning_effort,
+      runtime_config.tool_limits.max_command_output_bytes,
+      {}};
+#if defined(ZEDA_STATIC_DEEPWIKI)
+  plugin_config.builtin_plugins.push_back(
+      {zeda_deepwiki_entry_v1(),
+       bundled_deepwiki_resources(plugin_search_paths)});
+#endif
+  zed::plugins::PluginManager plugins(std::move(plugin_config), extensions,
+                                      tools, model, clangd);
   BuiltinCommandRegistrar command_registrar(
       extensions, runtime_config, model_catalog, built_in_agents,
       subagent_tool_handle, tools, configure_web, skills, active_skill,

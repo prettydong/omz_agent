@@ -14,6 +14,9 @@
 #include "zed/core/tool_registry.hpp"
 #include "zed/extensions/extension_registry.hpp"
 #include "zed/lsp/clangd_client.hpp"
+#if defined(ZED_TEST_STATIC_DEEPWIKI)
+#include "zed/plugins/deepwiki.hpp"
+#endif
 #include "zed/plugins/plugin_manager.hpp"
 
 namespace {
@@ -81,6 +84,22 @@ void write_fixture(const std::filesystem::path &workspace,
   readme << "# Fixture\n";
 }
 
+zed::plugins::PluginManagerConfig
+deepwiki_plugin_config(const std::filesystem::path &workspace) {
+  zed::plugins::PluginManagerConfig config;
+  config.workspace_root = workspace;
+  config.model = {"fake", "fake"};
+  config.reasoning_effort = zed::core::ReasoningEffort::low;
+#if defined(ZED_TEST_STATIC_DEEPWIKI)
+  config.builtin_plugins.push_back(
+      {zeda_deepwiki_entry_v1(),
+       std::filesystem::path(ZED_TEST_PLUGIN_ROOT) / "resources"});
+#else
+  config.search_paths = {ZED_TEST_PLUGIN_ROOT};
+#endif
+  return config;
+}
+
 } // namespace
 
 int main() {
@@ -93,10 +112,7 @@ int main() {
   zed::extensions::ExtensionRegistry extensions;
   zed::lsp::ClangdClient clangd({workspace, "/usr/bin/false", {}});
   {
-    zed::plugins::PluginManager manager({workspace,
-                                         {ZED_TEST_PLUGIN_ROOT},
-                                         {"fake", "fake"},
-                                         zed::core::ReasoningEffort::low},
+    zed::plugins::PluginManager manager(deepwiki_plugin_config(workspace),
                                         extensions, tools, model, clangd);
     assert(manager.discover_and_load());
     assert(manager.statuses().size() == 1);
@@ -257,11 +273,8 @@ int main() {
     zed::core::ToolRegistry reopened_tools;
     zed::extensions::ExtensionRegistry reopened_extensions;
     zed::plugins::PluginManager reopened_manager(
-        {workspace,
-         {ZED_TEST_PLUGIN_ROOT},
-         {"fake", "fake"},
-         zed::core::ReasoningEffort::low},
-        reopened_extensions, reopened_tools, model, clangd);
+        deepwiki_plugin_config(workspace), reopened_extensions, reopened_tools,
+        model, clangd);
     assert(reopened_manager.discover_and_load());
     const auto opened = reopened_extensions.execute("deepwiki", "open");
     assert(opened);
@@ -292,11 +305,8 @@ int main() {
            return zed::core::Result<std::string>::success("reserved");
          }}));
     zed::plugins::PluginManager duplicate_manager(
-        {workspace,
-         {ZED_TEST_PLUGIN_ROOT},
-         {"fake", "fake"},
-         zed::core::ReasoningEffort::low},
-        duplicate_extensions, duplicate_tools, model, clangd);
+        deepwiki_plugin_config(workspace), duplicate_extensions,
+        duplicate_tools, model, clangd);
     assert(duplicate_manager.discover_and_load());
     assert(!duplicate_manager.statuses().front().loaded);
     assert(duplicate_manager.statuses().front().detail.find("conflict") !=

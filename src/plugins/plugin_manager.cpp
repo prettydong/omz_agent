@@ -444,6 +444,34 @@ core::Result<Manifest> read_manifest(const std::filesystem::path &path) {
   }
 }
 
+core::Result<Manifest> read_builtin(const BuiltinPlugin &builtin) {
+  try {
+    if (builtin.descriptor == nullptr)
+      throw std::runtime_error("descriptor is null");
+    if (builtin.descriptor->abi_version != ZEDA_PLUGIN_ABI_VERSION)
+      throw std::runtime_error("plugin ABI mismatch");
+
+    Manifest manifest;
+    manifest.id = copy_string(builtin.descriptor->id);
+    manifest.name = copy_string(builtin.descriptor->name);
+    manifest.version = copy_string(builtin.descriptor->version);
+    manifest.abi_version = builtin.descriptor->abi_version;
+    manifest.manifest_path =
+        std::filesystem::path("<builtin:" + manifest.id + ">");
+    manifest.resource_path =
+        std::filesystem::weakly_canonical(builtin.resource_path);
+    if (!valid_plugin_id(manifest.id))
+      throw std::runtime_error("id contains unsupported characters");
+    if (manifest.name.empty() || manifest.version.empty())
+      throw std::runtime_error("name and version must be non-empty");
+    return core::Result<Manifest>::success(std::move(manifest));
+  } catch (const std::exception &exception) {
+    return core::Result<Manifest>::failure(
+        {ErrorCode::invalid_argument,
+         "invalid built-in plugin: " + std::string(exception.what())});
+  }
+}
+
 core::Result<void>
 add_manifest_candidate(const std::filesystem::path &root,
                        const std::filesystem::path &candidate,
@@ -765,6 +793,7 @@ public:
     Manifest manifest;
     std::size_t status_index{};
     bool processed{false};
+    const ZedaPluginDescriptorV1 *builtin_descriptor{};
   };
 
   Impl(PluginManagerConfig config, extensions::ExtensionRegistry &extensions,
@@ -800,6 +829,33 @@ public:
     statuses_.clear();
     std::vector<Candidate> candidates;
     std::unordered_map<std::string, std::size_t> winners;
+    for (const auto &builtin : config_.builtin_plugins) {
+      PluginStatus status;
+      auto manifest = read_builtin(builtin);
+      if (!manifest) {
+        status.state = PluginState::failed;
+        status.detail = manifest.error().message;
+        statuses_.push_back(std::move(status));
+        continue;
+      }
+
+      status.id = manifest.value().id;
+      status.name = manifest.value().name;
+      status.version = manifest.value().version;
+      status.manifest_path = manifest.value().manifest_path;
+      if (winners.contains(manifest.value().id)) {
+        status.state = PluginState::failed;
+        status.detail = "duplicate built-in plugin id: " + manifest.value().id;
+        statuses_.push_back(std::move(status));
+        continue;
+      }
+
+      const auto status_index = statuses_.size();
+      statuses_.push_back(std::move(status));
+      winners.emplace(manifest.value().id, candidates.size());
+      candidates.push_back({std::move(manifest.value()), status_index, false,
+                            builtin.descriptor});
+    }
     for (const auto &path : files.value()) {
       PluginStatus status;
       status.manifest_path = path;
@@ -828,7 +884,7 @@ public:
       const auto status_index = statuses_.size();
       statuses_.push_back(std::move(status));
       winners.emplace(manifest.value().id, candidates.size());
-      candidates.push_back({manifest.value(), status_index, false});
+      candidates.push_back({manifest.value(), status_index, false, nullptr});
     }
 
     bool made_progress = true;
@@ -850,7 +906,8 @@ public:
         if (!ready)
           continue;
         candidate.processed = true;
-        load(candidate.manifest, candidate.status_index);
+        load(candidate.manifest, candidate.status_index,
+             candidate.builtin_descriptor);
         made_progress = true;
       }
     }
@@ -1012,7 +1069,8 @@ public:
     return core::Result<void>::success();
   }
 
-  void load(const Manifest &manifest, std::size_t status_index) {
+  void load(const Manifest &manifest, std::size_t status_index,
+            const ZedaPluginDescriptorV1 *builtin_descriptor) {
     auto &status = statuses_[status_index];
     status.state = PluginState::loading;
     status.detail = "loading";
@@ -1029,24 +1087,27 @@ public:
     auto plugin = std::make_unique<LoadedPlugin>();
     plugin->manifest = manifest;
     plugin->status_index = status_index;
-    plugin->library.reset(
-        dlopen(plugin->manifest.library_path.c_str(), RTLD_NOW | RTLD_LOCAL));
-    if (!plugin->library) {
-      const char *load_error = dlerror();
-      fail("cannot load plugin library: " +
-           std::string(load_error == nullptr ? "unknown error" : load_error));
-      return;
-    }
-    const auto entry = reinterpret_cast<ZedaPluginEntryV1>(
-        dlsym(plugin->library.get(), ZEDA_PLUGIN_ENTRY_SYMBOL));
-    if (entry == nullptr) {
-      fail("plugin entry symbol is missing");
-      return;
-    }
-    try {
-      plugin->descriptor = entry();
-    } catch (...) {
-      plugin->descriptor = nullptr;
+    plugin->descriptor = builtin_descriptor;
+    if (plugin->descriptor == nullptr) {
+      plugin->library.reset(
+          dlopen(plugin->manifest.library_path.c_str(), RTLD_NOW | RTLD_LOCAL));
+      if (!plugin->library) {
+        const char *load_error = dlerror();
+        fail("cannot load plugin library: " +
+             std::string(load_error == nullptr ? "unknown error" : load_error));
+        return;
+      }
+      const auto entry = reinterpret_cast<ZedaPluginEntryV1>(
+          dlsym(plugin->library.get(), ZEDA_PLUGIN_ENTRY_SYMBOL));
+      if (entry == nullptr) {
+        fail("plugin entry symbol is missing");
+        return;
+      }
+      try {
+        plugin->descriptor = entry();
+      } catch (...) {
+        plugin->descriptor = nullptr;
+      }
     }
     bool descriptor_matches = false;
     try {

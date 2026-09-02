@@ -29,6 +29,15 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(ftxui)
 
 option(ZEDA_BUILD_DEEPWIKI_PLUGIN "Build the bundled DeepWiki plugin" ON)
+set(ZEDA_DEEPWIKI_LINKAGE "STATIC" CACHE STRING
+    "Linkage for the bundled DeepWiki plugin: STATIC or SHARED")
+set_property(CACHE ZEDA_DEEPWIKI_LINKAGE PROPERTY STRINGS STATIC SHARED)
+string(TOUPPER "${ZEDA_DEEPWIKI_LINKAGE}" ZEDA_DEEPWIKI_LINKAGE_NORMALIZED)
+if (NOT ZEDA_DEEPWIKI_LINKAGE_NORMALIZED STREQUAL "STATIC" AND
+        NOT ZEDA_DEEPWIKI_LINKAGE_NORMALIZED STREQUAL "SHARED")
+    message(FATAL_ERROR
+        "ZEDA_DEEPWIKI_LINKAGE must be STATIC or SHARED")
+endif()
 
 set(ZEDA_DEFAULT_SYSTEM_PROMPT_FILE
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/zed_system_propmt.md)
@@ -202,20 +211,32 @@ elseif (MSVC)
 endif()
 
 if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
-    add_library(zeda_deepwiki SHARED
+    add_library(zeda_deepwiki ${ZEDA_DEEPWIKI_LINKAGE_NORMALIZED}
         plugins/deepwiki/deepwiki_plugin.cpp
     )
     target_include_directories(zeda_deepwiki PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
+    # DeepWiki only serves an uncompressed loopback HTTP endpoint. Include the
+    # header directly so this plugin does not inherit cpp-httplib's optional
+    # TLS and compression dependencies from httplib::httplib.
+    target_include_directories(zeda_deepwiki SYSTEM PRIVATE
+        ${cpp_httplib_SOURCE_DIR}
+    )
     target_link_libraries(zeda_deepwiki PRIVATE
-        httplib::httplib
         nlohmann_json::nlohmann_json
         SQLite::SQLite3
     )
-    set_target_properties(zeda_deepwiki PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins/deepwiki
-    )
+    if (ZEDA_DEEPWIKI_LINKAGE_NORMALIZED STREQUAL "STATIC")
+        target_compile_definitions(zeda PRIVATE ZEDA_STATIC_DEEPWIKI=1)
+        target_link_libraries(zeda PRIVATE zeda_deepwiki)
+    else()
+        target_compile_definitions(zeda_deepwiki PRIVATE
+            ZEDA_DEEPWIKI_DYNAMIC_ENTRY=1)
+        set_target_properties(zeda_deepwiki PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins/deepwiki
+        )
+    endif()
     if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(zeda_deepwiki PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
@@ -230,11 +251,15 @@ if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
         ${ZEDA_DEEPWIKI_BUILD_RESOURCES}/vendor
         ${ZEDA_DEEPWIKI_BUILD_RESOURCES}/licenses
     )
-    configure_file(
-        plugins/deepwiki/zeda-plugin.json.in
-        ${ZEDA_DEEPWIKI_BUILD_ROOT}/zeda-plugin.json
-        @ONLY
-    )
+    if (ZEDA_DEEPWIKI_LINKAGE_NORMALIZED STREQUAL "SHARED")
+        configure_file(
+            plugins/deepwiki/zeda-plugin.json.in
+            ${ZEDA_DEEPWIKI_BUILD_ROOT}/zeda-plugin.json
+            @ONLY
+        )
+    else()
+        file(REMOVE ${ZEDA_DEEPWIKI_BUILD_ROOT}/zeda-plugin.json)
+    endif()
     file(COPY
         plugins/deepwiki/web/index.html
         plugins/deepwiki/web/app.js
@@ -272,10 +297,12 @@ install(FILES ${ZEDA_DEFAULT_SYSTEM_PROMPT_FILE}
 install(FILES include/zed/plugins/plugin_sdk.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/zeda)
 if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
-    install(TARGETS zeda_deepwiki
-            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/zeda/plugins/deepwiki)
-    install(FILES ${ZEDA_DEEPWIKI_BUILD_ROOT}/zeda-plugin.json
-            DESTINATION ${CMAKE_INSTALL_LIBDIR}/zeda/plugins/deepwiki)
+    if (ZEDA_DEEPWIKI_LINKAGE_NORMALIZED STREQUAL "SHARED")
+        install(TARGETS zeda_deepwiki
+                LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/zeda/plugins/deepwiki)
+        install(FILES ${ZEDA_DEEPWIKI_BUILD_ROOT}/zeda-plugin.json
+                DESTINATION ${CMAKE_INSTALL_LIBDIR}/zeda/plugins/deepwiki)
+    endif()
     install(DIRECTORY ${ZEDA_DEEPWIKI_BUILD_RESOURCES}/
             DESTINATION ${CMAKE_INSTALL_LIBDIR}/zeda/plugins/deepwiki/resources)
 endif()
@@ -396,8 +423,23 @@ if (BUILD_TESTING)
             ZED_TEST_PLUGIN_ROOT="${CMAKE_BINARY_DIR}/plugins/deepwiki"
             ZED_TEST_FAULTY_PLUGIN_ROOT="${ZEDA_FAULTY_PLUGIN_ROOT}"
         )
-        add_dependencies(zed_plugin_smoke zeda_deepwiki zed_faulty_plugin)
+        if (ZEDA_DEEPWIKI_LINKAGE_NORMALIZED STREQUAL "STATIC")
+            target_compile_definitions(zed_plugin_smoke PRIVATE
+                ZED_TEST_STATIC_DEEPWIKI=1)
+            target_link_libraries(zed_plugin_smoke PRIVATE zeda_deepwiki)
+        endif()
+        add_dependencies(zed_plugin_smoke zed_faulty_plugin)
         add_test(NAME zed_plugin_smoke COMMAND zed_plugin_smoke)
+
+        if (ZEDA_DEEPWIKI_LINKAGE_NORMALIZED STREQUAL "SHARED")
+            add_dependencies(zed_plugin_smoke zeda_deepwiki)
+            add_test(
+                NAME zeda_deepwiki_link_dependencies
+                COMMAND ${CMAKE_COMMAND}
+                    "-DPLUGIN_FILE=$<TARGET_FILE:zeda_deepwiki>"
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/deepwiki_link_dependencies.cmake
+            )
+        endif()
     endif()
 
     find_program(ZED_TEST_CLANGD_EXECUTABLE NAMES clangd)

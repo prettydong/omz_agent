@@ -32,7 +32,7 @@ zeda 的本机插件使用版本化 C ABI。当前运行时借鉴了 DeepSeek Ha
 
 ```text
 discovered -> loading -> active -> unloading -> disposed
-                  |         
+                  |
                   +-> failed
 
 discovered -> pending

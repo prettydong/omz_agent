@@ -16,15 +16,6 @@ namespace zed::core {
 
 namespace {
 
-constexpr std::string_view kDeferredActionCorrection =
-    "The previous attempt stopped at a progress update without taking the "
-    "promised action. Do not provide another progress update. Use the tools "
-    "now "
-    "to complete and verify the current request. If action is impossible, give "
-    "the exact blocker instead of promising future work.";
-
-constexpr std::size_t kMaxDeferredActionRetries = 1;
-
 TokenCount estimated_tokens(std::size_t bytes) {
   return static_cast<TokenCount>((bytes + 3) / 4);
 }
@@ -137,48 +128,6 @@ Result<void> validate_tool_calls(const std::vector<ToolCall> &calls) {
     }
   }
   return Result<void>::success();
-}
-
-std::string trim_ascii(std::string value) {
-  const auto is_space = [](unsigned char character) {
-    return std::isspace(character) != 0;
-  };
-  const auto begin = std::find_if_not(value.begin(), value.end(), is_space);
-  const auto end =
-      std::find_if_not(value.rbegin(), value.rend(), is_space).base();
-  if (begin >= end)
-    return {};
-  return std::string(begin, end);
-}
-
-std::string lowercase_ascii(std::string value) {
-  std::transform(value.begin(), value.end(), value.begin(),
-                 [](unsigned char character) {
-                   return static_cast<char>(std::tolower(character));
-                 });
-  return value;
-}
-
-bool looks_like_deferred_action(std::string_view content) {
-  constexpr std::size_t kMaxProgressUpdateBytes = 512;
-  const auto trimmed = trim_ascii(std::string(content));
-  if (trimmed.empty() || trimmed.size() > kMaxProgressUpdateBytes)
-    return false;
-
-  static constexpr std::string_view kMarkers[] = {
-      "正在构建",      "正在生成",      "正在创建",     "正在处理",
-      "正在修改",      "马上就好",      "请稍等",       "稍等一下",
-      "马上开始",      "现在开始",      "接下来我会",   "我现在就",
-      "继续完成",      "working on it", "i'm working",  "i am working",
-      "i'll start",    "i will start",  "let me start", "i'll now",
-      "i will now",    "starting now",  "i'm building", "i am building",
-      "be right back",
-  };
-  const auto normalized = lowercase_ascii(trimmed);
-  return std::any_of(std::begin(kMarkers), std::end(kMarkers),
-                     [&](std::string_view marker) {
-                       return normalized.find(marker) != std::string::npos;
-                     });
 }
 
 std::optional<Error>
@@ -312,7 +261,6 @@ Result<std::string>
 AgentLoop::run_active_turn(CancellationToken cancellation,
                            AgentEventCallback on_event,
                            const std::string &additional_system_prompt) {
-  std::size_t deferred_action_retries = 0;
   for (std::size_t turn = 0; turn < config_.max_turns; ++turn) {
     if (cancellation.is_cancelled()) {
       const auto error = cancelled_error();
@@ -335,10 +283,6 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
     if (!additional_system_prompt.empty()) {
       system_prompt += "\n\n";
       system_prompt += additional_system_prompt;
-    }
-    if (deferred_action_retries > 0) {
-      system_prompt += "\n\n";
-      system_prompt += kDeferredActionCorrection;
     }
     context_messages.push_back({"zeda-agent-system",
                                 Role::system,
@@ -413,25 +357,6 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
       return Result<std::string>::failure(valid_tool_calls.error());
     }
 
-    if (response.value().tool_calls.empty() &&
-        looks_like_deferred_action(response.value().content)) {
-      emit({AgentEventType::assistant_message, response.value().content,
-            std::nullopt, std::nullopt, response.value().usage},
-           on_event);
-      if (deferred_action_retries >= kMaxDeferredActionRetries) {
-        const Error error{
-            ErrorCode::model_error,
-            "model repeatedly stopped after a progress update without taking "
-            "the promised action",
-        };
-        emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
-             on_event);
-        return Result<std::string>::failure(error);
-      }
-      ++deferred_action_retries;
-      continue;
-    }
-
     Message assistant_message{
         next_id("assistant"),        Role::assistant, response.value().content,
         response.value().tool_calls, std::nullopt,
@@ -489,6 +414,8 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
           tool_result.content,      {},
           tool_result.tool_call_id, tool_result.is_error,
       };
+      tool_message.content = bound_tool_output(std::move(tool_message.content));
+      tool_result.content = tool_message.content;
       const auto append_tool = session_.append(tool_message);
       if (!append_tool) {
         emit({AgentEventType::error, append_tool.error().message, std::nullopt,

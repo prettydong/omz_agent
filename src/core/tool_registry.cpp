@@ -66,6 +66,29 @@ Result<Json> schema_with_purpose(const ToolDefinition &definition) {
 
 } // namespace
 
+std::string bound_tool_output(std::string content) {
+  constexpr std::string_view marker = "\n[output truncated]";
+  const bool input_truncated = content.size() > kMaxToolOutputBytes;
+  if (input_truncated)
+    content.resize(kMaxToolOutputBytes);
+  auto sanitized = sanitize_utf8(content);
+  if (sanitized.replacement_count > 0) {
+    sanitized.text += "\n[warning: replaced " +
+                      std::to_string(sanitized.replacement_count) +
+                      " invalid UTF-8 byte(s) in tool output]";
+  }
+  auto result = std::move(sanitized.text);
+  if (input_truncated || result.size() > kMaxToolOutputBytes) {
+    std::size_t end = kMaxToolOutputBytes - marker.size();
+    while (end > 0 &&
+           (static_cast<unsigned char>(result[end]) & 0xc0U) == 0x80U)
+      --end;
+    result.resize(end);
+    result += marker;
+  }
+  return result;
+}
+
 ToolRegistry::ToolRegistry(std::vector<std::string> allowed_tools)
     : allowed_tools_(std::in_place, allowed_tools.begin(),
                      allowed_tools.end()) {}
@@ -249,13 +272,7 @@ ToolRegistry::execute(const ToolCall &call, CancellationToken cancellation,
     return execution;
 
   auto result = std::move(execution.value());
-  auto sanitized = sanitize_utf8(result.content);
-  if (sanitized.replacement_count > 0) {
-    sanitized.text += "\n[warning: replaced " +
-                      std::to_string(sanitized.replacement_count) +
-                      " invalid UTF-8 byte(s) in tool output]";
-  }
-  result.content = std::move(sanitized.text);
+  result.content = bound_tool_output(std::move(result.content));
   return Result<ToolResult>::success(std::move(result));
 }
 

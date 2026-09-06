@@ -7,15 +7,18 @@
 #include "zed/support/unique_fd.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <poll.h>
 #include <signal.h>
 #include <string>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -140,7 +143,8 @@ core::Result<std::string> required_string(const Json &object,
 core::Result<std::size_t> optional_size(const Json &object,
                                         std::string_view name,
                                         std::size_t fallback,
-                                        std::size_t maximum) {
+                                        std::size_t maximum, bool clamp = false,
+                                        bool allow_zero = false) {
   const auto *value = field(object, name);
   if (value == nullptr)
     return core::Result<std::size_t>::success(fallback);
@@ -150,7 +154,7 @@ core::Result<std::size_t> optional_size(const Json &object,
     parsed = value->get<std::uint64_t>();
   } else if (value->is_number_integer()) {
     const auto signed_value = value->get<std::int64_t>();
-    if (signed_value <= 0) {
+    if (signed_value < 0 || (signed_value == 0 && !allow_zero)) {
       return core::Result<std::size_t>::failure({
           ErrorCode::invalid_argument,
           std::string(name) + " must be greater than zero",
@@ -164,13 +168,73 @@ core::Result<std::size_t> optional_size(const Json &object,
     });
   }
 
-  if (parsed == 0 || parsed > maximum) {
+  if ((!allow_zero && parsed == 0) || (!clamp && parsed > maximum)) {
     return core::Result<std::size_t>::failure({
         ErrorCode::invalid_argument,
         std::string(name) + " must be between 1 and " + std::to_string(maximum),
     });
   }
-  return core::Result<std::size_t>::success(static_cast<std::size_t>(parsed));
+  return core::Result<std::size_t>::success(
+      static_cast<std::size_t>(std::min<std::uint64_t>(parsed, maximum)));
+}
+
+// Nonblocking open prevents a FIFO from hanging before its type is checked.
+core::Result<support::UniqueFd>
+open_regular_file(const std::filesystem::path &path) {
+  support::UniqueFd descriptor(
+      open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW));
+  if (!descriptor.valid())
+    return core::Result<support::UniqueFd>::failure(
+        {ErrorCode::tool_error,
+         "cannot open file " + path.string() + ": " + std::strerror(errno)});
+  struct stat status{};
+  if (fstat(descriptor.get(), &status) != 0)
+    return core::Result<support::UniqueFd>::failure(
+        {ErrorCode::tool_error,
+         "cannot inspect file " + path.string() + ": " + std::strerror(errno)});
+  if (!S_ISREG(status.st_mode))
+    return core::Result<support::UniqueFd>::failure(
+        {ErrorCode::tool_error,
+         "cannot read non-regular file: " + path.string()});
+  return core::Result<support::UniqueFd>::success(std::move(descriptor));
+}
+
+struct FileRead {
+  std::string content;
+  bool truncated{};
+};
+
+core::Result<FileRead> read_regular_file(const std::filesystem::path &path,
+                                         std::size_t limit,
+                                         core::CancellationToken cancellation) {
+  auto opened = open_regular_file(path);
+  if (!opened)
+    return core::Result<FileRead>::failure(opened.error());
+  FileRead result;
+  std::array<char, 4096> buffer{};
+  while (true) {
+    if (cancellation.is_cancelled())
+      return core::Result<FileRead>::failure(
+          {ErrorCode::cancelled, "file read cancelled: " + path.string()});
+    const auto remaining = limit - result.content.size();
+    const auto amount =
+        remaining == 0 ? std::size_t{1} : std::min(buffer.size(), remaining);
+    const auto count = read(opened.value().get(), buffer.data(), amount);
+    if (count < 0) {
+      if (errno == EINTR)
+        continue;
+      return core::Result<FileRead>::failure(
+          {ErrorCode::tool_error,
+           "cannot read file " + path.string() + ": " + std::strerror(errno)});
+    }
+    if (count == 0)
+      return core::Result<FileRead>::success(std::move(result));
+    if (remaining == 0) {
+      result.truncated = true;
+      return core::Result<FileRead>::success(std::move(result));
+    }
+    result.content.append(buffer.data(), static_cast<std::size_t>(count));
+  }
 }
 
 bool wildcard_matches(std::string_view pattern, std::string_view text) {
@@ -343,17 +407,12 @@ ReadFileTool::execute(const ToolCall &call,
   if (!resolved)
     return core::Result<ToolResult>::failure(resolved.error());
 
-  std::ifstream input(resolved.value(), std::ios::binary);
-  if (!input)
-    return core::Result<ToolResult>::failure(
-        {ErrorCode::tool_error, "cannot open file: " + path.value()});
-  std::string content;
-  content.resize(limits().max_read_bytes + 1);
-  input.read(content.data(), static_cast<std::streamsize>(content.size()));
-  const auto bytes_read = static_cast<std::size_t>(input.gcount());
-  const bool truncated = bytes_read > limits().max_read_bytes;
-  content.resize(std::min(bytes_read, limits().max_read_bytes));
-  if (truncated)
+  auto read_result = read_regular_file(resolved.value(),
+                                       limits().max_read_bytes, cancellation);
+  if (!read_result)
+    return core::Result<ToolResult>::failure(read_result.error());
+  auto content = std::move(read_result.value().content);
+  if (read_result.value().truncated)
     content += "\n[output truncated]";
   return core::Result<ToolResult>::success(
       {call.id, std::move(content), false});
@@ -451,18 +510,18 @@ BashTool::execute(const ToolCall &call, core::CancellationToken cancellation) {
     working_directory = resolved.value();
   }
   constexpr std::size_t kMaximumTimeoutMs = 24U * 60U * 60U * 1000U;
-  std::size_t timeout_ms = limits().command_timeout_ms;
-  if (const auto *value = field(arguments.value(), "timeout_ms");
-      value != nullptr && value->is_number()) {
-    timeout_ms = static_cast<std::size_t>(std::max(1.0, value->get<double>()));
-  }
-  timeout_ms = std::min(timeout_ms, kMaximumTimeoutMs);
-  std::size_t max_output = limits().max_command_output_bytes;
-  if (const auto *value = field(arguments.value(), "max_output_bytes");
-      value != nullptr && value->is_number()) {
-    max_output = static_cast<std::size_t>(std::max(1.0, value->get<double>()));
-  }
-  max_output = std::min(max_output, limits().max_command_output_bytes);
+  const auto timeout =
+      optional_size(arguments.value(), "timeout_ms",
+                    limits().command_timeout_ms, kMaximumTimeoutMs, true);
+  if (!timeout)
+    return core::Result<ToolResult>::failure(timeout.error());
+  const auto output_limit = optional_size(
+      arguments.value(), "max_output_bytes", limits().max_command_output_bytes,
+      limits().max_command_output_bytes, true);
+  if (!output_limit)
+    return core::Result<ToolResult>::failure(output_limit.error());
+  const auto timeout_ms = timeout.value();
+  const auto max_output = output_limit.value();
 
   auto spawn_lock = support::lock_process_spawn();
   int output_pipe[2];
@@ -591,74 +650,128 @@ GrepTool::execute(const ToolCall &call, core::CancellationToken cancellation) {
       return core::Result<ToolResult>::failure(resolved.error());
     search_root = resolved.value();
   }
-  std::size_t max_results = 100;
-  if (const auto *value = field(arguments.value(), "max_results");
-      value != nullptr && value->is_number()) {
-    max_results = static_cast<std::size_t>(std::max(1.0, value->get<double>()));
-  }
-  std::size_t max_output = limits().max_read_bytes;
-  if (const auto *value = field(arguments.value(), "max_output_bytes");
-      value != nullptr && value->is_number()) {
-    max_output = static_cast<std::size_t>(std::max(1.0, value->get<double>()));
-  }
-
+  const auto result_limit =
+      optional_size(arguments.value(), "max_results", 100, 10'000, true);
+  if (!result_limit)
+    return core::Result<ToolResult>::failure(result_limit.error());
+  const auto output_limit =
+      optional_size(arguments.value(), "max_output_bytes",
+                    limits().max_read_bytes, limits().max_read_bytes, true);
+  if (!output_limit)
+    return core::Result<ToolResult>::failure(output_limit.error());
+  const auto max_results = result_limit.value();
+  const auto max_output = output_limit.value();
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(limits().command_timeout_ms);
+  std::size_t scanned_bytes = 0;
+  std::size_t scanned_entries = 0;
   std::string result;
   std::size_t result_count = 0;
-  std::error_code iterator_error;
-  std::filesystem::recursive_directory_iterator iterator(search_root,
-                                                         iterator_error);
-  if (iterator_error)
+  const auto incomplete = [&](std::string detail) {
+    return core::Result<ToolResult>::success(
+        {call.id, result + "[search incomplete: " + std::move(detail) + "]\n",
+         true});
+  };
+  const auto cancelled = [&] {
     return core::Result<ToolResult>::failure(
-        {ErrorCode::tool_error,
-         "cannot scan path: " + iterator_error.message()});
+        {ErrorCode::cancelled, "grep cancelled"});
+  };
+  std::error_code error;
+  std::filesystem::recursive_directory_iterator iterator(search_root, error);
+  if (error)
+    return incomplete("cannot scan path: " + error.message());
   const auto end = std::filesystem::recursive_directory_iterator{};
-  for (; iterator != end && result_count < max_results;
-       iterator.increment(iterator_error)) {
+  for (; iterator != end; iterator.increment(error)) {
+    if (error)
+      return incomplete("cannot traverse directory: " + error.message());
     if (cancellation.is_cancelled())
-      return core::Result<ToolResult>::failure(
-          {ErrorCode::cancelled, "grep cancelled"});
-    if (iterator_error)
-      break;
-    if (iterator->is_symlink(iterator_error) || iterator_error) {
-      iterator_error.clear();
+      return cancelled();
+    if (std::chrono::steady_clock::now() >= deadline)
+      return incomplete("scan timed out");
+    if (scanned_entries >= limits().max_search_entries)
+      return incomplete("entry limit reached");
+    ++scanned_entries;
+    const auto status = iterator->symlink_status(error);
+    if (error)
+      return incomplete("cannot inspect entry: " + error.message());
+    if (std::filesystem::is_symlink(status))
       continue;
-    }
-    if (iterator->is_directory(iterator_error)) {
-      if (!iterator_error && iterator->path().filename() == ".git")
+    if (std::filesystem::is_directory(status)) {
+      if (iterator->path().filename() == ".git")
         iterator.disable_recursion_pending();
-      iterator_error.clear();
       continue;
     }
-    if (!iterator->is_regular_file(iterator_error) || iterator_error) {
-      iterator_error.clear();
+    if (!std::filesystem::is_regular_file(status))
       continue;
-    }
-    std::ifstream input(iterator->path(), std::ios::binary);
-    if (!input)
-      continue;
+    auto opened = open_regular_file(iterator->path());
+    if (!opened)
+      return incomplete(opened.error().message);
+    const auto relative =
+        iterator->path().lexically_relative(workspace_root()).string();
     std::string line;
     std::size_t line_number = 0;
-    while (std::getline(input, line) && result_count < max_results) {
+    bool output_full = false;
+    const auto finish_line = [&] {
       ++line_number;
-      if (line.find(pattern.value()) == std::string::npos)
-        continue;
-      if (line.find('\0') != std::string::npos || !core::is_valid_utf8(line))
-        continue;
-      const auto relative = std::filesystem::relative(
-          iterator->path(), workspace_root(), iterator_error);
-      const std::string match = relative.string() + ":" +
-                                std::to_string(line_number) + ":" + line + "\n";
-      if (result.size() + match.size() > max_output) {
-        result += "[results truncated]\n";
-        return core::Result<ToolResult>::success(
-            {call.id, std::move(result), false});
+      if (line.find(pattern.value()) != std::string::npos &&
+          line.find('\0') == std::string::npos && core::is_valid_utf8(line)) {
+        const auto match =
+            relative + ":" + std::to_string(line_number) + ":" + line + "\n";
+        if (match.size() > max_output - result.size()) {
+          output_full = true;
+        } else {
+          result += match;
+          ++result_count;
+        }
       }
-      result += match;
-      ++result_count;
+      line.clear();
+    };
+    std::array<char, 4096> buffer{};
+    while (true) {
+      if (cancellation.is_cancelled())
+        return cancelled();
+      if (std::chrono::steady_clock::now() >= deadline)
+        return incomplete("scan timed out");
+      if (scanned_bytes >= limits().max_search_bytes)
+        return incomplete("byte limit reached");
+      const auto amount =
+          std::min(buffer.size(), limits().max_search_bytes - scanned_bytes);
+      const auto count = read(opened.value().get(), buffer.data(), amount);
+      if (count < 0) {
+        if (errno == EINTR)
+          continue;
+        return incomplete("cannot read " + relative + ": " +
+                          std::strerror(errno));
+      }
+      if (count == 0) {
+        if (!line.empty())
+          finish_line();
+        break;
+      }
+      scanned_bytes += static_cast<std::size_t>(count);
+      for (std::size_t index = 0; index < static_cast<std::size_t>(count);
+           ++index) {
+        if (buffer[index] == '\n') {
+          finish_line();
+          if (output_full || result_count >= max_results)
+            break;
+        } else {
+          if (line.size() >= limits().max_read_bytes)
+            return incomplete("line length limit reached in " + relative);
+          line.push_back(buffer[index]);
+        }
+      }
+      if (output_full || result_count >= max_results)
+        break;
+    }
+    if (output_full || result_count >= max_results) {
+      result += "[results truncated]\n";
+      return core::Result<ToolResult>::success(
+          {call.id, std::move(result), false});
     }
   }
-  if (result_count == max_results)
-    result += "[results truncated]\n";
+  if (error)
+    return incomplete("cannot traverse directory: " + error.message());
   return core::Result<ToolResult>::success({call.id, std::move(result), false});
 }
 
@@ -889,23 +1002,23 @@ EditFileTool::execute(const ToolCall &call,
   if (!new_text)
     return core::Result<ToolResult>::failure(new_text.error());
 
-  std::size_t expected = 1;
-  if (const auto *value = field(arguments.value(), "expected_replacements");
-      value != nullptr && value->is_number()) {
-    expected = static_cast<std::size_t>(std::max(0.0, value->get<double>()));
-  }
+  const auto expected_result =
+      optional_size(arguments.value(), "expected_replacements", 1,
+                    std::numeric_limits<std::size_t>::max(), false, true);
+  if (!expected_result)
+    return core::Result<ToolResult>::failure(expected_result.error());
+  const auto expected = expected_result.value();
   const auto resolved = resolve_path(path.value());
   if (!resolved)
     return core::Result<ToolResult>::failure(resolved.error());
-  std::ifstream input(resolved.value(), std::ios::binary);
-  if (!input)
-    return core::Result<ToolResult>::failure(
-        {ErrorCode::tool_error, "cannot open file: " + path.value()});
-  std::string content((std::istreambuf_iterator<char>(input)),
-                      std::istreambuf_iterator<char>());
-  if (content.size() > limits().max_write_bytes)
+  auto read_result = read_regular_file(resolved.value(),
+                                       limits().max_write_bytes, cancellation);
+  if (!read_result)
+    return core::Result<ToolResult>::failure(read_result.error());
+  if (read_result.value().truncated)
     return core::Result<ToolResult>::failure(
         {ErrorCode::tool_error, "file exceeds edit limit"});
+  auto content = std::move(read_result.value().content);
 
   std::size_t count = 0;
   std::size_t position = 0;

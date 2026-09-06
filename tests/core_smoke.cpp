@@ -121,67 +121,50 @@ public:
   }
 };
 
-class DeferredActionModel final : public Model {
-public:
-  Result<AssistantResponse> complete(const ModelRequest &request,
-                                     const StreamCallback &,
-                                     CancellationToken) override {
-    assert(!request.messages.empty());
-    assert(request.messages.front().role == Role::system);
-    ++calls_;
-    if (calls_ == 1) {
-      return Result<AssistantResponse>::success({
-          "正在构建……马上就好",
-          {},
-          FinishReason::stop,
-          {10, 0, 2},
-      });
-    }
-    if (calls_ == 2) {
-      saw_correction_ = request.messages.front().content.find(
-                            "previous attempt stopped") != std::string::npos;
-      return Result<AssistantResponse>::success({
-          {},
-          {{"deferred-call", "echo",
-            R"({"purpose":"Complete the deferred task","text":"done"})"}},
-          FinishReason::tool_calls,
-          {12, 0, 3},
-      });
-    }
-    return Result<AssistantResponse>::success({
-        "implemented and verified",
-        {},
-        FinishReason::stop,
-        {14, 0, 4},
-    });
-  }
-
-  [[nodiscard]] int calls() const { return calls_; }
-  [[nodiscard]] bool saw_correction() const { return saw_correction_; }
-
-private:
-  int calls_{0};
-  bool saw_correction_{false};
-};
-
-class RepeatedDeferredActionModel final : public Model {
+class LiteralAnswerModel final : public Model {
 public:
   Result<AssistantResponse> complete(const ModelRequest &,
                                      const StreamCallback &,
                                      CancellationToken) override {
-    ++calls_;
-    return Result<AssistantResponse>::success({
-        "正在生成，请稍等",
-        {},
-        FinishReason::stop,
-        {},
-    });
+    ++calls;
+    return Result<AssistantResponse>::success(
+        {"working on it 的意思是：正在处理。", {}, FinishReason::stop, {}});
   }
+  int calls{};
+};
 
-  [[nodiscard]] int calls() const { return calls_; }
+class OversizedTool final : public Tool {
+public:
+  const ToolDefinition &definition() const override {
+    static const ToolDefinition definition{"oversized", "Return large output",
+                                           R"({"type":"object"})"};
+    return definition;
+  }
+  Result<ToolResult> execute(const ToolCall &call, CancellationToken) override {
+    return Result<ToolResult>::success(
+        {call.id, std::string(kMaxToolOutputBytes * 2, 'x'), false});
+  }
+};
 
-private:
-  int calls_{0};
+class OversizedModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &request,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    if (calls++ == 0)
+      return Result<AssistantResponse>::success(
+          {{},
+           {{"large", "oversized", R"({"purpose":"test bounded output"})"}},
+           FinishReason::tool_calls,
+           {}});
+    const auto &message = request.messages.back();
+    assert(message.role == Role::tool);
+    assert(message.content.size() <= kMaxToolOutputBytes);
+    assert(message.content.ends_with("[output truncated]"));
+    return Result<AssistantResponse>::success(
+        {"done", {}, FinishReason::stop, {}});
+  }
+  int calls{};
 };
 
 class IncompleteModel final : public Model {
@@ -484,44 +467,55 @@ int main() {
   assert(guarded_history.value().size() == 1);
   assert(guarded_history.value()[0].role == Role::user);
 
-  DeferredActionModel deferred_model;
-  ToolRegistry deferred_tools;
-  assert(deferred_tools.register_tool(std::make_unique<EchoTool>()));
-  InMemorySessionStore deferred_session;
-  BasicContextManager deferred_context(estimator);
-  AgentLoop deferred_loop(deferred_model, deferred_tools, deferred_session,
-                          deferred_context, config);
-  const auto deferred_result = deferred_loop.run("build the project");
-  assert(deferred_result);
-  assert(deferred_result.value() == "implemented and verified");
-  assert(deferred_model.calls() == 3);
-  assert(deferred_model.saw_correction());
-  const auto deferred_history = deferred_session.load();
-  assert(deferred_history);
-  assert(deferred_history.value().size() == 4);
-  assert(deferred_history.value()[0].role == Role::user);
-  assert(deferred_history.value()[1].role == Role::assistant);
-  assert(deferred_history.value()[1].tool_calls.size() == 1);
-  assert(deferred_history.value()[2].role == Role::tool);
-  assert(deferred_history.value()[3].content == "implemented and verified");
+  LiteralAnswerModel literal_model;
+  ToolRegistry literal_tools;
+  InMemorySessionStore literal_session;
+  BasicContextManager literal_context(estimator);
+  AgentLoop literal_loop(literal_model, literal_tools, literal_session,
+                         literal_context, config);
+  const auto literal_result = literal_loop.run("翻译 working on it");
+  assert(literal_result);
+  assert(literal_result.value() == "working on it 的意思是：正在处理。");
+  assert(literal_model.calls == 1);
+  assert(literal_session.load().value().back().content ==
+         literal_result.value());
 
-  RepeatedDeferredActionModel repeated_deferred_model;
-  ToolRegistry repeated_deferred_tools;
-  InMemorySessionStore repeated_deferred_session;
-  BasicContextManager repeated_deferred_context(estimator);
-  AgentLoop repeated_deferred_loop(
-      repeated_deferred_model, repeated_deferred_tools,
-      repeated_deferred_session, repeated_deferred_context, config);
-  const auto repeated_deferred_result =
-      repeated_deferred_loop.run("build the project");
-  assert(!repeated_deferred_result);
-  assert(repeated_deferred_result.error().code == ErrorCode::model_error);
-  assert(repeated_deferred_result.error().message.find("repeatedly stopped") !=
-         std::string::npos);
-  assert(repeated_deferred_model.calls() == 2);
-  const auto repeated_deferred_history = repeated_deferred_session.load();
-  assert(repeated_deferred_history);
-  assert(repeated_deferred_history.value().size() == 1);
+  OversizedModel oversized_model;
+  ToolRegistry oversized_tools;
+  assert(oversized_tools.register_tool(std::make_unique<OversizedTool>()));
+  InMemorySessionStore oversized_session;
+  BasicContextManager oversized_context(estimator);
+  auto oversized_config = config;
+  oversized_config.context_limits.max_context_tokens = 1'000'000;
+  AgentLoop oversized_loop(oversized_model, oversized_tools, oversized_session,
+                           oversized_context, oversized_config);
+  bool saw_bounded_event = false;
+  const auto oversized_result = oversized_loop.run(
+      "test output bounds", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::tool_result) {
+          assert(event.text.size() <= kMaxToolOutputBytes);
+          assert(event.text.ends_with("[output truncated]"));
+          saw_bounded_event = true;
+        }
+      });
+  assert(oversized_result);
+  assert(saw_bounded_event);
+  const auto oversized_history = oversized_session.load();
+  assert(oversized_history);
+  assert(oversized_history.value()[2].content.size() <= kMaxToolOutputBytes);
+  std::string unicode;
+  while (unicode.size() <= kMaxToolOutputBytes)
+    unicode += "中";
+  const auto bounded_unicode = bound_tool_output(unicode);
+  assert(bounded_unicode.size() <= kMaxToolOutputBytes);
+  assert(is_valid_utf8(bounded_unicode));
+  assert(bounded_unicode.ends_with("[output truncated]"));
+  assert(bound_tool_output(std::string(kMaxToolOutputBytes, 'x')).size() ==
+         kMaxToolOutputBytes);
+  const auto invalid_large = bound_tool_output(
+      std::string(kMaxToolOutputBytes, static_cast<char>(0xff)));
+  assert(is_valid_utf8(invalid_large));
+  assert(invalid_large.size() <= kMaxToolOutputBytes);
 
   IncompleteModel incomplete_model;
   ToolRegistry incomplete_tools;

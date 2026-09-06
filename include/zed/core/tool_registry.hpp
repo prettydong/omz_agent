@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -12,6 +14,9 @@
 namespace zed::core {
 
 [[nodiscard]] Result<std::string> tool_call_purpose(const ToolCall &call);
+
+inline constexpr std::size_t kMaxToolOutputBytes = 256 * 1024;
+[[nodiscard]] std::string bound_tool_output(std::string content);
 
 class ToolRegistry {
 public:

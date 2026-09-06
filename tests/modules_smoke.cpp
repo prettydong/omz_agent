@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
@@ -871,6 +872,134 @@ int main() {
   assert(capped_output.value().content.find("[output truncated]") !=
          std::string::npos);
   assert(capped_output.value().content.find("123456789") == std::string::npos);
+
+  // No writer opens this FIFO: a blocking open would hang the regression.
+  const auto fifo_path = root / "read-fifo";
+  assert(mkfifo(fifo_path.c_str(), 0600) == 0);
+  const auto fifo_read = registry.execute(
+      call("fifo-read", "read", R"({"path":"read-fifo"})"), {});
+  assert(!fifo_read);
+  assert(fifo_read.error().message.find("non-regular") != std::string::npos);
+  const auto fifo_edit = registry.execute(
+      call("fifo-edit", "edit",
+           R"({"path":"read-fifo","old_text":"a","new_text":"b"})"),
+      {});
+  assert(!fifo_edit);
+  assert(
+      !registry.execute(call("directory-read", "read", R"({"path":"."})"), {}));
+  CancellationSource cancelled_read;
+  cancelled_read.cancel();
+  assert(registry
+             .execute(call("cancel-read", "read", R"({"path":"read-fifo"})"),
+                      cancelled_read.token())
+             .error()
+             .code == ErrorCode::cancelled);
+
+  for (const auto &invalid :
+       {"1e100", "1.5", "-1", "0", "true", "null", "\"12\""}) {
+    for (const auto &field_name : {"timeout_ms", "max_output_bytes"}) {
+      const auto invalid_bash =
+          registry.execute(call("invalid-bash-number", "bash",
+                                std::string("{\"command\":\"exit 0\",\"") +
+                                    field_name + "\":" + invalid + "}"),
+                           {});
+      assert(!invalid_bash);
+      assert(invalid_bash.error().code == ErrorCode::invalid_argument);
+    }
+    for (const auto &field_name : {"max_results", "max_output_bytes"}) {
+      const auto invalid_grep =
+          registry.execute(call("invalid-grep-number", "grep",
+                                std::string("{\"pattern\":\"x\",\"") +
+                                    field_name + "\":" + invalid + "}"),
+                           {});
+      assert(!invalid_grep);
+      assert(invalid_grep.error().code == ErrorCode::invalid_argument);
+    }
+  }
+  const auto invalid_edit_number = registry.execute(
+      call(
+          "invalid-edit-number", "edit",
+          R"({"path":"read-fifo","old_text":"a","new_text":"b","expected_replacements":1e100})"),
+      {});
+  assert(!invalid_edit_number);
+  assert(invalid_edit_number.error().code == ErrorCode::invalid_argument);
+
+  const auto search_root = root / "bounded-search";
+  std::filesystem::create_directory(search_root);
+  {
+    std::ofstream file(search_root / "text");
+    file << "first match\nlast match";
+  }
+  zed::tools::ToolLimits search_limits;
+  search_limits.max_read_bytes = 32;
+  zed::tools::GrepTool bounded_grep(root, search_limits);
+  auto grep_result = bounded_grep.execute(
+      call(
+          "bounded-grep", "grep",
+          R"({"pattern":"match","path":"bounded-search","max_output_bytes":18446744073709551615})"),
+      {});
+  assert(grep_result);
+  assert(grep_result.value().content.find("[results truncated]") !=
+         std::string::npos);
+  assert(!grep_result.value().is_error);
+  {
+    std::ofstream file(search_root / "text");
+    file << std::string(33, 'x');
+  }
+  grep_result = bounded_grep.execute(
+      call("long-line", "grep",
+           R"({"pattern":"absent","path":"bounded-search"})"),
+      {});
+  assert(grep_result && grep_result.value().is_error);
+  assert(grep_result.value().content.find("line length limit") !=
+         std::string::npos);
+  search_limits.max_search_bytes = 8;
+  zed::tools::GrepTool byte_bounded_grep(root, search_limits);
+  grep_result = byte_bounded_grep.execute(
+      call("byte-cap", "grep",
+           R"({"pattern":"absent","path":"bounded-search"})"),
+      {});
+  assert(grep_result && grep_result.value().is_error);
+  assert(grep_result.value().content.find("byte limit") != std::string::npos);
+  search_limits.max_search_entries = 0;
+  zed::tools::GrepTool entry_bounded_grep(root, search_limits);
+  assert(entry_bounded_grep
+             .execute(call("entry-cap", "grep",
+                           R"({"pattern":"x","path":"bounded-search"})"),
+                      {})
+             .value()
+             .is_error);
+  search_limits.command_timeout_ms = 0;
+  zed::tools::GrepTool timed_grep(root, search_limits);
+  assert(timed_grep
+             .execute(call("grep-timeout", "grep",
+                           R"({"pattern":"x","path":"bounded-search"})"),
+                      {})
+             .value()
+             .content.find("timed out") != std::string::npos);
+  assert(bounded_grep
+             .execute(call("grep-cancel", "grep",
+                           R"({"pattern":"x","path":"bounded-search"})"),
+                      cancelled_read.token())
+             .error()
+             .code == ErrorCode::cancelled);
+  zed::tools::ReadFileTool bounded_read(root, search_limits);
+  const auto bounded_read_result = bounded_read.execute(
+      call("bounded-read", "read", R"({"path":"bounded-search/text"})"), {});
+  assert(bounded_read_result);
+  assert(bounded_read_result.value().content ==
+         std::string(32, 'x') + "\n[output truncated]");
+  if (geteuid() != 0) {
+    assert(chmod((search_root / "text").c_str(), 0000) == 0);
+    const auto denied_search =
+        bounded_grep.execute(call("denied-search", "grep",
+                                  R"({"pattern":"x","path":"bounded-search"})"),
+                             {});
+    assert(denied_search && denied_search.value().is_error);
+    assert(denied_search.value().content.find("cannot open") !=
+           std::string::npos);
+    assert(chmod((search_root / "text").c_str(), 0600) == 0);
+  }
 
   const auto skill_root = root / ".zed" / "skills";
   const auto skill_directory = skill_root / "review";

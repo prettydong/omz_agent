@@ -17,6 +17,8 @@ struct ToolLimits {
   std::size_t max_write_bytes{256 * 1024};
   std::size_t max_command_output_bytes{256 * 1024};
   std::size_t command_timeout_ms{30'000};
+  std::size_t max_search_bytes{64 * 1024 * 1024};
+  std::size_t max_search_entries{100'000};
 };
 
 class WorkspaceToolBase {

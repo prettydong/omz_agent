@@ -207,12 +207,12 @@ void execute_task(const std::shared_ptr<HostTask> &task,
     core::AgentLoop loop(model, tools, session, context, config);
     const auto result =
         loop.run(request.task, token, [&](const core::AgentEvent &event) {
-          if (event.type == core::AgentEventType::assistant_message &&
-              event.model_usage.has_value()) {
+          if (event.model_usage.has_value()) {
             usage.input_tokens += event.model_usage->input_tokens;
             usage.cached_input_tokens += event.model_usage->cached_input_tokens;
             usage.output_tokens += event.model_usage->output_tokens;
-          } else if (event.type == core::AgentEventType::tool_start) {
+          }
+          if (event.type == core::AgentEventType::tool_start) {
             events.write({WorkerEventType::tool_start,
                           request.request_id,
                           {},

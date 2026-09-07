@@ -822,9 +822,12 @@ parse_workspace_config(std::string_view json_text) {
   }
 
   const auto &context = root.at("context");
-  constexpr std::string_view context_fields[]{
-      "model", "max_tokens", "reserved_output_tokens",
-      "compaction_trigger_tokens", "max_output_tokens"};
+  constexpr std::string_view context_fields[]{"model",
+                                              "max_tokens",
+                                              "reserved_output_tokens",
+                                              "compaction_trigger_tokens",
+                                              "max_output_tokens",
+                                              "experimental_mode"};
   constexpr std::string_view required_context_fields[]{
       "model", "max_tokens", "reserved_output_tokens",
       "compaction_trigger_tokens"};
@@ -876,6 +879,11 @@ parse_workspace_config(std::string_view json_text) {
       context.contains("max_output_tokens")
           ? config_size(context, "max_output_tokens", "context", 1'048'576)
           : core::Result<std::size_t>::success(1'024);
+  if (context.contains("experimental_mode") &&
+      !context.at("experimental_mode").is_boolean()) {
+    return core::Result<WorkspaceConfig>::failure(
+        invalid_config("context.experimental_mode must be a boolean"));
+  }
   const core::Error *error = !agent_model          ? &agent_model.error()
                              : !agent_reasoning    ? &agent_reasoning.error()
                              : !agent_turns        ? &agent_turns.error()
@@ -917,6 +925,7 @@ parse_workspace_config(std::string_view json_text) {
   config.context.limits = {context_max.value(), context_reserved.value(),
                            context_trigger.value()};
   config.context.max_output_tokens = context_output.value();
+  config.context.experimental_mode = context.value("experimental_mode", true);
   const auto valid = validate_workspace_config(config);
   if (!valid)
     return core::Result<WorkspaceConfig>::failure(valid.error());
@@ -952,7 +961,8 @@ std::string serialize_workspace_config(const WorkspaceConfig &config) {
          config.context.limits.reserved_output_tokens},
         {"compaction_trigger_tokens",
          config.context.limits.compaction_trigger_tokens},
-        {"max_output_tokens", config.context.max_output_tokens}}},
+        {"max_output_tokens", config.context.max_output_tokens},
+        {"experimental_mode", config.context.experimental_mode}}},
   };
   return root.dump(2) + "\n";
 }
@@ -1364,6 +1374,8 @@ load_runtime_config(RuntimeConfigLoadOptions options) {
   if (!quick_bash)
     return core::Result<RuntimeConfig>::failure(quick_bash.error());
   config.quick_bash_enabled = quick_bash.value();
+  config.experimental_context_management =
+      workspace_settings.value().context.experimental_mode;
 
   const auto max_context = size_environment(
       "ZED_MAX_CONTEXT_TOKENS",

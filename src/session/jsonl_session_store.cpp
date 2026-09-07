@@ -847,6 +847,12 @@ core::Result<std::vector<Message>> JsonlSessionStore::load() const {
   return core::Result<std::vector<Message>>::success(cache_->parsed.messages);
 }
 
+std::string JsonlSessionStore::session_id() const {
+  if (cache_ == nullptr)
+    return {};
+  return cache_->parsed.metadata.id;
+}
+
 core::Result<void> JsonlSessionStore::begin_turn(std::string_view turn_id,
                                                  const Message &user_message) {
   if (!lock_fd_.valid()) {

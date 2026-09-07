@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -22,6 +23,8 @@ public:
 
   virtual Result<void> append(const Message &message) = 0;
   virtual Result<std::vector<Message>> load() const = 0;
+
+  [[nodiscard]] virtual std::string session_id() const { return {}; }
 
   virtual Result<void> begin_turn(std::string_view turn_id,
                                   const Message &user_message) {

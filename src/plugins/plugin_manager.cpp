@@ -1474,7 +1474,10 @@ public:
                 event_truncation_reported = true;
               }
               if (!bounded.empty()) {
-                on_event(event_context, ZEDA_EVENT_DELTA, string_view(bounded));
+                const auto kind = delta.kind == core::ModelDeltaKind::retry
+                                      ? ZEDA_EVENT_STATUS
+                                      : ZEDA_EVENT_DELTA;
+                on_event(event_context, kind, string_view(bounded));
               }
             } catch (...) {
               event_callback_failed = true;

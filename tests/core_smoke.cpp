@@ -106,18 +106,113 @@ private:
   std::vector<ReasoningEffort> observed_efforts_;
 };
 
-class MissingPurposeModel final : public Model {
+class SessionIdModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &request,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    observed_session_id_ = request.session_id;
+    return Result<AssistantResponse>::success(
+        {"session id observed", {}, FinishReason::stop, {1, 0, 1}});
+  }
+
+  [[nodiscard]] const std::string &observed_session_id() const {
+    return observed_session_id_;
+  }
+
+private:
+  std::string observed_session_id_;
+};
+
+class IdentifiedSessionStore final : public SessionStore {
+public:
+  explicit IdentifiedSessionStore(std::string id) : id_(std::move(id)) {}
+
+  Result<void> append(const Message &message) override {
+    messages_.push_back(message);
+    return Result<void>::success();
+  }
+
+  Result<std::vector<Message>> load() const override {
+    return Result<std::vector<Message>>::success(messages_);
+  }
+
+  [[nodiscard]] std::string session_id() const override { return id_; }
+
+private:
+  std::string id_;
+  std::vector<Message> messages_;
+};
+
+class RetrySequenceModel final : public Model {
+public:
+  explicit RetrySequenceModel(std::vector<AssistantResponse> responses)
+      : responses_(std::move(responses)) {}
+
+  Result<AssistantResponse> complete(const ModelRequest &request,
+                                     const StreamCallback &,
+                                     CancellationToken) override {
+    assert(calls_ < static_cast<int>(responses_.size()));
+    if (calls_ > 0) {
+      bool has_retry_feedback = false;
+      for (const auto &message : request.messages) {
+        has_retry_feedback =
+            has_retry_feedback ||
+            (message.role == Role::system &&
+             message.content.find("Validation diagnostic:") !=
+                 std::string::npos &&
+             message.content.find("purpose") != std::string::npos &&
+             message.content.find("tool") != std::string::npos);
+      }
+      saw_retry_feedback_ = saw_retry_feedback_ || has_retry_feedback;
+    }
+    return Result<AssistantResponse>::success(
+        responses_[static_cast<std::size_t>(calls_++)]);
+  }
+
+  [[nodiscard]] int calls() const { return calls_; }
+  [[nodiscard]] bool saw_retry_feedback() const { return saw_retry_feedback_; }
+
+private:
+  std::vector<AssistantResponse> responses_;
+  int calls_{0};
+  bool saw_retry_feedback_{false};
+};
+
+class CancelledResponseModel final : public Model {
 public:
   Result<AssistantResponse> complete(const ModelRequest &,
                                      const StreamCallback &,
                                      CancellationToken) override {
-    return Result<AssistantResponse>::success({
-        {},
-        {{"missing-purpose", "echo", R"({"text":"hello"})"}},
-        FinishReason::tool_calls,
-        {},
-    });
+    ++calls_;
+    return Result<AssistantResponse>::failure(
+        {ErrorCode::cancelled, "model cancelled"});
   }
+
+  [[nodiscard]] int calls() const { return calls_; }
+
+private:
+  int calls_{0};
+};
+
+class RetryStatusDeltaModel final : public Model {
+public:
+  Result<AssistantResponse> complete(const ModelRequest &,
+                                     const StreamCallback &on_delta,
+                                     CancellationToken) override {
+    ++calls_;
+    if (on_delta) {
+      on_delta({"searching for a source", ModelDeltaKind::retry});
+      on_delta({"final answer", ModelDeltaKind::text});
+    }
+    return Result<AssistantResponse>::success(
+        {"final answer", {}, FinishReason::stop, {5, 0, 2}});
+  }
+
+  [[nodiscard]] int calls() const { return calls_; }
+
+private:
+  int calls_{0};
 };
 
 class DeferredActionModel final : public Model {
@@ -464,20 +559,388 @@ int main() {
   assert(history.value()[2].role == Role::tool);
   assert(history.value()[3].role == Role::assistant);
 
-  MissingPurposeModel missing_purpose_model;
-  ToolRegistry guarded_tools;
-  assert(guarded_tools.register_tool(std::make_unique<EchoTool>()));
-  InMemorySessionStore guarded_session;
-  BasicContextManager guarded_context(estimator);
-  AgentLoop guarded_loop(missing_purpose_model, guarded_tools, guarded_session,
-                         guarded_context, config);
-  const auto rejected = guarded_loop.run("run invalid echo");
-  assert(!rejected);
-  assert(rejected.error().code == ErrorCode::model_error);
-  const auto guarded_history = guarded_session.load();
-  assert(guarded_history);
-  assert(guarded_history.value().size() == 1);
-  assert(guarded_history.value()[0].role == Role::user);
+  SessionIdModel session_id_model;
+  IdentifiedSessionStore identified_session("active-session-id");
+  BasicContextManager session_id_context(estimator);
+  AgentLoop session_id_loop(session_id_model, tools, identified_session,
+                            session_id_context, config);
+  const auto session_id_result = session_id_loop.run("observe the session");
+  assert(session_id_result);
+  assert(session_id_model.observed_session_id() == "active-session-id");
+
+  const auto valid_echo_response = [] {
+    return AssistantResponse{
+        {},
+        {{"corrected-call", "echo",
+          R"({"purpose":"Retry with a valid call","text":"hello"})"}},
+        FinishReason::tool_calls,
+        {21, 2, 5}};
+  };
+  const auto completed_response = [] {
+    return AssistantResponse{"completed", {}, FinishReason::stop, {23, 3, 7}};
+  };
+  const auto missing_purpose_response = [] {
+    return AssistantResponse{
+        {},
+        {{"missing-purpose", "echo", R"({"text":"hello"})"}},
+        FinishReason::tool_calls,
+        {11, 1, 2}};
+  };
+
+  RetrySequenceModel corrected_model({missing_purpose_response(),
+                                      valid_echo_response(),
+                                      completed_response()});
+  ToolRegistry corrected_tools;
+  assert(corrected_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore corrected_session;
+  BasicContextManager corrected_context(estimator);
+  AgentLoop corrected_loop(corrected_model, corrected_tools, corrected_session,
+                           corrected_context, config);
+  std::size_t corrected_tool_starts = 0;
+  std::vector<AgentEvent> retry_events;
+  const auto corrected =
+      corrected_loop.run("run invalid echo", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::tool_start)
+          ++corrected_tool_starts;
+        if (event.type == AgentEventType::model_retry)
+          retry_events.push_back(event);
+      });
+  assert(corrected);
+  assert(corrected.value() == "completed");
+  assert(corrected_model.calls() == 3);
+  assert(corrected_model.saw_retry_feedback());
+  assert(corrected_tool_starts == 1);
+  assert(retry_events.size() == 1);
+  assert(retry_events[0].text.find("retrying (1/2)") != std::string::npos);
+  assert(retry_events[0].text.find("purpose") != std::string::npos);
+  assert(retry_events[0].model_usage.has_value());
+  assert(retry_events[0].model_usage->input_tokens == 11);
+  const auto corrected_history = corrected_session.load();
+  assert(corrected_history);
+  assert(corrected_history.value().size() == 4);
+  assert(corrected_history.value()[0].role == Role::user);
+  assert(corrected_history.value()[1].role == Role::assistant);
+  assert(corrected_history.value()[1].tool_calls.size() == 1);
+  assert(corrected_history.value()[1].tool_calls[0].id == "corrected-call");
+  assert(corrected_history.value()[2].role == Role::tool);
+  assert(corrected_history.value()[3].content == "completed");
+
+  RetrySequenceModel empty_calls_model(
+      {AssistantResponse{"", {}, FinishReason::tool_calls, {6, 0, 1}},
+       valid_echo_response(), completed_response()});
+  ToolRegistry empty_calls_tools;
+  assert(empty_calls_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore empty_calls_session;
+  BasicContextManager empty_calls_context(estimator);
+  AgentLoop empty_calls_loop(empty_calls_model, empty_calls_tools,
+                             empty_calls_session, empty_calls_context, config);
+  const auto empty_calls_result = empty_calls_loop.run("retry empty calls");
+  assert(empty_calls_result);
+  assert(empty_calls_model.calls() == 3);
+  const auto empty_calls_history = empty_calls_session.load();
+  assert(empty_calls_history);
+  assert(empty_calls_history.value().size() == 4);
+  assert(empty_calls_history.value()[1].tool_calls[0].id == "corrected-call");
+
+  for (const std::string empty_content :
+       {std::string{}, std::string{" \t\r\n"}}) {
+    RetrySequenceModel empty_answer_model(
+        {AssistantResponse{empty_content, {}, FinishReason::stop, {3, 0, 1}},
+         AssistantResponse{"valid answer", {}, FinishReason::stop, {4, 0, 2}}});
+    ToolRegistry empty_answer_tools;
+    InMemorySessionStore empty_answer_session;
+    BasicContextManager empty_answer_context(estimator);
+    AgentLoop empty_answer_loop(empty_answer_model, empty_answer_tools,
+                                empty_answer_session, empty_answer_context,
+                                config);
+    const auto empty_answer_result =
+        empty_answer_loop.run("retry empty answer");
+    assert(empty_answer_result);
+    assert(empty_answer_result.value() == "valid answer");
+    assert(empty_answer_model.calls() == 2);
+    const auto empty_answer_history = empty_answer_session.load();
+    assert(empty_answer_history);
+    assert(empty_answer_history.value().size() == 2);
+    assert(empty_answer_history.value()[1].content == "valid answer");
+  }
+
+  RetrySequenceModel repeated_empty_model(
+      {AssistantResponse{"", {}, FinishReason::stop, {7, 0, 1}},
+       AssistantResponse{" \t", {}, FinishReason::stop, {8, 0, 1}},
+       AssistantResponse{"", {}, FinishReason::stop, {9, 0, 1}}});
+  ToolRegistry repeated_empty_tools;
+  InMemorySessionStore repeated_empty_session;
+  BasicContextManager repeated_empty_context(estimator);
+  AgentLoop repeated_empty_loop(repeated_empty_model, repeated_empty_tools,
+                                repeated_empty_session, repeated_empty_context,
+                                config);
+  std::vector<AgentEvent> repeated_empty_events;
+  const auto repeated_empty = repeated_empty_loop.run(
+      "do not accept empty answers", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::model_retry ||
+            event.type == AgentEventType::error) {
+          repeated_empty_events.push_back(event);
+        }
+      });
+  assert(!repeated_empty);
+  assert(repeated_empty.error().code == ErrorCode::model_error);
+  assert(repeated_empty_model.calls() == 3);
+  assert(repeated_empty_events.size() == 3);
+  assert(repeated_empty_events[0].text.find("retrying (1/2)") !=
+         std::string::npos);
+  assert(repeated_empty_events[1].text.find("retrying (2/2)") !=
+         std::string::npos);
+  assert(repeated_empty_events[2].model_usage.has_value());
+  assert(repeated_empty_events[2].model_usage->input_tokens == 9);
+  const auto repeated_empty_history = repeated_empty_session.load();
+  assert(repeated_empty_history);
+  assert(repeated_empty_history.value().size() == 1);
+
+  RetrySequenceModel shared_correction_budget_model(
+      {missing_purpose_response(),
+       AssistantResponse{"", {}, FinishReason::tool_calls, {12, 0, 1}},
+       missing_purpose_response()});
+  ToolRegistry shared_correction_budget_tools;
+  assert(shared_correction_budget_tools.register_tool(
+      std::make_unique<EchoTool>()));
+  InMemorySessionStore shared_correction_budget_session;
+  BasicContextManager shared_correction_budget_context(estimator);
+  AgentLoop shared_correction_budget_loop(
+      shared_correction_budget_model, shared_correction_budget_tools,
+      shared_correction_budget_session, shared_correction_budget_context,
+      config);
+  std::size_t shared_correction_retries = 0;
+  const auto shared_correction_budget = shared_correction_budget_loop.run(
+      "share correction budget", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::model_retry)
+          ++shared_correction_retries;
+      });
+  assert(!shared_correction_budget);
+  assert(shared_correction_budget.error().code == ErrorCode::model_error);
+  assert(shared_correction_budget_model.calls() == 3);
+  assert(shared_correction_retries == 2);
+
+  for (const std::string response : {
+           std::string{"“正在构建”表示编译过程尚未结束，并不表示构建成功。"},
+           std::string{"The phrase \"working on it\" is not a result."},
+           std::string{"已完成：正在构建阶段已结束，测试已通过。"},
+           std::string{"```text\n正在构建\n```"},
+       }) {
+    RetrySequenceModel explanatory_model(
+        {AssistantResponse{response, {}, FinishReason::stop, {2, 0, 1}}});
+    ToolRegistry explanatory_tools;
+    InMemorySessionStore explanatory_session;
+    BasicContextManager explanatory_context(estimator);
+    AgentLoop explanatory_loop(explanatory_model, explanatory_tools,
+                               explanatory_session, explanatory_context,
+                               config);
+    std::size_t explanatory_retries = 0;
+    const auto explanatory_result = explanatory_loop.run(
+        "accept explanatory reply", {}, [&](const AgentEvent &event) {
+          if (event.type == AgentEventType::model_retry)
+            ++explanatory_retries;
+        });
+    assert(explanatory_result);
+    assert(explanatory_model.calls() == 1);
+    assert(explanatory_retries == 0);
+  }
+
+  RetryStatusDeltaModel retry_status_model;
+  ToolRegistry retry_status_tools;
+  InMemorySessionStore retry_status_session;
+  BasicContextManager retry_status_context(estimator);
+  AgentLoop retry_status_loop(retry_status_model, retry_status_tools,
+                              retry_status_session, retry_status_context,
+                              config);
+  std::vector<AgentEvent> retry_status_events;
+  const auto retry_status_result = retry_status_loop.run(
+      "stream retry status", {},
+      [&](const AgentEvent &event) { retry_status_events.push_back(event); });
+  assert(retry_status_result);
+  assert(retry_status_model.calls() == 1);
+  assert(std::count_if(retry_status_events.begin(), retry_status_events.end(),
+                       [](const AgentEvent &event) {
+                         return event.type == AgentEventType::model_retry &&
+                                event.text == "searching for a source";
+                       }) == 1);
+  assert(std::count_if(retry_status_events.begin(), retry_status_events.end(),
+                       [](const AgentEvent &event) {
+                         return event.type == AgentEventType::assistant_delta &&
+                                event.text == "searching for a source";
+                       }) == 0);
+  const auto retry_status_history = retry_status_session.load();
+  assert(retry_status_history);
+  assert(retry_status_history.value().size() == 2);
+  assert(retry_status_history.value()[1].content == "final answer");
+
+  for (const std::string arguments : {R"({"purpose":"","text":"hello"})",
+                                      R"({"purpose":"   \t","text":"hello"})",
+                                      R"({"purpose":42,"text":"hello"})"}) {
+    RetrySequenceModel purpose_model(
+        {AssistantResponse{{},
+                           {{"invalid-purpose", "echo", arguments}},
+                           FinishReason::tool_calls,
+                           {1, 0, 1}},
+         valid_echo_response(), completed_response()});
+    ToolRegistry purpose_tools;
+    assert(purpose_tools.register_tool(std::make_unique<EchoTool>()));
+    InMemorySessionStore purpose_session;
+    BasicContextManager purpose_context(estimator);
+    AgentLoop purpose_loop(purpose_model, purpose_tools, purpose_session,
+                           purpose_context, config);
+    const auto purpose_result = purpose_loop.run("validate purpose");
+    assert(purpose_result);
+    assert(purpose_model.calls() == 3);
+  }
+
+  const std::vector<AssistantResponse> structural_invalid_responses{
+      {{},
+       {{"", "echo", R"({"purpose":"missing id"})"}},
+       FinishReason::tool_calls,
+       {1, 0, 1}},
+      {{},
+       {{"missing-name", "", R"({"purpose":"missing name"})"}},
+       FinishReason::tool_calls,
+       {1, 0, 1}},
+      {{},
+       {{"invalid-json", "echo", "{"}},
+       FinishReason::tool_calls,
+       {1, 0, 1}},
+      {{},
+       {{"duplicate", "echo", R"({"purpose":"first"})"},
+        {"duplicate", "echo", R"({"purpose":"second"})"}},
+       FinishReason::tool_calls,
+       {1, 0, 1}},
+  };
+  for (const auto &invalid_response : structural_invalid_responses) {
+    RetrySequenceModel structural_model(
+        {invalid_response, valid_echo_response(), completed_response()});
+    ToolRegistry structural_tools;
+    assert(structural_tools.register_tool(std::make_unique<EchoTool>()));
+    InMemorySessionStore structural_session;
+    BasicContextManager structural_context(estimator);
+    AgentLoop structural_loop(structural_model, structural_tools,
+                              structural_session, structural_context, config);
+    const auto structural_result = structural_loop.run("validate tool call");
+    assert(structural_result);
+    assert(structural_model.calls() == 3);
+  }
+
+  RetrySequenceModel repeated_invalid_model({missing_purpose_response(),
+                                             missing_purpose_response(),
+                                             missing_purpose_response()});
+  ToolRegistry repeated_invalid_tools;
+  assert(repeated_invalid_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore repeated_invalid_session;
+  BasicContextManager repeated_invalid_context(estimator);
+  AgentLoop repeated_invalid_loop(
+      repeated_invalid_model, repeated_invalid_tools, repeated_invalid_session,
+      repeated_invalid_context, config);
+  std::vector<AgentEvent> repeated_invalid_events;
+  const auto repeated_invalid = repeated_invalid_loop.run(
+      "retry invalid calls", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::model_retry ||
+            event.type == AgentEventType::error) {
+          repeated_invalid_events.push_back(event);
+        }
+      });
+  assert(!repeated_invalid);
+  assert(repeated_invalid.error().code == ErrorCode::model_error);
+  assert(repeated_invalid_model.calls() == 3);
+  assert(repeated_invalid_events.size() == 3);
+  assert(repeated_invalid_events[0].text.find("retrying (1/2)") !=
+         std::string::npos);
+  assert(repeated_invalid_events[1].text.find("retrying (2/2)") !=
+         std::string::npos);
+  assert(repeated_invalid_events[2].text.find("purpose") != std::string::npos);
+  assert(repeated_invalid_events[2].model_usage.has_value());
+  assert(repeated_invalid_events[2].model_usage->input_tokens == 11);
+
+  RetrySequenceModel mixed_batch_model(
+      {AssistantResponse{
+           {},
+           {{"would-run", "echo",
+             R"({"purpose":"This must not execute","text":"hello"})"},
+            {"bad-batch-call", "echo", R"({"text":"hello"})"}},
+           FinishReason::tool_calls,
+           {4, 0, 1}},
+       valid_echo_response(), completed_response()});
+  ToolRegistry mixed_batch_tools;
+  assert(mixed_batch_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore mixed_batch_session;
+  BasicContextManager mixed_batch_context(estimator);
+  AgentLoop mixed_batch_loop(mixed_batch_model, mixed_batch_tools,
+                             mixed_batch_session, mixed_batch_context, config);
+  std::size_t mixed_batch_tool_starts = 0;
+  const auto mixed_batch = mixed_batch_loop.run(
+      "do not partially execute", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::tool_start)
+          ++mixed_batch_tool_starts;
+      });
+  assert(mixed_batch);
+  assert(mixed_batch_tool_starts == 1);
+  const auto mixed_batch_history = mixed_batch_session.load();
+  assert(mixed_batch_history);
+  assert(mixed_batch_history.value().size() == 4);
+  assert(mixed_batch_history.value()[1].tool_calls[0].id == "corrected-call");
+
+  AgentLoopConfig single_turn_config = config;
+  single_turn_config.max_turns = 1;
+  RetrySequenceModel single_turn_model({missing_purpose_response()});
+  ToolRegistry single_turn_tools;
+  assert(single_turn_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore single_turn_session;
+  BasicContextManager single_turn_context(estimator);
+  AgentLoop single_turn_loop(single_turn_model, single_turn_tools,
+                             single_turn_session, single_turn_context,
+                             single_turn_config);
+  std::size_t false_retries = 0;
+  const auto single_turn =
+      single_turn_loop.run("one turn only", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::model_retry)
+          ++false_retries;
+      });
+  assert(!single_turn);
+  assert(single_turn_model.calls() == 1);
+  assert(false_retries == 0);
+
+  RetrySequenceModel cancelled_retry_model({missing_purpose_response()});
+  ToolRegistry cancelled_retry_tools;
+  assert(cancelled_retry_tools.register_tool(std::make_unique<EchoTool>()));
+  InMemorySessionStore cancelled_retry_session;
+  BasicContextManager cancelled_retry_context(estimator);
+  AgentLoop cancelled_retry_loop(cancelled_retry_model, cancelled_retry_tools,
+                                 cancelled_retry_session,
+                                 cancelled_retry_context, config);
+  CancellationSource retry_cancellation;
+  const auto cancelled_retry =
+      cancelled_retry_loop.run("cancel correction", retry_cancellation.token(),
+                               [&](const AgentEvent &event) {
+                                 if (event.type == AgentEventType::model_retry)
+                                   retry_cancellation.cancel();
+                               });
+  assert(!cancelled_retry);
+  assert(cancelled_retry.error().code == ErrorCode::cancelled);
+  assert(cancelled_retry_model.calls() == 1);
+  assert(cancelled_retry_session.load().value().size() == 1);
+
+  CancelledResponseModel cancelled_response_model;
+  ToolRegistry cancelled_response_tools;
+  InMemorySessionStore cancelled_response_session;
+  BasicContextManager cancelled_response_context(estimator);
+  AgentLoop cancelled_response_loop(
+      cancelled_response_model, cancelled_response_tools,
+      cancelled_response_session, cancelled_response_context, config);
+  std::size_t cancellation_retries = 0;
+  const auto cancelled_response = cancelled_response_loop.run(
+      "do not retry cancellation", {}, [&](const AgentEvent &event) {
+        if (event.type == AgentEventType::model_retry)
+          ++cancellation_retries;
+      });
+  assert(!cancelled_response);
+  assert(cancelled_response.error().code == ErrorCode::cancelled);
+  assert(cancelled_response_model.calls() == 1);
+  assert(cancellation_retries == 0);
 
   DeferredActionModel deferred_model;
   ToolRegistry deferred_tools;

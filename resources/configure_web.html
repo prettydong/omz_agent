@@ -313,6 +313,9 @@
             <div class="f wide"><label>可用预算</label><span class="readout" id="context-budget"></span></div>
           </div>
 
+          <div class="sec">实验功能</div>
+          <div class="inline"><label><input id="context-experimental-mode" type="checkbox">启用笔记与可搜索历史实验</label><span class="unit">需要重启</span></div>
+
           <div class="sec">System Prompt<span class="aux"><span class="readout" id="context-prompt-size"></span></span></div>
           <div class="prompt"><textarea id="context-prompt" aria-label="Context System Prompt" spellcheck="false"></textarea></div>
         </div>
@@ -900,6 +903,7 @@
           reserved_output_tokens: integer('context-reserved'),
           compaction_trigger_tokens: active.compaction_trigger_tokens,
           max_output_tokens: integer('context-output'),
+          experimental_mode: $('context-experimental-mode').checked,
         };
         return {
           config,
@@ -992,6 +996,7 @@
         $('context-max').value = payload.config.context.max_tokens;
         $('context-reserved').value = payload.config.context.reserved_output_tokens;
         $('context-output').value = payload.config.context.max_output_tokens;
+        $('context-experimental-mode').checked = payload.config.context.experimental_mode;
         $('context-prompt').value = payload.prompts.context;
         selection = { type: 'agent', index: 0 };
         render();

@@ -91,6 +91,7 @@ reasoning_effort_from_name(std::string_view name) {
 
 struct ModelRequest {
   ModelRef model;
+  std::string session_id;
   std::vector<Message> messages;
   std::vector<ToolDefinition> tools;
   std::optional<std::size_t> max_output_tokens;
@@ -128,8 +129,14 @@ struct ModelUsage {
   std::optional<ContextTokenBreakdown> context_breakdown;
 };
 
+enum class ModelDeltaKind {
+  text,
+  retry,
+};
+
 struct ModelDelta {
   std::string text;
+  ModelDeltaKind kind{ModelDeltaKind::text};
 };
 
 struct AssistantResponse {

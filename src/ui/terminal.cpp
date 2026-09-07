@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "zed/ui/code_render.hpp"
 #include "zed/ui/markdown.hpp"
 
 #include <nlohmann/json.hpp>
@@ -344,7 +345,7 @@ ftxui::Element render_message(const TerminalMessage &message,
         std::move(header),
         ftxui::hbox({
             ftxui::text("  "),
-            ftxui::paragraph(message.content) |
+            render_tool_output(message.content, theme) |
                 ftxui::color(message.is_error ? theme.error
                                               : theme.text_muted) |
                 ftxui::xflex,
@@ -376,11 +377,17 @@ ftxui::Element render_message(const TerminalMessage &message,
         }),
         ftxui::hbox({
             ftxui::text("  "),
-            ftxui::paragraph(message.content) | ftxui::color(color) |
+            render_tool_output(message.content, theme) | ftxui::color(color) |
                 ftxui::xflex,
         }),
     });
   }
+  case TerminalMessageKind::notice:
+    return ftxui::hbox({
+        ftxui::text("↻ ") | ftxui::color(theme.warning),
+        ftxui::paragraph(message.content) | ftxui::color(theme.warning) |
+            ftxui::xflex,
+    });
   case TerminalMessageKind::error:
     return ftxui::hbox({
         ftxui::text("⚠ ") | ftxui::bold | ftxui::color(theme.error),
@@ -415,8 +422,7 @@ struct CommandCompletionInput {
   bool command{false};
   std::string_view name;
   bool has_arguments{false};
-  std::string_view option_prefix;
-  bool has_additional_arguments{false};
+  std::vector<std::string_view> arguments;
 };
 
 CommandCompletionInput parse_command_completion_input(std::string_view input) {
@@ -435,14 +441,16 @@ CommandCompletionInput parse_command_completion_input(std::string_view input) {
 
   parsed.has_arguments = true;
   auto arguments = input.substr(name_length);
-  while (!arguments.empty() && is_command_whitespace(arguments.front()))
-    arguments.remove_prefix(1);
-  const auto argument_separator =
-      std::find_if(arguments.begin(), arguments.end(), is_command_whitespace);
-  const auto argument_length = static_cast<std::size_t>(
-      std::distance(arguments.begin(), argument_separator));
-  parsed.option_prefix = arguments.substr(0, argument_length);
-  parsed.has_additional_arguments = argument_separator != arguments.end();
+  while (!arguments.empty()) {
+    while (!arguments.empty() && is_command_whitespace(arguments.front()))
+      arguments.remove_prefix(1);
+    const auto end =
+        std::find_if(arguments.begin(), arguments.end(), is_command_whitespace);
+    const auto length =
+        static_cast<std::size_t>(std::distance(arguments.begin(), end));
+    parsed.arguments.push_back(arguments.substr(0, length));
+    arguments.remove_prefix(length);
+  }
   return parsed;
 }
 
@@ -501,6 +509,8 @@ TerminalCommand parse_terminal_command(std::string_view line) {
 
 bool terminal_command_reloads_session(std::string_view name,
                                       std::string_view arguments) {
+  if (name == "new")
+    return true;
   if (name != "session")
     return false;
   arguments = trim_command_whitespace(arguments);
@@ -527,13 +537,32 @@ std::vector<TerminalCommandSuggestion> terminal_command_suggestions(
                    });
   std::vector<TerminalCommandSuggestion> suggestions;
   if (exact_command != available_commands.end()) {
-    if (parsed.has_additional_arguments)
-      return suggestions;
-    for (const auto &option : exact_command->options) {
-      if (option.value.starts_with(parsed.option_prefix)) {
-        suggestions.push_back({option.value, option.description,
-                               "/" + exact_command->name + " " + option.value,
-                               true});
+    const auto *options = &exact_command->options;
+    std::string path = "/" + exact_command->name;
+    std::string_view prefix;
+    for (std::size_t index = 0; index < parsed.arguments.size(); ++index) {
+      const auto token = parsed.arguments[index];
+      const auto match = std::find_if(
+          options->begin(), options->end(),
+          [&](const auto &option) { return option.value == token; });
+      if (index + 1 < parsed.arguments.size() ||
+          (match != options->end() && !match->children.empty())) {
+        if (match == options->end() || match->children.empty())
+          return {};
+        path += " " + match->value;
+        options = &match->children;
+      } else {
+        prefix = token;
+      }
+    }
+    for (const auto &option : *options) {
+      if (option.value.starts_with(prefix)) {
+        suggestions.push_back(
+            {option.value, option.description,
+             path + " " + option.value +
+                 (!option.children.empty() || option.accepts_argument ? " "
+                                                                      : ""),
+             true, option.display_name, option.details, option.score});
       }
     }
     return suggestions;
@@ -598,6 +627,68 @@ ftxui::Element render_terminal_command_guide(
 
   ftxui::Elements rows;
   rows.reserve(visible + 2);
+  if (command_help != nullptr && command_help->name == "model") {
+    using namespace ftxui;
+    Elements models;
+    for (std::size_t offset = 0; offset < visible; ++offset) {
+      const auto index = first_visible + offset;
+      const auto &suggestion = suggestions[index];
+      const bool selected = index == selected_suggestion;
+      auto label =
+          text(suggestion.display_name.empty() ? suggestion.value
+                                               : suggestion.display_name) |
+          color(selected ? theme.secondary : theme.text);
+      if (selected)
+        label |= bold;
+      auto row = hbox({text(selected ? "› " : "  ") | color(theme.secondary),
+                       std::move(label)});
+      if (selected)
+        row |= bgcolor(theme.input_background);
+      models.push_back(std::move(row));
+    }
+    if (suggestions.empty())
+      return text("没有匹配的模型") | color(theme.text_muted);
+
+    Elements details;
+    const auto &selected = suggestions[selected_suggestion];
+    if (selected.details.empty()) {
+      details.push_back(hbox(
+          {filler(), text(selected.description) | color(theme.text_muted)}));
+    } else {
+      for (std::size_t index = 0; index < selected.details.size(); ++index) {
+        if (selected.details[index].empty())
+          continue;
+        if (index == 0) {
+          // Composite reference scores use 0..100; missing data stays unfilled.
+          const float score =
+              selected.score
+                  ? static_cast<float>(std::clamp(*selected.score, 0, 100)) /
+                        100.0F
+                  : 0.0F;
+          details.push_back(hbox({
+              filler(),
+              text(selected.details[index]) | color(theme.text),
+              text("  "),
+              gauge(score) | size(WIDTH, EQUAL, 14) |
+                  color(selected.score ? theme.accent : theme.border) |
+                  bgcolor(theme.background_element),
+          }));
+        } else if (index == 2) {
+          details.push_back(hbox({
+              filler(),
+              text(" " + selected.details[index] + " ") | bold |
+                  color(theme.text) | bgcolor(theme.background_element),
+          }));
+        } else {
+          details.push_back(hbox({filler(), text(selected.details[index]) |
+                                                color(theme.text_muted)}));
+        }
+      }
+    }
+    return hbox({vbox(std::move(models)) | size(WIDTH, LESS_THAN, 32),
+                 text("  "), vbox(std::move(details)) | flex});
+  }
+
   if (command_help != nullptr) {
     rows.push_back(ftxui::hbox({
         ftxui::text("/" + command_help->name) | ftxui::bold |
@@ -1022,6 +1113,19 @@ void TerminalTranscript::cancel_request() {
 
 void TerminalTranscript::append_event(const core::AgentEvent &event) {
   using core::AgentEventType;
+  if (event.model_usage.has_value() &&
+      event.type != AgentEventType::tool_result) {
+    token_metrics_.context_tokens = event.model_usage->input_tokens;
+    token_metrics_.input_tokens += event.model_usage->input_tokens;
+    token_metrics_.output_tokens += event.model_usage->output_tokens;
+    token_metrics_.cached_context_tokens =
+        event.model_usage->cached_input_tokens;
+    token_metrics_.context_breakdown = event.model_usage->context_breakdown;
+    if (event.model_usage->output_tokens_per_second > 0.0) {
+      token_metrics_.output_tokens_per_second =
+          event.model_usage->output_tokens_per_second;
+    }
+  }
   switch (event.type) {
   case AgentEventType::agent_start:
     activity_ = TerminalActivity::thinking;
@@ -1036,18 +1140,6 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
     break;
   case AgentEventType::assistant_message:
     activity_ = TerminalActivity::stream;
-    if (event.model_usage.has_value()) {
-      token_metrics_.context_tokens = event.model_usage->input_tokens;
-      token_metrics_.input_tokens += event.model_usage->input_tokens;
-      token_metrics_.output_tokens += event.model_usage->output_tokens;
-      token_metrics_.cached_context_tokens =
-          event.model_usage->cached_input_tokens;
-      token_metrics_.context_breakdown = event.model_usage->context_breakdown;
-      if (event.model_usage->output_tokens_per_second > 0.0) {
-        token_metrics_.output_tokens_per_second =
-            event.model_usage->output_tokens_per_second;
-      }
-    }
     if (active_assistant_.has_value()) {
       if (!event.text.empty()) {
         messages_[*active_assistant_].content = event.text;
@@ -1056,6 +1148,21 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
       append_message({TerminalMessageKind::assistant, "zeda", event.text});
     }
     active_assistant_.reset();
+    break;
+  case AgentEventType::context_window:
+    append_message({TerminalMessageKind::notice, "context", event.text});
+    activity_ = TerminalActivity::thinking;
+    break;
+  case AgentEventType::model_retry:
+    if (active_assistant_.has_value()) {
+      messages_[*active_assistant_] = {TerminalMessageKind::notice, "retry",
+                                       event.text};
+    } else {
+      append_message({TerminalMessageKind::notice, "retry", event.text});
+    }
+    active_assistant_.reset();
+    active_tool_.reset();
+    activity_ = TerminalActivity::thinking;
     break;
   case AgentEventType::tool_start:
     activity_ = TerminalActivity::action;
@@ -1083,16 +1190,20 @@ void TerminalTranscript::append_event(const core::AgentEvent &event) {
       message.content = event.text;
       message.is_error =
           event.tool_result.has_value() && event.tool_result->is_error;
+      if (!message.is_error && looks_like_diff(message.content))
+        message.expanded = true;
     } else if (active_tool_.has_value()) {
       auto &message = messages_[*active_tool_];
       message.content = event.text;
       message.is_error =
           event.tool_result.has_value() && event.tool_result->is_error;
+      if (!message.is_error && looks_like_diff(message.content))
+        message.expanded = true;
     } else {
       const bool is_error =
           event.tool_result.has_value() && event.tool_result->is_error;
       append_message({TerminalMessageKind::tool, "tool", event.text, true,
-                      false, is_error});
+                      !is_error && looks_like_diff(event.text), is_error});
     }
     active_tool_.reset();
     break;
@@ -1196,7 +1307,9 @@ void TerminalTranscript::restore(const std::vector<core::Message> &history) {
           label = name->second;
       }
       append_message({TerminalMessageKind::tool, std::move(label),
-                      message.content, true, false, message.is_error});
+                      message.content, true,
+                      !message.is_error && looks_like_diff(message.content),
+                      message.is_error});
       break;
     }
     }
@@ -1378,6 +1491,18 @@ void TerminalRenderer::render(const core::AgentEvent &event) {
             << std::flush;
     last_tool_update_.clear();
     break;
+  case AgentEventType::model_retry:
+    if (assistant_stream_open_) {
+      output_ << "\n";
+      assistant_stream_open_ = false;
+    }
+    output_ << render_text("[retry: " + event.text + "]", Tone::tool) << "\n"
+            << std::flush;
+    break;
+  case AgentEventType::context_window:
+    output_ << render_text("[context: " + event.text + "]", Tone::tool) << "\n"
+            << std::flush;
+    break;
   case AgentEventType::tool_update:
     if (!event.text.empty() && event.text != last_tool_update_) {
       output_ << render_text("[tool update: " + event.text + "]", Tone::tool)
@@ -1387,8 +1512,8 @@ void TerminalRenderer::render(const core::AgentEvent &event) {
     }
     break;
   case AgentEventType::tool_result:
-    output_ << render_element(ftxui::paragraph(event.text) |
-                              ftxui::color(terminal_theme(options_.theme).text))
+    output_ << render_element(render_tool_output(
+                   event.text, terminal_theme(options_.theme)))
             << "\n"
             << std::flush;
     last_tool_update_.clear();
@@ -1462,7 +1587,7 @@ TerminalApplication::TerminalApplication(
     QuickBashState quick_bash_enabled, SessionNameState session_name,
     SessionLoader session_loader, InitialActivity initial_activity,
     std::vector<TerminalCommandHint> command_hints, SubmitHandler submit,
-    CommandHandler command)
+    CommandHandler command, CommandHintsState command_hints_state)
     : workspace_(std::move(workspace)), model_state_(model),
       version_(std::move(version)), startup_(startup),
       max_context_tokens_state_(max_context_tokens),
@@ -1475,8 +1600,9 @@ TerminalApplication::TerminalApplication(
       session_name_(std::move(session_name)),
       session_loader_(std::move(session_loader)),
       initial_activity_(std::move(initial_activity)),
-      command_hints_(std::move(command_hints)), submit_(std::move(submit)),
-      command_(std::move(command)) {}
+      command_hints_(std::move(command_hints)),
+      command_hints_state_(std::move(command_hints_state)),
+      submit_(std::move(submit)), command_(std::move(command)) {}
 
 TerminalApplication::~TerminalApplication() {
   if (active_cancellation_ != nullptr)
@@ -1895,6 +2021,20 @@ bool TerminalApplication::handle_event(ftxui::Event event) {
   }
   const auto command_suggestions =
       terminal_command_suggestions(input_, command_hints_);
+  if (!busy_ && prompt_history_.navigating() && event == ftxui::Event::Return)
+    return false;
+  if (!busy_ && (prompt_history_.navigating() || command_suggestions.empty()) &&
+      (event == ftxui::Event::ArrowUp || event == ftxui::Event::ArrowDown)) {
+    const auto recalled = event == ftxui::Event::ArrowUp
+                              ? prompt_history_.previous(input_)
+                              : prompt_history_.next();
+    if (recalled) {
+      input_ = *recalled;
+      input_cursor_position_ = static_cast<int>(input_.size());
+      selected_command_suggestion_ = 0;
+    }
+    return true;
+  }
   if (!busy_ && !command_suggestions.empty()) {
     if (event == ftxui::Event::ArrowDown) {
       selected_command_suggestion_ =
@@ -1908,6 +2048,7 @@ bool TerminalApplication::handle_event(ftxui::Event event) {
       return true;
     }
     if (is_terminal_command_completion_event(event)) {
+      prompt_history_.reset_navigation();
       auto completed = complete_terminal_command(input_, command_hints_,
                                                  selected_command_suggestion_);
       if (event == ftxui::Event::Return && completed == input_)
@@ -1917,17 +2058,6 @@ bool TerminalApplication::handle_event(ftxui::Event event) {
       selected_command_suggestion_ = 0;
       return true;
     }
-  }
-  if (!busy_ && command_suggestions.empty() &&
-      (event == ftxui::Event::ArrowUp || event == ftxui::Event::ArrowDown)) {
-    const auto recalled = event == ftxui::Event::ArrowUp
-                              ? prompt_history_.previous(input_)
-                              : prompt_history_.next();
-    if (recalled.has_value()) {
-      input_ = *recalled;
-      input_cursor_position_ = static_cast<int>(input_.size());
-    }
-    return true;
   }
   if (event.is_mouse() && event.mouse().button == ftxui::Mouse::Left) {
     const auto &mouse = event.mouse();
@@ -2037,6 +2167,7 @@ void TerminalApplication::submit_line() {
     const std::string display =
         "/" + command.name +
         (command.arguments.empty() ? std::string{} : " " + command.arguments);
+    prompt_history_.remember(display);
     const bool opens_document_view = terminal_command_opens_document_view(
         command.name, command.arguments, command_hints_);
     transcript_.begin_request(display, TerminalActivity::action);
@@ -2067,7 +2198,11 @@ void TerminalApplication::submit_line() {
           const auto displayed_max_context_tokens = max_context_tokens_state_;
           const auto displayed_reasoning_effort = reasoning_effort_state_;
           const auto displayed_theme_kind = theme_kind_state_;
+          auto refreshed_hints = command_hints_state_
+                                     ? std::optional(command_hints_state_())
+                                     : std::nullopt;
           app_->Post([this, command, display, result = std::move(result),
+                      refreshed_hints = std::move(refreshed_hints),
                       document_view = std::move(document_view),
                       displayed_model = std::move(displayed_model),
                       displayed_max_context_tokens, displayed_reasoning_effort,
@@ -2076,6 +2211,8 @@ void TerminalApplication::submit_line() {
             displayed_max_context_tokens_ = displayed_max_context_tokens;
             displayed_reasoning_effort_ = displayed_reasoning_effort;
             displayed_theme_kind_ = displayed_theme_kind;
+            if (refreshed_hints)
+              command_hints_ = std::move(*refreshed_hints);
             bool appended_after_restore = false;
             if (document_view.has_value()) {
               auto opened = core::Result<std::string>::success(
@@ -2109,8 +2246,7 @@ void TerminalApplication::submit_line() {
   busy_ = true;
   scroll_state_.follow_latest();
   const auto initial_activity = initial_activity_(trimmed_line);
-  if (initial_activity != TerminalActivity::action)
-    prompt_history_.remember(std::string(trimmed_line));
+  prompt_history_.remember(std::string(trimmed_line));
   transcript_.begin_request(std::string(trimmed_line), initial_activity);
   active_cancellation_ = std::make_shared<core::CancellationSource>();
   const auto cancellation = active_cancellation_;
@@ -2142,6 +2278,12 @@ void TerminalApplication::submit_line() {
             const auto now = std::chrono::steady_clock::now();
             if (!delta_posted || now - last_delta_post >= kFrameInterval)
               flush_delta();
+            return;
+          }
+          if (event.type == core::AgentEventType::model_retry) {
+            pending_delta.clear();
+            delta_posted = false;
+            post_event(event);
             return;
           }
           flush_delta();

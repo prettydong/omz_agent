@@ -38,6 +38,18 @@ struct TerminalTheme {
   ftxui::Color markdown_rule;
   ftxui::Color markdown_list;
   ftxui::Color markdown_code_block;
+  ftxui::Color code_text;
+  ftxui::Color code_keyword;
+  ftxui::Color code_string;
+  ftxui::Color code_number;
+  ftxui::Color code_comment;
+  ftxui::Color code_type;
+  ftxui::Color code_line_number;
+  ftxui::Color diff_header;
+  ftxui::Color diff_added;
+  ftxui::Color diff_removed;
+  ftxui::Color diff_added_background;
+  ftxui::Color diff_removed_background;
 };
 
 [[nodiscard]] constexpr std::string_view theme_name(ThemeKind kind) {

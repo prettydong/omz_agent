@@ -24,8 +24,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../src/app/command_completion.hpp"
 #include "zed/core/context.hpp"
 #include "zed/core/tool_registry.hpp"
+#include "zed/core/utf8.hpp"
 #include "zed/extensions/extension_registry.hpp"
 #include "zed/providers/opencode_go_model.hpp"
 #include "zed/session/jsonl_session_store.hpp"
@@ -218,6 +220,50 @@ int main() {
 
   zed::session::JsonlSessionStore session(root / "session.jsonl");
   assert(session.initialize(metadata(session.path(), "Primary session")));
+  const auto completion_catalog = zed::providers::default_opencode_go_models();
+  const auto configure_options =
+      zed::app::configure_completion_options(root, completion_catalog);
+  const auto configure =
+      std::find_if(configure_options.begin(), configure_options.end(),
+                   [](const zed::ui::TerminalCommandOption &option) {
+                     return option.value == "agent";
+                   });
+  assert(configure != configure_options.end());
+  const auto select =
+      std::find_if(configure->children.begin(), configure->children.end(),
+                   [](const zed::ui::TerminalCommandOption &option) {
+                     return option.value == "select";
+                   });
+  assert(select != configure->children.end());
+  assert(!select->children.empty());
+  const auto agent_set =
+      std::find_if(configure->children.begin(), configure->children.end(),
+                   [](const zed::ui::TerminalCommandOption &option) {
+                     return option.value == "set";
+                   });
+  assert(agent_set != configure->children.end());
+  const auto max_turns =
+      std::find_if(agent_set->children.begin(), agent_set->children.end(),
+                   [](const zed::ui::TerminalCommandOption &option) {
+                     return option.value == "max-turns";
+                   });
+  assert(max_turns != agent_set->children.end());
+  assert(max_turns->accepts_argument);
+  const auto session_options = zed::app::session_completion_options(root);
+  const auto open =
+      std::find_if(session_options.begin(), session_options.end(),
+                   [](const zed::ui::TerminalCommandOption &option) {
+                     return option.value == "open";
+                   });
+  assert(open != session_options.end());
+  assert(std::any_of(open->children.begin(), open->children.end(),
+                     [](const zed::ui::TerminalCommandOption &option) {
+                       return option.value == "session";
+                     }));
+  assert(std::any_of(session_options.begin(), session_options.end(),
+                     [](const zed::ui::TerminalCommandOption &option) {
+                       return option.value == "session";
+                     }));
   const Message original_user{
       "user-1", Role::user, "你好，zed", {}, std::nullopt};
   const Message original_assistant{
@@ -477,6 +523,16 @@ int main() {
   const auto write = registry.execute(
       call("write-1", "write", R"({"path":"hello.txt","content":"你好"})"), {});
   assert(write);
+  assert(write.value().content.starts_with("wrote 6 bytes\n--- /dev/null\n"
+                                           "+++ b/hello.txt\n"));
+  assert(write.value().content.find("@@ -0,0 +1,1 @@") != std::string::npos);
+
+  const auto failed_write = registry.execute(
+      call("write-duplicate", "write",
+           R"({"path":"hello.txt","content":"must not be written"})"),
+      {});
+  assert(!failed_write);
+  assert(failed_write.error().message.find("wrote ") == std::string::npos);
 
   const auto read =
       registry.execute(call("read-1", "read", R"({"path":"hello.txt"})"), {});
@@ -489,6 +545,55 @@ int main() {
           R"({"path":"hello.txt","old_text":"你好","new_text":"你好，zed","expected_replacements":1})"),
       {});
   assert(edit);
+  assert(edit.value().content.starts_with("replaced 1 occurrence(s)\n"
+                                          "--- a/hello.txt\n"
+                                          "+++ b/hello.txt\n"));
+  assert(edit.value().content.find("-你好\n\\ No newline at end of file\n"
+                                   "+你好，zed\n"
+                                   "\\ No newline at end of file\n") !=
+         std::string::npos);
+
+  {
+    std::ofstream original(root / "overwrite.txt");
+    original << "before";
+  }
+  const auto overwrite = registry.execute(
+      call(
+          "write-overwrite", "write",
+          R"({"path":"overwrite.txt","content":"overwritten\n","overwrite":true})"),
+      {});
+  assert(overwrite);
+  assert(overwrite.value().content.find(
+             "--- a/overwrite.txt\n+++ b/overwrite.txt\n") !=
+         std::string::npos);
+  assert(overwrite.value().content.find("-before\n"
+                                        "\\ No newline at end of file\n"
+                                        "+overwritten\n") != std::string::npos);
+
+  const auto escaped_path_write =
+      registry.execute(call("write-escaped-path", "write",
+                            R"({"path":"line\nname.txt","content":"safe"})"),
+                       {});
+  assert(escaped_path_write);
+  assert(escaped_path_write.value().content.find(
+             "+++ b/\"line\\nname.txt\"\n") != std::string::npos);
+
+  zed::core::ToolRegistry limited_output_registry;
+  assert(limited_output_registry.register_tool(
+      std::make_unique<zed::tools::WriteFileTool>(
+          root, zed::tools::ToolLimits{256 * 1024, 256 * 1024, 256 * 1024,
+                                       1'000, 80})));
+  const auto truncated_write = limited_output_registry.execute(
+      call(
+          "write-output-limit", "write",
+          R"({"path":"limited-output.txt","content":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})"),
+      {});
+  assert(truncated_write);
+  assert(truncated_write.value().content.size() <= 80);
+  assert(truncated_write.value().content.find("[diff truncated]") !=
+         std::string::npos);
+  assert(truncated_write.value().content.find('\0') == std::string::npos);
+  assert(zed::core::is_valid_utf8(truncated_write.value().content));
 
   {
     std::ofstream limited_file(root / "limited-edit.txt");
@@ -1049,6 +1154,76 @@ int main() {
   assert(first_update != std::string::npos);
   assert(terminal_output.str().find("explorer running", first_update + 1) ==
          std::string::npos);
+
+  std::stringstream context_terminal_output;
+  zed::ui::TerminalRenderer context_renderer(context_terminal_output, {false});
+  const zed::core::AgentEvent context_event{
+      zed::core::AgentEventType::context_window,
+      "window-1 -> window-2; archived 4 messages"};
+  context_renderer.render(context_event);
+  assert(context_terminal_output.str().find(
+             "[context: window-1 -> window-2;") != std::string::npos);
+  zed::ui::TerminalTranscript context_transcript;
+  context_transcript.begin_request("continue the task");
+  context_transcript.append_event(context_event);
+  assert(context_transcript.messages().back().kind ==
+         zed::ui::TerminalMessageKind::notice);
+  assert(context_transcript.messages().back().content == context_event.text);
+  assert(context_transcript.activity() == zed::ui::TerminalActivity::thinking);
+
+  std::stringstream retry_terminal_output;
+  zed::ui::TerminalRenderer retry_renderer(retry_terminal_output, {false});
+  retry_renderer.render(
+      {zed::core::AgentEventType::assistant_delta, "discarded partial", {}});
+  retry_renderer.render({zed::core::AgentEventType::model_retry,
+                         "retrying (1/2): missing purpose",
+                         {},
+                         {},
+                         zed::core::ModelUsage{7, 2, 3}});
+  retry_renderer.render(
+      {zed::core::AgentEventType::assistant_delta, "recovered reply", {}});
+  retry_renderer.render(
+      {zed::core::AgentEventType::assistant_message, "recovered reply", {}});
+  retry_renderer.render({zed::core::AgentEventType::agent_end, {}, {}});
+  const auto retry_terminal_text = retry_terminal_output.str();
+  assert(retry_terminal_text.find("discarded partial\n[retry: retrying (1/2): "
+                                  "missing purpose]") != std::string::npos);
+  assert(retry_terminal_text.find("recovered reply") != std::string::npos);
+
+  zed::ui::TerminalTranscript retry_transcript;
+  retry_transcript.begin_request("repair the call");
+  retry_transcript.append_event(
+      {zed::core::AgentEventType::assistant_delta, "discarded partial", {}});
+  retry_transcript.append_event({zed::core::AgentEventType::model_retry,
+                                 "retrying (1/2): missing purpose",
+                                 {},
+                                 {},
+                                 zed::core::ModelUsage{7, 2, 3}});
+  assert(retry_transcript.activity() == zed::ui::TerminalActivity::thinking);
+  assert(retry_transcript.messages().size() == 2);
+  assert(retry_transcript.messages()[1].kind ==
+         zed::ui::TerminalMessageKind::notice);
+  assert(retry_transcript.messages()[1].content.find("retrying (1/2)") !=
+         std::string::npos);
+  assert(retry_transcript.messages()[1].content.find("discarded") ==
+         std::string::npos);
+  const auto retry_metrics = retry_transcript.token_metrics();
+  assert(retry_metrics.input_tokens == 7);
+  assert(retry_metrics.output_tokens == 3);
+  retry_transcript.append_event(
+      {zed::core::AgentEventType::assistant_delta, "recovered reply", {}});
+  retry_transcript.append_event({zed::core::AgentEventType::assistant_message,
+                                 "recovered reply",
+                                 {},
+                                 {},
+                                 zed::core::ModelUsage{11, 4, 5}});
+  retry_transcript.append_event({zed::core::AgentEventType::agent_end, {}, {}});
+  assert(retry_transcript.messages().size() == 3);
+  assert(retry_transcript.messages()[2].kind ==
+         zed::ui::TerminalMessageKind::assistant);
+  assert(retry_transcript.messages()[2].content == "recovered reply");
+  assert(retry_transcript.token_metrics().input_tokens == 18);
+  assert(retry_transcript.token_metrics().output_tokens == 8);
 
   std::stringstream terminal_input("first line\n");
   zed::ui::TerminalInput input(terminal_input);

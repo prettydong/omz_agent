@@ -16,7 +16,6 @@ FetchContent_Declare(
     nlohmann_json
     URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
     URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
@@ -82,19 +81,16 @@ if (ZEDA_BUILD_DEEPWIKI_PLUGIN)
         marked_web
         URL https://registry.npmjs.org/marked/-/marked-18.0.11.tgz
         URL_HASH SHA1=0f50ce5cdf25b2c07f67d3787220b64a5845cce1
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     FetchContent_Declare(
         dompurify_web
         URL https://registry.npmjs.org/dompurify/-/dompurify-3.4.14.tgz
         URL_HASH SHA1=a789edb2c7bcdb69a93713a34edb7e0a5245d8c9
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     FetchContent_Declare(
         mermaid_web
         URL https://registry.npmjs.org/mermaid/-/mermaid-11.17.2.tgz
         URL_HASH SHA1=e3caf3717582c0e44e5d04cff043e025caec7cba
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     FetchContent_MakeAvailable(marked_web dompurify_web mermaid_web)
 endif()
@@ -105,6 +101,8 @@ add_library(zed_core
     src/core/agent_loop.cpp
     src/core/context.cpp
     src/core/model_context_controller.cpp
+    src/context/context_archive.cpp
+    src/context/experimental_context.cpp
     src/core/session_store.cpp
     src/core/tool_registry.cpp
     src/core/utf8.cpp
@@ -124,7 +122,9 @@ add_library(zed_core
     src/support/atomic_file.cpp
     src/support/child_process.cpp
     src/tools/basic_tools.cpp
+    src/tools/text_diff.cpp
     src/tools/clangd_tool.cpp
+    src/tools/context_tools.cpp
     src/tools/multi_bash_tool.cpp
     src/tools/subagent_tool.cpp
 )
@@ -161,6 +161,7 @@ elseif (MSVC)
 endif()
 
 add_library(zed_ui
+    src/ui/code_render.cpp
     src/ui/markdown.cpp
     src/ui/terminal.cpp
     src/ui/theme.cpp
@@ -286,6 +287,18 @@ endif()
 include(CTest)
 
 if (BUILD_TESTING)
+    add_executable(zed_context_archive_smoke tests/context_archive_smoke.cpp)
+    target_link_libraries(zed_context_archive_smoke PRIVATE zed_core)
+    add_test(NAME zed_context_archive_smoke COMMAND zed_context_archive_smoke)
+
+    add_executable(zed_context_tools_edges_smoke tests/context_tools_edges_smoke.cpp)
+    target_link_libraries(zed_context_tools_edges_smoke PRIVATE zed_core)
+    add_test(NAME zed_context_tools_edges_smoke COMMAND zed_context_tools_edges_smoke)
+
+    add_executable(zed_experimental_context_smoke tests/experimental_context_smoke.cpp)
+    target_link_libraries(zed_experimental_context_smoke PRIVATE zed_core)
+    add_test(NAME zed_experimental_context_smoke COMMAND zed_experimental_context_smoke)
+
     add_executable(zed_core_smoke tests/core_smoke.cpp)
     target_link_libraries(zed_core_smoke PRIVATE zed_core)
     add_test(NAME zed_core_smoke COMMAND zed_core_smoke)
@@ -309,6 +322,14 @@ if (BUILD_TESTING)
     target_link_libraries(zed_markdown_smoke PRIVATE zed_ui)
     add_test(NAME zed_markdown_smoke COMMAND zed_markdown_smoke)
 
+    add_executable(zed_code_render_smoke tests/code_render_smoke.cpp)
+    target_link_libraries(zed_code_render_smoke PRIVATE zed_ui)
+    add_test(NAME zed_code_render_smoke COMMAND zed_code_render_smoke)
+
+    add_executable(zed_text_diff_smoke tests/text_diff_smoke.cpp)
+    target_link_libraries(zed_text_diff_smoke PRIVATE zed_core)
+    add_test(NAME zed_text_diff_smoke COMMAND zed_text_diff_smoke)
+
     add_executable(zed_quick_bash_smoke tests/quick_bash_smoke.cpp)
     target_link_libraries(zed_quick_bash_smoke PRIVATE zed_core)
     add_test(NAME zed_quick_bash_smoke COMMAND zed_quick_bash_smoke)
@@ -324,6 +345,12 @@ if (BUILD_TESTING)
     add_executable(zed_support_smoke tests/support_smoke.cpp)
     target_link_libraries(zed_support_smoke PRIVATE zed_core)
     add_test(NAME zed_support_smoke COMMAND zed_support_smoke)
+
+    add_executable(zed_model_scores_smoke tests/model_scores_smoke.cpp)
+    target_include_directories(zed_model_scores_smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME zed_model_scores_smoke COMMAND zed_model_scores_smoke)
 
     add_executable(zed_fake_clangd tests/fake_clangd.cpp)
     add_executable(zed_fake_opencode tests/fake_opencode.cpp)
@@ -417,11 +444,16 @@ if (BUILD_TESTING)
     endif()
 
     set(ZED_ASSERTING_TEST_TARGETS
+        zed_context_archive_smoke
+        zed_context_tools_edges_smoke
+        zed_experimental_context_smoke
         zed_core_smoke
         zed_modules_smoke
         zed_config_smoke
         zed_configure_web_smoke
         zed_markdown_smoke
+        zed_code_render_smoke
+        zed_text_diff_smoke
         zed_quick_bash_smoke
         zed_session_smoke
         zed_opencode_go_smoke
@@ -459,6 +491,14 @@ if (BUILD_TESTING)
             "-DZEDA_EXECUTABLE=$<TARGET_FILE:zeda>"
             "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/configure-web-smoke"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/configure_web_command_smoke.cmake
+    )
+
+    add_test(
+        NAME zeda_configure_terminal_command_smoke
+        COMMAND ${CMAKE_COMMAND}
+            "-DZEDA_EXECUTABLE=$<TARGET_FILE:zeda>"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/configure-terminal-smoke"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/configure_terminal_command_smoke.cmake
     )
 
     add_test(

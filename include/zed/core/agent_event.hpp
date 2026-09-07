@@ -5,6 +5,7 @@
 #include <string>
 #include <utility>
 
+#include "zed/core/context.hpp"
 #include "zed/core/message.hpp"
 #include "zed/core/model.hpp"
 #include "zed/core/tool.hpp"
@@ -21,6 +22,8 @@ enum class AgentEventType {
   tool_result,
   agent_end,
   error,
+  model_retry,
+  context_window,
 };
 
 struct AgentEvent {
@@ -40,6 +43,7 @@ struct AgentEvent {
   std::optional<ToolCall> tool_call;
   std::optional<ToolResult> tool_result;
   std::optional<ModelUsage> model_usage;
+  std::optional<ContextTransition> context_transition;
 };
 
 using AgentEventCallback = std::function<void(const AgentEvent &)>;

@@ -30,6 +30,7 @@ struct ContextConfig {
   core::ModelRef model{"opencode-go", "muse-spark-1.2-contributor"};
   core::ContextLimits limits{1'000'000, 4'096, 800'000};
   std::size_t max_output_tokens{1'024};
+  bool experimental_mode{true};
 };
 
 struct SubagentExecutionConfig {
@@ -88,6 +89,7 @@ struct RuntimeConfig {
   core::ReasoningEffort reasoning_effort{core::ReasoningEffort::low};
   std::string terminal_theme{"light"};
   bool quick_bash_enabled{true};
+  bool experimental_context_management{true};
   core::ContextLimits context_limits;
   tools::ToolLimits tool_limits;
   std::size_t max_turns{32};

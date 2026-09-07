@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <cmath>
 #include <iostream>
+#include <sstream>
 #include <string_view>
 #include <utility>
 
@@ -31,6 +34,58 @@ split_first_argument(std::string_view arguments) {
           trim_ascii_whitespace(trimmed.substr(separator + 1))};
 }
 
+zed::core::Result<std::size_t> parse_size(std::string_view text,
+                                          std::string_view field) {
+  std::size_t value = 0;
+  const auto parsed =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (text.empty() || parsed.ec != std::errc{} ||
+      parsed.ptr != text.data() + text.size()) {
+    return zed::core::Result<std::size_t>::failure({
+        zed::core::ErrorCode::invalid_argument,
+        std::string(field) + " must be an integer",
+    });
+  }
+  return zed::core::Result<std::size_t>::success(value);
+}
+
+zed::core::Result<double> parse_temperature(std::string_view text) {
+  double value = 0.0;
+  const auto parsed =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (text.empty() || parsed.ec != std::errc{} ||
+      parsed.ptr != text.data() + text.size()) {
+    return zed::core::Result<double>::failure({
+        zed::core::ErrorCode::invalid_argument,
+        "temperature must be a number between 0 and 2",
+    });
+  }
+  return zed::core::Result<double>::success(value);
+}
+
+zed::core::Result<bool> parse_on_off(std::string_view text,
+                                     std::string_view field) {
+  if (text == "on")
+    return zed::core::Result<bool>::success(true);
+  if (text == "off")
+    return zed::core::Result<bool>::success(false);
+  return zed::core::Result<bool>::failure({
+      zed::core::ErrorCode::invalid_argument,
+      std::string(field) + " must be on or off",
+  });
+}
+
+std::vector<std::string> split_csv(std::string_view text) {
+  std::vector<std::string> values;
+  while (true) {
+    const auto separator = text.find(',');
+    values.push_back(trim_ascii_whitespace(text.substr(0, separator)));
+    if (separator == std::string_view::npos)
+      return values;
+    text.remove_prefix(separator + 1);
+  }
+}
+
 } // namespace
 
 namespace zed::app {
@@ -50,7 +105,7 @@ BuiltinCommandRegistrar::BuiltinCommandRegistrar(
     const std::filesystem::path &session_directory,
     session::JsonlSessionStore &session,
     const SessionMetadataFactory &session_metadata,
-    plugins::PluginManager &plugins)
+    plugins::PluginManager &plugins, context::ContextArchive *context_archive)
     : extensions(extensions), runtime_config(runtime_config),
       model_catalog(model_catalog), built_in_agents(built_in_agents),
       subagent_tool_handle(subagent_tool_handle), tools(tools),
@@ -60,7 +115,8 @@ BuiltinCommandRegistrar::BuiltinCommandRegistrar(
       active_context_limits(active_context_limits), active_theme(active_theme),
       loop(loop), model(model), quick_bash(quick_bash),
       session_directory(session_directory), session(session),
-      session_metadata(session_metadata), plugins(plugins) {}
+      session_metadata(session_metadata), plugins(plugins),
+      context_archive(context_archive) {}
 
 extensions::Command BuiltinCommandRegistrar::create_model_command(
     std::vector<extensions::CommandOption> options) {
@@ -68,6 +124,7 @@ extensions::Command BuiltinCommandRegistrar::create_model_command(
       .name = "model",
       .description = "Show, set, or refresh OpenCode Go models: /model "
                      "<id|list|refresh>.",
+      .execute = {},
       .options = std::move(options),
       .execute_with_events =
           [this](std::string_view arguments,
@@ -252,6 +309,16 @@ extensions::Command BuiltinCommandRegistrar::create_session_command(
           const auto forked = session.fork_to(path, remainder);
           if (!forked)
             return zed::core::Result<std::string>::failure(forked.error());
+          if (context_archive != nullptr) {
+            const auto copied = context_archive->fork_to(
+                std::filesystem::path(path.string() + ".context"), {});
+            if (!copied)
+              return core::Result<std::string>::failure(
+                  {copied.error().code,
+                   "session transcript fork was created but context state "
+                   "could not be copied; current session unchanged: " +
+                       copied.error().message});
+          }
           const auto switched = session.switch_to(path);
           if (!switched)
             return zed::core::Result<std::string>::failure(switched.error());
@@ -309,6 +376,559 @@ extensions::Command BuiltinCommandRegistrar::create_session_command(
         result += "usage: /session new [title] | open <id-or-title> | "
                   "rename <title> | fork [title]\n";
         return zed::core::Result<std::string>::success(std::move(result));
+      },
+      std::move(options),
+      {},
+  };
+}
+
+extensions::Command BuiltinCommandRegistrar::create_configure_command(
+    std::vector<extensions::CommandOption> options) {
+  return {
+      "configure",
+      "Inspect or persist terminal configuration; changes apply after restart.",
+      [this](std::string_view arguments) {
+        const auto usage = [] {
+          return std::string(
+              "usage:\n"
+              "  /configure [show]\n"
+              "  /configure model [id]\n"
+              "  /configure reasoning [effort]\n"
+              "  /configure agent list|select <id>|set <field> <value>\n"
+              "  /configure subagent list|set <explorer|id> <field> <value>\n"
+              "  /configure skill list|enable <id>|disable <id>\n"
+              "  /configure context set <field> <value>\n"
+              "agent fields: model, reasoning, max-turns, max-output-tokens, "
+              "temperature, compaction, trigger, tools, system-prompt\n"
+              "tools accepts * or a comma-separated list of registered tool "
+              "names\n"
+              "subagent fields: enabled, model, reasoning, max-turns, "
+              "max-output-tokens, system-prompt\n"
+              "context fields: model, max-tokens, reserved-output-tokens, "
+              "trigger, max-output-tokens, max-concurrency, timeout-ms, "
+              "max-output-bytes, experimental-mode, system-prompt\n");
+        };
+        const auto loaded_config =
+            load_workspace_config(runtime_config.workspace);
+        if (!loaded_config)
+          return core::Result<std::string>::failure(loaded_config.error());
+        const auto loaded_prompts =
+            load_workspace_prompts(runtime_config.workspace);
+        if (!loaded_prompts)
+          return core::Result<std::string>::failure(loaded_prompts.error());
+        const auto loaded_management = load_agent_management(
+            runtime_config.workspace, loaded_config.value(),
+            loaded_prompts.value());
+        if (!loaded_management) {
+          return core::Result<std::string>::failure(loaded_management.error());
+        }
+        const auto loaded_skills =
+            skills::load_workspace_skills(runtime_config.workspace);
+        if (!loaded_skills)
+          return core::Result<std::string>::failure(loaded_skills.error());
+
+        auto config = loaded_config.value();
+        auto prompts = loaded_prompts.value();
+        auto management = loaded_management.value();
+        auto managed_skills = loaded_skills.value();
+        const auto active_profile = [&]() -> AgentProfile * {
+          const auto profile =
+              std::find_if(management.agents.begin(), management.agents.end(),
+                           [&](const AgentProfile &candidate) {
+                             return candidate.id == management.active_agent;
+                           });
+          return profile == management.agents.end() ? nullptr : &*profile;
+        };
+        const auto summary = [&]() {
+          const auto *active = active_profile();
+          std::string result =
+              "workspace: " + runtime_config.workspace.string() + "\nconfig: " +
+              workspace_config_path(runtime_config.workspace).string() + "\n";
+          if (active != nullptr) {
+            result += "active agent: " + active->id + " (" +
+                      active->config.model.model + ", " +
+                      std::string(core::reasoning_effort_name(
+                          active->config.reasoning_effort)) +
+                      ")\n";
+            result +=
+                "  turns: " + std::to_string(active->config.max_turns) +
+                ", output: " +
+                std::to_string(active->config.max_output_tokens) +
+                ", temperature: " + std::to_string(active->config.temperature) +
+                ", compaction: " +
+                (active->automatic_context_compaction ? "on" : "off") +
+                ", trigger: " +
+                std::to_string(active->compaction_trigger_tokens) + "\n";
+          }
+          result +=
+              "context: " + config.context.model.model + ", max: " +
+              std::to_string(config.context.limits.max_context_tokens) +
+              ", reserved: " +
+              std::to_string(config.context.limits.reserved_output_tokens) +
+              ", output: " + std::to_string(config.context.max_output_tokens) +
+              ", experimental mode: " +
+              (config.context.experimental_mode ? "on" : "off") + "\n";
+          result += "subagent execution: concurrency " +
+                    std::to_string(config.subagent_execution.max_concurrency) +
+                    ", timeout " +
+                    std::to_string(config.subagent_execution.total_timeout_ms) +
+                    " ms, output " +
+                    std::to_string(
+                        config.subagent_execution.max_aggregate_output_bytes) +
+                    " bytes\n";
+          result += "subagents: explorer";
+          for (const auto &subagent : management.subagents)
+            result += ", " + subagent.name;
+          result += "\nskills: " + std::to_string(managed_skills.size()) +
+                    "\nrestart required after saved changes\n";
+          return result;
+        };
+        const auto save = [&](bool write_prompts, bool write_config,
+                              bool write_management,
+                              bool write_skills) -> core::Result<std::string> {
+          auto *active = active_profile();
+          if (active == nullptr) {
+            return core::Result<std::string>::failure({
+                core::ErrorCode::invalid_argument,
+                "active Agent does not exist",
+            });
+          }
+          config.agent = active->config;
+          config.context.limits.compaction_trigger_tokens =
+              active->compaction_trigger_tokens;
+          prompts.agent = active->system_prompt;
+          const auto valid_config =
+              parse_workspace_config(serialize_workspace_config(config));
+          const auto valid_prompts = validate_workspace_prompts(prompts);
+          const auto valid_management = validate_agent_management(management);
+          const auto valid_skills =
+              skills::validate_workspace_skills(managed_skills);
+          if (!valid_config || !valid_prompts || !valid_management ||
+              !valid_skills) {
+            const auto *error = !valid_config       ? &valid_config.error()
+                                : !valid_prompts    ? &valid_prompts.error()
+                                : !valid_management ? &valid_management.error()
+                                                    : &valid_skills.error();
+            return core::Result<std::string>::failure(*error);
+          }
+          const auto validate_model =
+              [&](std::string_view model_id, core::ReasoningEffort effort,
+                  std::string_view label) -> core::Result<void> {
+            const auto *model =
+                providers::find_opencode_go_model(model_catalog, model_id);
+            if (model == nullptr) {
+              return core::Result<void>::failure({
+                  core::ErrorCode::not_found,
+                  std::string(label) +
+                      " model is not in the current catalog: " +
+                      std::string(model_id),
+              });
+            }
+            if (!providers::supports_reasoning_effort(*model, effort)) {
+              return core::Result<void>::failure({
+                  core::ErrorCode::invalid_argument,
+                  std::string(label) +
+                      " reasoning effort is not supported by " +
+                      std::string(model_id),
+              });
+            }
+            return core::Result<void>::success();
+          };
+          const auto main_model =
+              validate_model(active->config.model.model,
+                             active->config.reasoning_effort, "active Agent");
+          if (!main_model)
+            return core::Result<std::string>::failure(main_model.error());
+          const auto context_model =
+              validate_model(config.context.model.model,
+                             core::ReasoningEffort::automatic, "context");
+          if (!context_model)
+            return core::Result<std::string>::failure(context_model.error());
+          const auto explorer_model =
+              validate_model(config.explorer.model.model,
+                             config.explorer.reasoning_effort, "Explorer");
+          if (!explorer_model)
+            return core::Result<std::string>::failure(explorer_model.error());
+          for (const auto &subagent : management.subagents) {
+            const auto valid_subagent =
+                validate_model(subagent.model.model, subagent.reasoning_effort,
+                               "Sub Agent " + subagent.name);
+            if (!valid_subagent)
+              return core::Result<std::string>::failure(valid_subagent.error());
+          }
+          if (write_prompts) {
+            const auto saved_prompts =
+                save_workspace_prompts(runtime_config.workspace, prompts);
+            if (!saved_prompts) {
+              return core::Result<std::string>::failure(saved_prompts.error());
+            }
+          }
+          if (write_config) {
+            const auto saved_config =
+                save_workspace_config(runtime_config.workspace, config);
+            if (!saved_config) {
+              return core::Result<std::string>::failure(saved_config.error());
+            }
+          }
+          if (write_management) {
+            const auto saved_management =
+                save_agent_management(runtime_config.workspace, management);
+            if (!saved_management) {
+              return core::Result<std::string>::failure(
+                  saved_management.error());
+            }
+          }
+          if (write_skills) {
+            const auto saved_skills = skills::save_workspace_skills(
+                runtime_config.workspace, managed_skills);
+            if (!saved_skills) {
+              return core::Result<std::string>::failure(saved_skills.error());
+            }
+          }
+          return core::Result<std::string>::success(
+              "configuration saved to " +
+              workspace_config_path(runtime_config.workspace).string() +
+              "\nrestart zeda for changes to take effect\n");
+        };
+        const auto model_valid = [&](std::string_view requested) {
+          return providers::find_opencode_go_model(model_catalog, requested) !=
+                 nullptr;
+        };
+        const auto set_active_model =
+            [&](std::string_view requested) -> core::Result<std::string> {
+          auto *profile = active_profile();
+          const auto *model_info =
+              providers::find_opencode_go_model(model_catalog, requested);
+          if (profile == nullptr || model_info == nullptr) {
+            return core::Result<std::string>::failure({
+                core::ErrorCode::not_found,
+                "model not found; use /model list",
+            });
+          }
+          profile->config.model.model = std::string(requested);
+          if (!providers::supports_reasoning_effort(
+                  *model_info, profile->config.reasoning_effort)) {
+            profile->config.reasoning_effort = core::ReasoningEffort::automatic;
+            return core::Result<std::string>::success(
+                "reasoning reset to auto\n");
+          }
+          return core::Result<std::string>::success({});
+        };
+        const auto set_active_reasoning =
+            [&](std::string_view requested) -> core::Result<void> {
+          const auto effort = core::reasoning_effort_from_name(requested);
+          auto *profile = active_profile();
+          if (!effort.has_value()) {
+            return core::Result<void>::failure({
+                core::ErrorCode::invalid_argument,
+                "unknown reasoning effort",
+            });
+          }
+          const auto *model_info =
+              profile == nullptr
+                  ? nullptr
+                  : providers::find_opencode_go_model(
+                        model_catalog, profile->config.model.model);
+          if (profile == nullptr || model_info == nullptr ||
+              !providers::supports_reasoning_effort(*model_info, *effort)) {
+            return core::Result<void>::failure({
+                core::ErrorCode::invalid_argument,
+                "reasoning effort is not supported by the active Agent model",
+            });
+          }
+          profile->config.reasoning_effort = *effort;
+          return core::Result<void>::success();
+        };
+        const auto arguments_trimmed = trim_ascii_whitespace(arguments);
+        if (arguments_trimmed.empty() || arguments_trimmed == "show")
+          return core::Result<std::string>::success(summary() + usage());
+
+        const auto [group, after_group] =
+            split_first_argument(arguments_trimmed);
+        const auto [action, after_action] = split_first_argument(after_group);
+        if (group == "model") {
+          if (after_group.empty()) {
+            const auto *profile = active_profile();
+            return core::Result<std::string>::success(
+                "default model: " + profile->config.model.model + "\n" +
+                "usage: /configure model [id]\n");
+          }
+          const auto [requested, remainder] = split_first_argument(after_group);
+          if (!remainder.empty())
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument,
+                 "usage: /configure model [id]"});
+          const auto updated = set_active_model(requested);
+          if (!updated)
+            return core::Result<std::string>::failure(updated.error());
+          const auto saved = save(true, true, true, false);
+          if (!saved)
+            return saved;
+          return core::Result<std::string>::success(saved.value() +
+                                                    updated.value());
+        }
+        if (group == "reasoning") {
+          if (after_group.empty()) {
+            const auto *profile = active_profile();
+            return core::Result<std::string>::success(
+                "default reasoning: " +
+                std::string(core::reasoning_effort_name(
+                    profile->config.reasoning_effort)) +
+                "\nusage: /configure reasoning [effort]\n");
+          }
+          const auto [requested, remainder] = split_first_argument(after_group);
+          if (!remainder.empty())
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument,
+                 "usage: /configure reasoning [effort]"});
+          const auto updated = set_active_reasoning(requested);
+          if (!updated)
+            return core::Result<std::string>::failure(updated.error());
+          return save(true, true, true, false);
+        }
+        if (group == "agent") {
+          if (action == "list") {
+            if (!after_action.empty())
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::invalid_argument,
+                   "usage: /configure agent list"});
+            std::string result;
+            for (const auto &profile : management.agents) {
+              result += profile.id == management.active_agent ? "* " : "  ";
+              result += profile.id + " — " + profile.name + " — " +
+                        profile.config.model.model + "\n";
+            }
+            return core::Result<std::string>::success(std::move(result));
+          }
+          if (action == "select") {
+            if (after_action.empty())
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::invalid_argument,
+                   "usage: /configure agent select <id>"});
+            const auto profile =
+                std::find_if(management.agents.begin(), management.agents.end(),
+                             [&](const AgentProfile &candidate) {
+                               return candidate.id == after_action;
+                             });
+            if (profile == management.agents.end())
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::not_found,
+                   "Agent not found: " + after_action});
+            management.active_agent = profile->id;
+            return save(true, true, true, false);
+          }
+          if (action != "set")
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument, usage()});
+          const auto [field, value] = split_first_argument(after_action);
+          auto *profile = active_profile();
+          if (field.empty() || value.empty() || profile == nullptr)
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument, usage()});
+          std::string change_note;
+          if (field == "model") {
+            const auto updated = set_active_model(value);
+            if (!updated)
+              return core::Result<std::string>::failure(updated.error());
+            change_note = updated.value();
+          } else if (field == "reasoning") {
+            const auto updated = set_active_reasoning(value);
+            if (!updated)
+              return core::Result<std::string>::failure(updated.error());
+          } else if (field == "max-turns" || field == "max-output-tokens" ||
+                     field == "trigger") {
+            const auto number = parse_size(value, field);
+            if (!number)
+              return core::Result<std::string>::failure(number.error());
+            if (field == "max-turns")
+              profile->config.max_turns = number.value();
+            else if (field == "max-output-tokens")
+              profile->config.max_output_tokens = number.value();
+            else
+              profile->compaction_trigger_tokens = number.value();
+          } else if (field == "temperature") {
+            const auto temperature = parse_temperature(value);
+            if (!temperature)
+              return core::Result<std::string>::failure(temperature.error());
+            if (!std::isfinite(temperature.value())) {
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::invalid_argument,
+                   "temperature must be finite and between 0 and 2"});
+            }
+            profile->config.temperature = temperature.value();
+          } else if (field == "compaction") {
+            const auto enabled = parse_on_off(value, field);
+            if (!enabled)
+              return core::Result<std::string>::failure(enabled.error());
+            profile->automatic_context_compaction = enabled.value();
+          } else if (field == "tools") {
+            profile->tools = split_csv(value);
+          } else if (field == "system-prompt") {
+            profile->system_prompt = value;
+          } else {
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument, usage()});
+          }
+          const auto saved = save(true, true, true, false);
+          if (!saved)
+            return saved;
+          return core::Result<std::string>::success(saved.value() +
+                                                    change_note);
+        }
+
+        if (group == "subagent") {
+          if (action == "list") {
+            if (!after_action.empty())
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::invalid_argument,
+                   "usage: /configure subagent list"});
+            std::string result =
+                "explorer — " + config.explorer.model.model +
+                (config.explorer.enabled ? " — enabled\n" : " — disabled\n");
+            for (const auto &subagent : management.subagents) {
+              result += subagent.name + " — " + subagent.model.model +
+                        (subagent.enabled ? " — enabled\n" : " — disabled\n");
+            }
+            return core::Result<std::string>::success(std::move(result));
+          }
+          if (action != "set")
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument, usage()});
+          const auto [id, after_id] = split_first_argument(after_action);
+          const auto [field, value] = split_first_argument(after_id);
+          if (id.empty() || field.empty() || value.empty())
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument, usage()});
+          subagents::ExplorerAgentConfig *target = nullptr;
+          if (id == "explorer") {
+            target = &config.explorer;
+          } else {
+            const auto found = std::find_if(
+                management.subagents.begin(), management.subagents.end(),
+                [&](const subagents::ExplorerAgentConfig &candidate) {
+                  return candidate.name == id;
+                });
+            if (found == management.subagents.end())
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::not_found, "Sub Agent not found: " + id});
+            target = &*found;
+          }
+          if (field == "enabled") {
+            const auto enabled = parse_on_off(value, field);
+            if (!enabled)
+              return core::Result<std::string>::failure(enabled.error());
+            target->enabled = enabled.value();
+          } else if (field == "model") {
+            if (!model_valid(value))
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::not_found,
+                   "model not found; use /model list"});
+            target->model.model = value;
+          } else if (field == "reasoning") {
+            const auto effort = core::reasoning_effort_from_name(value);
+            if (!effort.has_value())
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::invalid_argument,
+                   "unknown reasoning effort"});
+            target->reasoning_effort = *effort;
+          } else if (field == "max-turns" || field == "max-output-tokens") {
+            const auto number = parse_size(value, field);
+            if (!number)
+              return core::Result<std::string>::failure(number.error());
+            if (field == "max-turns")
+              target->max_turns = number.value();
+            else
+              target->max_output_tokens = number.value();
+          } else if (field == "system-prompt") {
+            target->system_prompt = value;
+            if (id == "explorer")
+              prompts.explorer = value;
+          } else {
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument, usage()});
+          }
+          return save(id == "explorer", id == "explorer", id != "explorer",
+                      false);
+        }
+
+        if (group == "skill") {
+          if (action == "list") {
+            if (!after_action.empty())
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::invalid_argument,
+                   "usage: /configure skill list"});
+            std::string result;
+            for (const auto &skill : managed_skills) {
+              result += skill.id + " — " +
+                        (skill.enabled ? "enabled" : "disabled") + " — " +
+                        skill.name + "\n";
+            }
+            return core::Result<std::string>::success(
+                result.empty() ? "no managed workspace skills\n"
+                               : std::move(result));
+          }
+          if ((action != "enable" && action != "disable") ||
+              after_action.empty())
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument, usage()});
+          const auto skill =
+              std::find_if(managed_skills.begin(), managed_skills.end(),
+                           [&](const skills::ManagedSkill &candidate) {
+                             return candidate.id == after_action;
+                           });
+          if (skill == managed_skills.end())
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::not_found,
+                 "Skill not found: " + after_action});
+          skill->enabled = action == "enable";
+          return save(false, false, false, true);
+        }
+
+        if (group == "context" && action == "set") {
+          const auto [field, value] = split_first_argument(after_action);
+          if (field.empty() || value.empty())
+            return core::Result<std::string>::failure(
+                {core::ErrorCode::invalid_argument, usage()});
+          if (field == "model") {
+            if (!model_valid(value))
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::not_found,
+                   "model not found; use /model list"});
+            config.context.model.model = value;
+          } else if (field == "system-prompt") {
+            prompts.context = value;
+          } else if (field == "experimental-mode") {
+            const auto enabled = parse_on_off(value, field);
+            if (!enabled)
+              return core::Result<std::string>::failure(enabled.error());
+            config.context.experimental_mode = enabled.value();
+          } else {
+            const auto number = parse_size(value, field);
+            if (!number)
+              return core::Result<std::string>::failure(number.error());
+            if (field == "max-tokens")
+              config.context.limits.max_context_tokens = number.value();
+            else if (field == "reserved-output-tokens")
+              config.context.limits.reserved_output_tokens = number.value();
+            else if (field == "trigger")
+              active_profile()->compaction_trigger_tokens = number.value();
+            else if (field == "max-output-tokens")
+              config.context.max_output_tokens = number.value();
+            else if (field == "max-concurrency")
+              config.subagent_execution.max_concurrency = number.value();
+            else if (field == "timeout-ms")
+              config.subagent_execution.total_timeout_ms = number.value();
+            else if (field == "max-output-bytes")
+              config.subagent_execution.max_aggregate_output_bytes =
+                  number.value();
+            else
+              return core::Result<std::string>::failure(
+                  {core::ErrorCode::invalid_argument, usage()});
+          }
+          return save(true, true, true, false);
+        }
+        return core::Result<std::string>::failure(
+            {core::ErrorCode::invalid_argument, usage()});
       },
       std::move(options),
       {},
@@ -581,6 +1201,28 @@ bool BuiltinCommandRegistrar::register_commands() {
       }))
     return false;
   if (!register_command(create_session_command(std::move(session_options))))
+    return false;
+  if (!register_command({
+          "new",
+          "Create and open a new Session: /new [title].",
+          [this](std::string_view arguments) {
+            return extensions.execute(
+                "session", "new " + trim_ascii_whitespace(arguments));
+          },
+          {},
+          {},
+      }))
+    return false;
+  if (!register_command(create_configure_command({
+          {"show", "Show saved workspace configuration."},
+          {"model", "Show or persist the default startup model."},
+          {"reasoning",
+           "Show or persist the default startup reasoning effort."},
+          {"agent", "Manage active Agent profiles."},
+          {"subagent", "Inspect or edit Explorer and custom Sub Agents."},
+          {"skill", "List or enable/disable managed workspace Skills."},
+          {"context", "Edit context and Sub Agent execution limits."},
+      })))
     return false;
   if (!register_command({
           "plugins",

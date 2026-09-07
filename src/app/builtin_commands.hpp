@@ -2,6 +2,7 @@
 
 #include "zed/app/config.hpp"
 #include "zed/app/configure_web.hpp"
+#include "zed/context/context_archive.hpp"
 #include "zed/core/agent_loop.hpp"
 #include "zed/extensions/extension_registry.hpp"
 #include "zed/extensions/quick_bash_input.hpp"
@@ -40,7 +41,8 @@ public:
       const std::filesystem::path &session_directory,
       session::JsonlSessionStore &session,
       const SessionMetadataFactory &session_metadata,
-      plugins::PluginManager &plugins);
+      plugins::PluginManager &plugins,
+      context::ContextArchive *context_archive = nullptr);
 
   bool register_commands();
 
@@ -49,6 +51,8 @@ private:
   create_model_command(std::vector<extensions::CommandOption> options);
   extensions::Command
   create_session_command(std::vector<extensions::CommandOption> options);
+  extensions::Command
+  create_configure_command(std::vector<extensions::CommandOption> options);
 
   extensions::ExtensionRegistry &extensions;
   const RuntimeConfig &runtime_config;
@@ -68,8 +72,9 @@ private:
   extensions::QuickBashInput &quick_bash;
   const std::filesystem::path &session_directory;
   session::JsonlSessionStore &session;
-  const SessionMetadataFactory &session_metadata;
+  SessionMetadataFactory session_metadata;
   plugins::PluginManager &plugins;
+  context::ContextArchive *context_archive;
 };
 
 } // namespace zed::app

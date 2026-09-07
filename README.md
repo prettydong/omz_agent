@@ -63,6 +63,10 @@ zeda 默认从 OpenCode 内置凭证库
 OpenCode 登录后，后续启动无需再输入。`OPENCODE_GO_API_KEY` 仍可用于显式覆盖
 内置凭证，`ZED_OPENCODE_AUTH_PATH` 可用于指定其他凭证文件位置。
 
+每次 OpenCode Go 请求都会发送 `User-Agent: omz-agent/0.2` 和当前 Session 的
+`x-opencode-session`，以便服务端保持会话关联；没有持久化 Session 时，provider 会为
+该实例使用稳定的本地 fallback ID。
+
 构建时通过 CMake FetchContent 获取并固定以下开源依赖：
 
 - [nlohmann/json 3.12.0](https://github.com/nlohmann/json)：JSON 解析和序列化
@@ -80,9 +84,22 @@ export ZED_MODEL="gpt-5.6-luna"
 ```
 
 zeda 启动时直接使用内置模型目录，不执行外部模型发现，以避免阻塞欢迎页。运行中使用
-`/model list` 查看当前目录；只有显式执行 `/model refresh` 时，才会通过本机
-`opencode models opencode-go --verbose` 刷新模型、协议、上下文容量和思考档位。
-使用 `/model <id>` 切换主模型，也可在启动前通过 `ZED_MODEL` 指定模型。
+`/model list` 查看当前目录；在终端输入 `/model` 后可用方向键在左侧模型名称和右侧
+详情面板中选择。每张卡片固定 12 行，评分以统一 0–100 刻度的进度条展示 AA 指数点数，
+不是百分比。只显示最高推理档位的分数，不随当前会话 reasoning 改变；最高档位未确认
+或缺少数据时保留同样版式并显示暂无评分。卡片保留 USD 输入/输出/缓存价格及上下文/输出
+上限，不显示来源网址、日期和操作提示等辅助小字。
+
+数据快照日期为 2026-09-07：评分来自 [Artificial Analysis v4.2](https://artificialanalysis.ai/models/gpt-5-6-luna)，
+价格来自 [OpenCode Go](https://dev.opencode.ai/docs/go/#usage-limits)。模型各自的 AA 来源路径
+保存在 `src/app/model_presentation.hpp`。Grok 4.6 使用最高档位
+[xhigh 的 49 分估算值](https://artificialanalysis.ai/models/grok-4-6-xhigh/)，而不是 high 的 51 分。
+DeepSeek 分数对应标注的 0731/0813 修订版，服务端别名可能不同；Qwen3.8 Max 的公开分数
+未明确 effort，暂不作为最高档位评分展示。价格及可用性以当前文档与账户为准。
+只有显式执行 `/model refresh` 时，才会通过本机
+`opencode models opencode-go --verbose` 刷新模型、协议、上下文容量和思考档位，并同步
+更新选择器；质量与价格快照不会由 refresh 改写。使用 `/model <id>` 切换主模型，也可在
+启动前通过 `ZED_MODEL` 指定模型。
 
 请确认 OpenCode Go 对所选模型的地区、配额和数据政策。`Contributor` 模型可能允许使用 prompts 和 completions 改进后续模型；不要在未接受该政策前发送凭证或敏感代码。
 
@@ -119,7 +136,7 @@ ZED_PLUGIN_PATH                追加外部插件发现目录，多个目录使�
   提示词，并与 Explorer 一起进入 `subagent` 工具的动态 schema；
 - 可新增、编辑、启用、停用或移除 workspace Skill；
 - 可配置 Sub Agent 并发、总超时和聚合输出上限；
-- 上下文控制模型、窗口预算、摘要输出上限和完整系统提示词。
+- 上下文控制模型、窗口预算、摘要输出上限、完整系统提示词，以及默认开启的笔记与可搜索历史实验。
 
 页面采用无标签页的三栏单页结构：左侧同时显示 Agent、Sub Agent 和 Skill 清单，中间
 编辑当前资源，右侧常驻上下文与 Sub Agent 执行参数。界面使用无圆角、无阴影的高密度
@@ -140,6 +157,39 @@ ZED_PLUGIN_PATH                追加外部插件发现目录，多个目录使�
 保存后重启 `zeda` 生效。已有环境变量保持最高优先级，例如 `ZED_MODEL` 会覆盖网页中
 保存的主模型；Explorer 当前没有环境变量覆盖项。配置文件使用版本化且不接受额外字段
 的 JSON schema，手工修改错误会在下次启动时明确报告，不会静默回退。
+
+### 终端配置
+
+不使用浏览器时，`/configure` 提供同一 workspace 持久化配置的终端入口。它不会显示或
+写入 API Key；每次修改先运行与网页配置相同的 schema 校验，再以私有原子文件保存，
+并在输出中提示重启。终端入口适合查看、选择已有 Agent、调整 Active Agent、Explorer
+或已有自定义 Sub Agent，以及启用/停用已有 workspace Skill；新增或删除配置档案和编辑
+Skill 完整内容仍使用 `/configure-web`。
+
+```text
+/configure
+/configure model
+/configure model glm-5.1
+/configure reasoning auto
+/configure agent list
+/configure agent select <id>
+/configure agent set model <model-id>
+/configure agent set tools read,grep
+/configure subagent list
+/configure subagent set explorer enabled off
+/configure skill list
+/configure skill disable <id>
+/configure context set max-tokens 200000
+```
+
+`/configure model [id]` 读取或保存 Active Agent 的默认启动模型，`/configure reasoning
+[effort]` 读取或保存默认推理强度；它们只写入 workspace 配置，不会切换当前会话模型。
+若新默认模型不支持原有推理强度，终端会明确报告并将保存值重置为 `auto`，使下次启动可用。
+`/configure` 的 `agent set` 支持模型、reasoning、最大回合、输出上限、temperature、
+自动压缩、压缩阈值、Tool 权限和完整系统提示词。`subagent set` 支持启用状态、模型、
+reasoning、执行上限和提示词；`context set` 支持上下文模型、窗口/保留/压缩预算、摘要
+输出上限、Sub Agent 并发/超时/聚合输出上限和上下文提示词。模型必须位于当前模型目录；
+可先用 `/model list` 检查。所有这些更改在重启后生效。
 
 `agent_management.json` 保存 Agent 档案、Active Agent 和自定义 Sub Agent。为了兼容
 已有配置，Active Agent 的运行参数和提示词也会同步到原有 `config.json` 与主提示词
@@ -194,8 +244,10 @@ Skill 根目录、Skill 目录和 `SKILL.md` 都不得是符号链接；指令�
 底部 Token 摘要会显示当前上下文占用比例和最近一次模型输出的平均 Token 速率。
 在输入区输入 `/` 或命令前缀时，界面会实时显示匹配的命令和说明。
 输入完整命令名后，提示区会显示该命令的帮助和支持的二级选项；主题、
-Quick Bash、思考强度和 Skill 名称都支持二级补全。使用 `↑` / `↓` 选择
-候选项，按 `Enter` 或 `Tab` 自动补全命令或二级选项；补全后再按
+Quick Bash、思考强度和 Skill 名称支持补全；`/configure` 与 `/session` 支持多级补全，
+例如 `/configure agent set model <id>`，每一级只显示当前可用的子命令、字段或值。
+数字、提示词等自由输入字段会补上空格，再由用户输入。使用 `↑` / `↓` 选择
+候选项，按 `Enter` 或 `Tab` 逐级补全；补全后再按
 `Enter` 执行。
 
 Quick Bash 是内置的可选输入扩展，不是插件。默认开启，可在运行中切换：
@@ -218,7 +270,11 @@ Session 序列化错误会返回可见的 `session_error`，不会以未捕获�
 
 每次模型工具调用都必须提供非空的 `purpose`，用于在终端中解释调用目的。
 Bash 调用标题只显示这个目的，不显示具体 Shell 指令。
-工具输出默认折叠。用户输入的模型请求、斜杠命令和 Quick Bash 命令及其执行
+普通工具输出默认折叠；包含 unified diff 的成功结果自动展开，仍可点击折叠。
+`edit` 和 `write` 成功后会附带文件变更 diff（未改变内容时不产生 diff），
+包含文件路径、行号、增删标记和上下文；大变更受输出预算限制并显示省略提示。
+这些文本结果随 Session 保存，也会作为工具结果进入后续模型上下文。
+用户输入的模型请求、斜杠命令和 Quick Bash 命令及其执行
 结果默认完整展开，仍可使用鼠标点击记录手动收起或重新展开。
 
 每次启动默认在当前工作区的 `.zed/sessions/` 下创建新的 Session v2 JSONL
@@ -239,6 +295,7 @@ Bash 调用标题只显示这个目的，不显示具体 Shell 指令。
 /session
 /session list
 /session new [title]
+/new [title]
 /session open <id-or-title>
 /session rename <title>
 /session fork [title]
@@ -248,6 +305,8 @@ Bash 调用标题只显示这个目的，不显示具体 Shell 指令。
 标题可以重复，但重复时必须使用唯一的 Session ID 打开。`fork` 创建独立文件并记录
 父 Session ID，不会修改原 Session。模型用户输入按原文保存；启用的 Skill 指令只
 进入当次 system prompt，不会伪装成用户输入写入历史。
+
+`/new [title]` 是 `/session new [title]` 的简写：创建并立即切换到新的 Session v2。
 
 仍可在启动时通过环境变量显式恢复或指定 Session 文件：
 
@@ -397,6 +456,15 @@ plugins/deepwiki/       C/C++ DeepWiki 插件与本地网页资源
 
 `ContextController` 是可选的。没有上下文模型时，`BasicContextManager` 使用确定性规则裁剪；接入模型后，在上下文达到阈值时请求结构化摘要和保留列表。
 
+实验性上下文管理采用独立路径，默认开启，提供跨窗口笔记、可搜索的完整 Session
+历史和窗口切换。没有配置文件或旧配置缺少开关字段时也默认开启；显式设置为 `false`
+仍保持关闭。运行中输入 `/configure context set experimental-mode off`，然后重启
+`zeda`，即可使用原有摘要/裁剪路径；重新开启使用 `on` 并重启。也可在
+`/configure-web` 的上下文设置中切换。
+配置字段是 `.zed/config.json` 中的 `context.experimental_mode`，无需更换 provider。
+详见 [实验性上下文管理](docs/experimental_context.md)，包括 Codex 机制来源、工具、
+持久化格式、预算和测试边界。
+
 在全屏 TUI 中用鼠标左键拖拽选中文本并松开后，zeda 会通过 OSC 52
 请求终端将所选文本写入剪贴板，并在底栏显示复制状态。普通单击
 仍用于展开或收起可折叠记录。该能力需要终端支持 OSC 52。
@@ -409,7 +477,14 @@ plugins/deepwiki/       C/C++ DeepWiki 插件与本地网页资源
 startup: 23.000 ms = config 2.000 + session 3.000 + setup 5.000 + plugins 10.000 + ui 2.000 + other 1.000
 ```
 
-欢迎页与消息记录位于同一个可滚动区域，因此向下浏览后不会固定占用屏幕。鼠标滚轮每次固定滚动 3 行；默认自动跟随最新消息，向上滚动后暂停跟随，滚回底部、执行命令或提交新请求时恢复。输入框在没有命令补全列表时支持使用上下方向键切换本进程中已发送的模型 prompt，回到最新位置时恢复未发送草稿。底部固定输入框、运行状态和 token 指标。底栏左侧根据 Agent 事件显示紧凑状态；思考时会显示当前强度（例如 `low think`），活动状态带旋转动画，空闲时显示静态 `idle`。用户、助手、工具和错误消息分别渲染，只有助手内容会进入 Markdown 解析，避免输入或工具输出意外破坏对话布局。
+欢迎页与消息记录位于同一个可滚动区域，因此向下浏览后不会固定占用屏幕。鼠标滚轮每次固定滚动 3 行；默认自动跟随最新消息，向上滚动后暂停跟随，滚回底部、执行命令或提交新请求时恢复。
+
+输入历史包括本进程提交的普通指令、`/configure` 等斜杠命令和 Quick Bash 命令。
+输入为空或没有补全候选时，按上箭头找回上一条输入；进入历史浏览后，上下箭头持续浏览
+历史，不会被回忆出的命令补全菜单抢占。回到最新位置时恢复未发送草稿。回忆出的命令
+按 Enter 原样执行；继续输入或按 Tab 则退出历史浏览并使用补全。历史不跨进程保存。
+
+底部固定输入框、运行状态和 token 指标。底栏左侧根据 Agent 事件显示紧凑状态；思考时会显示当前强度（例如 `low think`），活动状态带旋转动画，空闲时显示静态 `idle`。用户、助手、工具和错误消息分别渲染，只有助手内容会进入 Markdown 解析，避免输入或工具输出意外破坏对话布局。
 
 底栏右侧显示 token 指标：`ctx` 是最近一次模型请求的 input tokens，`↑` 和 `↓` 分别是本次进程内所有模型调用的累计 input 与 output，`Σ` 后的值是两者之和。数值达到千级或百万级时使用 `k` 或 `m` 紧凑显示。一次 Agent 请求包含多轮工具调用时，每轮模型 usage 都会计入。`ctx` 可以点击，打开 Context analysis 面板；面板外的聊天页面会变暗，面板自身保持不透明。总量采用供应商返回的精确 usage，页面会显示容量、剩余空间、缓存命中，以及系统指令、用户消息、助手消息、工具往返、工具定义和协议开销的估算分布。再次点击 `ctx` 或按 Esc 关闭。
 
@@ -421,6 +496,53 @@ Provider 按模型选择 Responses、Chat Completions 或 Anthropic Messages 的
 
 主 Agent 请求不发送 `max_output_tokens`，因此 zeda 不设置单次响应输出上限，由模型供应商和模型自身的上下文窗口决定实际最大值。内部上下文摘要请求仍使用独立的 1024-token 上限。`ZED_RESERVED_OUTPUT_TOKENS` 只控制构建上下文时为输出预留的空间，不会截断模型输出。
 
-Agent Loop 只在 Provider 明确发出 `response.completed`、不存在待执行工具调用且回复不是延后执行提示时正常结束。`response.incomplete`、`response.failed`、缺少终止事件和不一致的工具结束状态都会显示为错误；达到输出 token 上限不会再被误报为成功。默认 coding-agent 指令要求模型直接使用工具完成并验证工作。模型若只回复“正在构建”“马上开始”等短促进度提示，Agent Loop 会纠偏重试一次；再次不执行则明确失败，并且这些无效进度回复不会写入 Session。
+Agent Loop 在 Provider 给出明确的完成状态、不存在待执行工具调用且最终回复非空时
+正常结束。`response.incomplete`、`response.failed`、缺少协议终止事件及输出 token
+上限截断仍会明确报错。Responses 如果仅在最终 `response.completed` 的输出中提供
+正文，Provider 会回填正文；已有流式正文时不会重复输出相同内容。
+
+默认 coding-agent 指令要求模型直接使用工具完成并验证工作。只有整条短回复完全由
+“正在构建”“马上就好”等进度短语及标点组成时，Agent Loop 才会纠偏一次；持续只报
+进度则明确失败，这些无效回复不会写入 Session。正常解释、引用、代码片段和完成报告
+不会仅因为包含进度关键词而被拒绝。纠正提示在模型恢复正常回复后清除。
+
+模型返回的工具调用如果在执行前校验失败（例如 `subagent` 缺少顶层 `purpose`、
+`purpose` 为空白或类型错误、参数 JSON 无效、调用 ID 缺失或重复），或者模型声明要
+调用工具却返回空列表，或最终回复为空/仅含空白，Agent Loop 会把具体错误反馈给模型，
+要求重新生成有效回复或工具调用。这几类错误每次用户请求共享最多 2 次纠正重试，
+重试也计入总回合上限；仍然失败时会显示次数和最后的错误原因。
+主 Agent 和 Sub Agent 内部均适用。CLI/TUI 会显示主 Agent 的 `retrying (1/2)` 等
+提示，重试的 Token 用量也计入统计。无效批次中的工具都不会执行，无效回复及临时
+纠正提示不会写入 Session；已完成的工具结果保留。用户取消、网络错误和不完整响应
+不会触发这项纠正重试。
+
+HTTP `429`、`500`、`502`、`503`、`504` 使用独立的服务重试机制，最多重试 2 次。
+没有有效 `Retry-After` 时分别退避 250 ms、500 ms；有效的秒数或 HTTP 日期会被遵守，
+等待超过剩余超时预算时会明确失败。所有尝试与退避等待共享一次模型请求的超时预算，
+等待期间仍可取消。其他 HTTP 错误、格式错误的 SSE、已经开始的成功响应中途断流
+不会自动重放。重试状态单独显示，不会作为助手正文或插件生成内容保存。
 
 Markdown 当前支持标题、段落、粗体、行内代码、链接、列表、引用、代码块和横线。Markdown 源文中分隔块级内容的一个或多个空行，会在终端中保留为一个空白行。表格使用 FTXUI 的表格布局，支持表头、单线边框、列分隔线、换行以及 `:---`、`:---:`、`---:` 对齐语法；表格单元格中的 `\\|` 会按字面竖线处理。
+
+带语言标记的围栏代码块自动进行轻量词法高亮，支持 C/C++、Python、
+JavaScript/TypeScript、JSON、Shell、Rust 和 Go 的常见关键词、字符串、数字和注释。
+未知语言保持纯文本，代码缩进和空行保留。`diff` / `patch` 代码块及工具返回的
+unified diff 参考 [Codex CLI 的 diff 展示](https://github.com/openai/codex/blob/main/codex-rs/tui/src/diff_render.rs)，使用文件标题、行号、`+/-` 标记和柔和红绿底色；
+根据文件扩展名为 diff 内容着色。窄终端内长行换行，浅色与 monaka 主题分别配色。
+语法高亮用于全屏终端的实时消息与历史消息；重定向输出仍即时输出原始文本增量。
+
+`/model` 使用无边框的紧凑列表，最多显示 6 个候选，随上下键滚动。右侧对齐性能刻度条、
+价格信息条和上下文信息；性能采用多榜单编程综合参考分（0–100），价格保留输入／输出／缓存的具体
+数值，并用浅色底条强调。筛选结果较少时自动收起空白。
+
+评分数据核对日期为 **2026-09-07**。完整权重、原始成绩、模型版本映射和缺失数据说明见
+[模型评分依据](docs/model-scores.md)。`暂定` 表示榜单覆盖不足或服务别名映射尚未验证，
+不代表已在 omz_agent 中实测。价格不计入性能分。
+
+## License
+
+本项目采用 [MIT License](LICENSE)。任何人均可免费使用、复制、修改、发布、
+再分发和销售本项目代码，包括商业用途和闭源项目；分发副本或实质性代码部分时，
+须保留版权声明和许可证全文。软件按原样提供，不提供任何担保。
+
+第三方依赖及随附资源仍遵循各自的许可证；本项目的 MIT 许可证不替代它们的授权条款。

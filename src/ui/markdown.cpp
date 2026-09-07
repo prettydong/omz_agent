@@ -1,4 +1,5 @@
 #include "zed/ui/markdown.hpp"
+#include "zed/ui/code_render.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -407,8 +408,11 @@ ftxui::Element render_markdown(std::string_view markdown,
     char fence_marker = 0;
     std::size_t fence_length = 0;
     if (is_fence(lines[index], fence_marker, fence_length)) {
+      const auto fence_info = trim(lines[index]);
+      const auto language = trim(fence_info.substr(fence_length));
       ++index;
       std::string code;
+      bool first_code_line = true;
       while (index < lines.size()) {
         char closing_marker = 0;
         std::size_t closing_length = 0;
@@ -417,14 +421,15 @@ ftxui::Element render_markdown(std::string_view markdown,
           ++index;
           break;
         }
-        if (!code.empty())
+        if (!first_code_line)
           code += '\n';
+        first_code_line = false;
         code += lines[index++];
       }
-      blocks.push_back(ftxui::paragraph(std::move(code)) |
-                       ftxui::color(theme.markdown_code_block) |
-                       ftxui::bgcolor(theme.background_panel) |
-                       ftxui::borderStyled(ftxui::LIGHT, theme.border));
+      if (language == "diff" || language == "patch")
+        blocks.push_back(render_diff(code, theme));
+      else
+        blocks.push_back(render_code_block(code, language, theme));
       continue;
     }
 

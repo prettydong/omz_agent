@@ -5,6 +5,7 @@
 #include "zed/support/atomic_file.hpp"
 #include "zed/support/child_process.hpp"
 #include "zed/support/unique_fd.hpp"
+#include "zed/tools/text_diff.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -292,6 +293,110 @@ std::string truncate_output(std::string output, std::size_t limit,
   return output;
 }
 
+std::size_t utf8_prefix_size(std::string_view text, std::size_t maximum) {
+  const auto limit = std::min(text.size(), maximum);
+  std::size_t position = 0;
+  while (position < limit) {
+    const auto byte = static_cast<unsigned char>(text[position]);
+    std::size_t width = 1;
+    if ((byte & 0xE0U) == 0xC0U)
+      width = 2;
+    else if ((byte & 0xF0U) == 0xE0U)
+      width = 3;
+    else if ((byte & 0xF8U) == 0xF0U)
+      width = 4;
+    if (position + width > limit)
+      break;
+    position += width;
+  }
+  return position;
+}
+
+std::string truncate_tool_result(std::string output, std::size_t limit) {
+  constexpr std::string_view marker = "\n[output truncated]";
+  if (output.size() <= limit)
+    return output;
+  if (limit >= marker.size()) {
+    output.resize(utf8_prefix_size(output, limit - marker.size()));
+    output += marker;
+  } else {
+    output.resize(utf8_prefix_size(output, limit));
+  }
+  return output;
+}
+
+struct OriginalFileContent {
+  bool available{};
+  bool size_limited{};
+  std::string content;
+};
+
+OriginalFileContent read_original_for_diff(const std::filesystem::path &path,
+                                           std::size_t maximum_bytes) {
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(path, error) || error)
+    return {};
+  std::ifstream input(path, std::ios::binary);
+  if (!input)
+    return {};
+  std::string content(maximum_bytes + 1, '\0');
+  input.read(content.data(), static_cast<std::streamsize>(content.size()));
+  const auto bytes_read = static_cast<std::size_t>(input.gcount());
+  if (bytes_read > maximum_bytes)
+    return {false, true, {}};
+  if (input.bad())
+    return {};
+  content.resize(bytes_read);
+  return {true, false, std::move(content)};
+}
+
+std::string workspace_relative_path(const std::filesystem::path &root,
+                                    const std::filesystem::path &path) {
+  auto relative = path.lexically_relative(root).generic_string();
+  if (relative.empty())
+    relative = path.filename().generic_string();
+  const bool has_control_character = std::any_of(
+      relative.begin(), relative.end(), [](unsigned char character) {
+        return character < 0x20U || character == 0x7FU;
+      });
+  return has_control_character ? Json(relative).dump() : relative;
+}
+
+std::string omitted_original_diff(std::string_view path, bool size_limited) {
+  return "--- a/" + std::string(path) + "\n+++ b/" + std::string(path) +
+         (size_limited
+              ? "\n[diff omitted: original file exceeds configured comparison "
+                "limit]\n"
+              : "\n[diff omitted: original file could not be read]\n");
+}
+
+struct ChangeResultBudget {
+  std::string summary;
+  std::string feedback;
+  std::size_t diff_bytes{};
+};
+
+ChangeResultBudget reserve_change_result_budget(std::string summary,
+                                                std::string feedback,
+                                                std::size_t maximum) {
+  summary = truncate_tool_result(std::move(summary), maximum);
+  const auto feedback_limit = maximum - summary.size();
+  feedback = truncate_tool_result(std::move(feedback), feedback_limit);
+  const auto remaining = feedback_limit - feedback.size();
+  return {std::move(summary), std::move(feedback),
+          remaining == 0 ? 0 : remaining - 1};
+}
+
+std::string compose_change_result(ChangeResultBudget budget, std::string diff) {
+  std::string result = std::move(budget.summary);
+  if (!diff.empty() && budget.diff_bytes > 0) {
+    result += '\n';
+    result += truncate_tool_result(std::move(diff), budget.diff_bytes);
+  }
+  result += budget.feedback;
+  return result;
+}
+
 } // namespace
 
 WorkspaceToolBase::WorkspaceToolBase(std::filesystem::path workspace_root,
@@ -412,6 +517,10 @@ WriteFileTool::execute(const ToolCall &call,
         {ErrorCode::conflict,
          "file already exists; set overwrite=true to replace it"});
   }
+  const auto original =
+      exists
+          ? read_original_for_diff(resolved.value(), limits().max_write_bytes)
+          : OriginalFileContent{true, false, {}};
   std::filesystem::create_directories(resolved.value().parent_path(), error);
   if (error)
     return core::Result<ToolResult>::failure(
@@ -422,10 +531,29 @@ WriteFileTool::execute(const ToolCall &call,
                                      "workspace file", overwrite, cancellation);
   if (!written)
     return core::Result<ToolResult>::failure(written.error());
-  std::string result =
-      "wrote " + std::to_string(content.value().size()) + " bytes";
-  result += clangd_feedback(clangd_, resolved.value(), cancellation);
-  return core::Result<ToolResult>::success({call.id, std::move(result), false});
+  const auto feedback =
+      clangd_feedback(clangd_, resolved.value(), cancellation);
+  auto budget = reserve_change_result_budget(
+      "wrote " + std::to_string(content.value().size()) + " bytes", feedback,
+      limits().max_output_bytes);
+  const auto display_path =
+      workspace_relative_path(workspace_root(), resolved.value());
+  std::string diff;
+  if (original.available) {
+    if (budget.diff_bytes > 0) {
+      diff = make_unified_diff(display_path, original.content, content.value(),
+                               exists,
+                               {.context_lines = 3,
+                                .max_output_bytes = budget.diff_bytes,
+                                .max_comparison_cells = 1'000'000})
+                 .text;
+    }
+  } else {
+    diff = omitted_original_diff(display_path, original.size_limited);
+  }
+  return core::Result<ToolResult>::success(
+      {call.id, compose_change_result(std::move(budget), std::move(diff)),
+       false});
 }
 
 const ToolDefinition &BashTool::definition() const { return bash_definition(); }
@@ -954,9 +1082,24 @@ EditFileTool::execute(const ToolCall &call,
       resolved.value(), updated, "edited workspace file", true, cancellation);
   if (!written)
     return core::Result<ToolResult>::failure(written.error());
-  std::string result = "replaced " + std::to_string(count) + " occurrence(s)";
-  result += clangd_feedback(clangd_, resolved.value(), cancellation);
-  return core::Result<ToolResult>::success({call.id, std::move(result), false});
+  const auto feedback =
+      clangd_feedback(clangd_, resolved.value(), cancellation);
+  auto budget = reserve_change_result_budget(
+      "replaced " + std::to_string(count) + " occurrence(s)", feedback,
+      limits().max_output_bytes);
+  const auto display_path =
+      workspace_relative_path(workspace_root(), resolved.value());
+  std::string diff;
+  if (budget.diff_bytes > 0) {
+    diff = make_unified_diff(display_path, content, updated, true,
+                             {.context_lines = 3,
+                              .max_output_bytes = budget.diff_bytes,
+                              .max_comparison_cells = 1'000'000})
+               .text;
+  }
+  return core::Result<ToolResult>::success(
+      {call.id, compose_change_result(std::move(budget), std::move(diff)),
+       false});
 }
 
 } // namespace zed::tools

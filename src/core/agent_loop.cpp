@@ -24,6 +24,20 @@ constexpr std::string_view kDeferredActionCorrection =
     "the exact blocker instead of promising future work.";
 
 constexpr std::size_t kMaxDeferredActionRetries = 1;
+constexpr std::size_t kMaxResponseCorrectionRetries = 2;
+
+constexpr std::string_view kResponseCorrection =
+    "The previous response was invalid and was rejected before any tool in "
+    "that response ran. Complete the current request with a meaningful "
+    "answer or the tool calls needed for the task. Do not return an empty "
+    "answer or an empty tool-call list. Correct and reissue any intended tool "
+    "calls using the available tool schemas. Every "
+    "call must have a non-empty unique id, a tool name, and a valid JSON "
+    "object for arguments. Every arguments object, including subagent calls, "
+    "must contain a non-empty string named purpose explaining the goal of "
+    "that call. A task or description field does not replace purpose. Do "
+    "not repeat tools whose results are already in the conversation. "
+    "Do not just apologize or promise to act. Validation diagnostic: ";
 
 TokenCount estimated_tokens(std::size_t bytes) {
   return static_cast<TokenCount>((bytes + 3) / 4);
@@ -139,6 +153,27 @@ Result<void> validate_tool_calls(const std::vector<ToolCall> &calls) {
   return Result<void>::success();
 }
 
+Result<void> validate_response(const AssistantResponse &response) {
+  if (response.tool_calls.empty()) {
+    if (response.finish_reason == FinishReason::tool_calls) {
+      return Result<void>::failure({
+          ErrorCode::model_error,
+          "model reported tool calls but returned no tool call",
+      });
+    }
+    const auto has_text = std::any_of(
+        response.content.begin(), response.content.end(),
+        [](unsigned char character) { return std::isspace(character) == 0; });
+    if (!has_text) {
+      return Result<void>::failure({
+          ErrorCode::model_error,
+          "model returned an empty response without tool calls",
+      });
+    }
+  }
+  return validate_tool_calls(response.tool_calls);
+}
+
 std::string trim_ascii(std::string value) {
   const auto is_space = [](unsigned char character) {
     return std::isspace(character) != 0;
@@ -175,10 +210,33 @@ bool looks_like_deferred_action(std::string_view content) {
       "be right back",
   };
   const auto normalized = lowercase_ascii(trimmed);
-  return std::any_of(std::begin(kMarkers), std::end(kMarkers),
-                     [&](std::string_view marker) {
-                       return normalized.find(marker) != std::string::npos;
-                     });
+  std::string_view remaining(normalized);
+  bool found_marker = false;
+  // Only reject replies made entirely of progress phrases. A quoted phrase,
+  // an explanation, or a completed-work report is not a promise to act.
+  static constexpr std::string_view kSeparators[] = {
+      " ", "\t", "\r", "\n", ".",  ",",  "!",  "?",
+      ";", "…",  "，", "。", "！", "？", "；",
+  };
+  while (!remaining.empty()) {
+    const auto separator = std::find_if(
+        std::begin(kSeparators), std::end(kSeparators),
+        [&](std::string_view value) { return remaining.starts_with(value); });
+    if (separator != std::end(kSeparators)) {
+      remaining.remove_prefix(separator->size());
+      continue;
+    }
+    std::size_t matched = 0;
+    for (const auto marker : kMarkers) {
+      if (remaining.starts_with(marker))
+        matched = std::max(matched, marker.size());
+    }
+    if (matched == 0)
+      return false;
+    remaining.remove_prefix(matched);
+    found_marker = true;
+  }
+  return found_marker;
 }
 
 std::optional<Error>
@@ -200,11 +258,6 @@ terminal_response_error(const AssistantResponse &response) {
     }
     return std::nullopt;
   case FinishReason::tool_calls:
-    if (response.tool_calls.empty()) {
-      return Error{ErrorCode::model_error,
-                   "model reported tool calls but returned no tool call"};
-    }
-    return std::nullopt;
   case FinishReason::stop:
     return std::nullopt;
   }
@@ -313,6 +366,9 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
                            AgentEventCallback on_event,
                            const std::string &additional_system_prompt) {
   std::size_t deferred_action_retries = 0;
+  bool deferred_action_correction_pending = false;
+  std::size_t response_correction_retries = 0;
+  std::string response_correction;
   for (std::size_t turn = 0; turn < config_.max_turns; ++turn) {
     if (cancellation.is_cancelled()) {
       const auto error = cancelled_error();
@@ -336,9 +392,13 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
       system_prompt += "\n\n";
       system_prompt += additional_system_prompt;
     }
-    if (deferred_action_retries > 0) {
+    if (deferred_action_correction_pending) {
       system_prompt += "\n\n";
       system_prompt += kDeferredActionCorrection;
+    }
+    if (!response_correction.empty()) {
+      system_prompt += "\n\n";
+      system_prompt += response_correction;
     }
     context_messages.push_back({"zeda-agent-system",
                                 Role::system,
@@ -348,8 +408,10 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
     context_messages.insert(context_messages.end(), history.value().begin(),
                             history.value().end());
 
+    const auto tool_definitions = tools_.definitions();
     const auto window =
-        context_.build(context_messages, config_.context_limits, cancellation);
+        context_.build_request(context_messages, tool_definitions,
+                               config_.context_limits, cancellation);
     if (!window) {
       emit({AgentEventType::error, window.error().message, std::nullopt,
             std::nullopt},
@@ -357,16 +419,30 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
       return Result<std::string>::failure(window.error());
     }
 
+    if (window.value().transition.has_value()) {
+      const auto &transition = *window.value().transition;
+      AgentEvent event{
+          AgentEventType::context_window,
+          transition.previous_window_id + " -> " + transition.window_id +
+              "; archived " + std::to_string(transition.archived_ids.size()) +
+              " messages from active context (searchable in history)"};
+      event.context_transition = transition;
+      emit(event, on_event);
+    }
+
     ModelRequest request = config_.model_request;
+    request.session_id = session_.session_id();
     request.messages = window.value().messages;
-    request.tools = tools_.definitions();
+    request.tools = tool_definitions;
 
     const auto model_started_at = std::chrono::steady_clock::now();
     auto response = model_.complete(
         request,
         [&](const ModelDelta &delta) {
-          emit({AgentEventType::assistant_delta, delta.text, std::nullopt,
-                std::nullopt},
+          emit({delta.kind == ModelDeltaKind::retry
+                    ? AgentEventType::model_retry
+                    : AgentEventType::assistant_delta,
+                delta.text, std::nullopt, std::nullopt},
                on_event);
         },
         cancellation);
@@ -403,14 +479,40 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
            on_event);
       return Result<std::string>::failure(*error);
     }
-    const auto valid_tool_calls =
-        validate_tool_calls(response.value().tool_calls);
-    if (!valid_tool_calls) {
-      emit({AgentEventType::error, valid_tool_calls.error().message,
-            std::nullopt, std::nullopt},
+    const auto valid_response = validate_response(response.value());
+    if (!valid_response) {
+      // The entire batch is checked before persistence or execution. Retrying
+      // this response therefore cannot repeat a partially executed batch.
+      if (response_correction_retries < kMaxResponseCorrectionRetries &&
+          turn + 1 < config_.max_turns) {
+        ++response_correction_retries;
+        response_correction =
+            std::string(kResponseCorrection) + valid_response.error().message;
+        emit({AgentEventType::model_retry,
+              "Invalid model response; retrying (" +
+                  std::to_string(response_correction_retries) + "/" +
+                  std::to_string(kMaxResponseCorrectionRetries) +
+                  "): " + valid_response.error().message,
+              std::nullopt, std::nullopt, response.value().usage},
+             on_event);
+        continue;
+      }
+      const Error error{
+          ErrorCode::model_error,
+          (response_correction_retries >= kMaxResponseCorrectionRetries
+               ? "model response validation failed after " +
+                     std::to_string(response_correction_retries) +
+                     " correction retries: "
+               : std::string("model response validation failed; cannot retry "
+                             "within the maximum number of turns: ")) +
+              valid_response.error().message,
+      };
+      emit({AgentEventType::error, error.message, std::nullopt, std::nullopt,
+            response.value().usage},
            on_event);
-      return Result<std::string>::failure(valid_tool_calls.error());
+      return Result<std::string>::failure(error);
     }
+    response_correction.clear();
 
     if (response.value().tool_calls.empty() &&
         looks_like_deferred_action(response.value().content)) {
@@ -428,8 +530,10 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
         return Result<std::string>::failure(error);
       }
       ++deferred_action_retries;
+      deferred_action_correction_pending = true;
       continue;
     }
+    deferred_action_correction_pending = false;
 
     Message assistant_message{
         next_id("assistant"),        Role::assistant, response.value().content,

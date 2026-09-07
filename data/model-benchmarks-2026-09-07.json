@@ -1,0 +1,1040 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-09-07",
+  "purpose": "Coding-agent public benchmark reference; not measured omz_agent or OpenCode Go runtime accuracy. Price is excluded.",
+  "formula": "sum(weight * percent) / sum(available weights); round half up once. Missing entries are not zero. Scores with fewer than 3 benchmarks, less than 70% coverage weight, or unverified endpoint-to-checkpoint mapping are provisional.",
+  "sources": {
+    "aa": {
+      "url": "https://artificialanalysis.ai/leaderboards/models/",
+      "snapshot_sha256": "aca63abeb959075cdf628c862691aa55c851c7dd26fd27766a4572570b48af09",
+      "server_date": "Mon, 07 Sep 2026 05:52:55 GMT",
+      "etag": "W/\"6cd9cd97ab432aaf4285b975aa9290da\"",
+      "index_version": null,
+      "note": "A single downloaded Next Flight leaderboard snapshot. Do not combine search snippets or different index snapshots.",
+      "methodology_url": "https://artificialanalysis.ai/methodology/intelligence-benchmarking"
+    },
+    "vals_swe": {
+      "url": "https://www.vals.ai/benchmarks/swebench",
+      "updated": "2026-09-01",
+      "version": "SWE-bench Verified, 500 tasks",
+      "harness": "mini-SWE-agent, bash only",
+      "archived_page_notice": true,
+      "sha256": "0442aef35064e9aead4036429f238c6cb2e28f9bb1e0feb4953d960adaca8072",
+      "retrieved_at_utc": "2026-09-07T05:53:31.730967+00:00"
+    },
+    "vals_lcb": {
+      "url": "https://www.vals.ai/benchmarks/lcb",
+      "updated": "2026-09-01",
+      "version": "Vals LiveCodeBench snapshot (page describes v6; data metadata version 1)",
+      "harness": "one-shot Python code generation",
+      "archived_page_notice": true,
+      "sha256": "6dd6bb6b74594d78017cb8a5bcb8ca84e84ac1c3ec5674607f066f52815dbb0a",
+      "retrieved_at_utc": "2026-09-07T05:55:40.420979+00:00"
+    }
+  },
+  "benchmarks": [
+    {
+      "id": "aa_terminalbench_2_1",
+      "label": "Terminal-Bench 2.1",
+      "source": "aa",
+      "weight": 40,
+      "unit": "percent",
+      "harness": "AA Terminal-Bench 2.1 official evaluation; 89 tasks, three repeats, pass@1"
+    },
+    {
+      "id": "vals_swe_verified",
+      "label": "SWE-bench Verified",
+      "source": "vals_swe",
+      "weight": 30,
+      "unit": "percent"
+    },
+    {
+      "id": "vals_livecodebench",
+      "label": "LiveCodeBench",
+      "source": "vals_lcb",
+      "weight": 20,
+      "unit": "percent"
+    },
+    {
+      "id": "aa_scicode",
+      "label": "SciCode",
+      "source": "aa",
+      "weight": 10,
+      "unit": "percent",
+      "harness": "AA SciCode, 288 test subproblems, scientist-annotated background prompting, three repeats, pass@1"
+    }
+  ],
+  "models": [
+    {
+      "id": "gpt-5.6-luna",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 80.8988764044944,
+          "raw_value": 0.808988764044944,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "GPT-5.6 Luna (max)",
+          "source_slug": "gpt-5-6-luna",
+          "reasoning_configuration": "GPT-5.6 Luna (max)",
+          "url": "https://artificialanalysis.ai/models/gpt-5-6-luna"
+        },
+        "aa_scicode": {
+          "percent": 53.587962962963,
+          "raw_value": 0.53587962962963,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "GPT-5.6 Luna (max)",
+          "source_slug": "gpt-5-6-luna",
+          "reasoning_configuration": "GPT-5.6 Luna (max)",
+          "url": "https://artificialanalysis.ai/models/gpt-5-6-luna"
+        },
+        "vals_swe_verified": {
+          "percent": 93,
+          "field": "benchmarkView.tasks.overall.openai/gpt-5.6-luna.accuracy",
+          "source_model": "openai/gpt-5.6-luna",
+          "reasoning_effort": "max",
+          "stderr": 1.142,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": [
+        "vals_livecodebench"
+      ]
+    },
+    {
+      "id": "grok-4.6",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 88.38951310861421,
+          "raw_value": 0.883895131086142,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Grok 4.6 (high)",
+          "source_slug": "grok-4-6",
+          "reasoning_configuration": "Grok 4.6 (high)",
+          "url": "https://artificialanalysis.ai/models/grok-4-6"
+        },
+        "aa_scicode": {
+          "percent": 56.4814814814815,
+          "raw_value": 0.564814814814815,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Grok 4.6 (high)",
+          "source_slug": "grok-4-6",
+          "reasoning_configuration": "Grok 4.6 (high)",
+          "url": "https://artificialanalysis.ai/models/grok-4-6"
+        },
+        "vals_swe_verified": {
+          "percent": 95.6,
+          "field": "benchmarkView.tasks.overall.grok/grok-4.6.accuracy",
+          "source_model": "grok/grok-4.6",
+          "reasoning_effort": "high",
+          "stderr": 0.918,
+          "max_output_tokens": null
+        },
+        "vals_livecodebench": {
+          "percent": 88.224,
+          "field": "benchmarkView.tasks.overall.grok/grok-4.6.accuracy",
+          "source_model": "grok/grok-4.6",
+          "reasoning_effort": "high",
+          "stderr": 0.941,
+          "max_output_tokens": null
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "muse-spark-1.2-contributor",
+      "reference_mapping": true,
+      "mapping_note": "Uses the public Muse Spark 1.2 xhigh reference. Contributor endpoint equivalence has not been runtime-verified.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 80.1498127340824,
+          "raw_value": 0.801498127340824,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Muse Spark 1.2 (xhigh)",
+          "source_slug": "muse-spark-1-2",
+          "reasoning_configuration": "Muse Spark 1.2 (xhigh)",
+          "url": "https://artificialanalysis.ai/models/muse-spark-1-2"
+        },
+        "aa_scicode": {
+          "percent": 57.4074074074074,
+          "raw_value": 0.574074074074074,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Muse Spark 1.2 (xhigh)",
+          "source_slug": "muse-spark-1-2",
+          "reasoning_configuration": "Muse Spark 1.2 (xhigh)",
+          "url": "https://artificialanalysis.ai/models/muse-spark-1-2"
+        },
+        "vals_swe_verified": {
+          "percent": 86.6,
+          "field": "benchmarkView.tasks.overall.meta/muse_spark_1_2.accuracy",
+          "source_model": "meta/muse_spark_1_2",
+          "reasoning_effort": "xhigh",
+          "stderr": 1.525,
+          "max_output_tokens": 131072
+        }
+      },
+      "missing_benchmarks": [
+        "vals_livecodebench"
+      ]
+    },
+    {
+      "id": "muse-spark-1.3-contributor",
+      "reference_mapping": true,
+      "mapping_note": "Uses the public Muse Spark 1.3 max reference. Contributor endpoint equivalence has not been runtime-verified.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 85.76779026217231,
+          "raw_value": 0.857677902621723,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Muse Spark 1.3 (max)",
+          "source_slug": "muse-spark-1-3",
+          "reasoning_configuration": "Muse Spark 1.3 (max)",
+          "url": "https://artificialanalysis.ai/models/muse-spark-1-3"
+        },
+        "aa_scicode": {
+          "percent": 58.3333333333333,
+          "raw_value": 0.583333333333333,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Muse Spark 1.3 (max)",
+          "source_slug": "muse-spark-1-3",
+          "reasoning_configuration": "Muse Spark 1.3 (max)",
+          "url": "https://artificialanalysis.ai/models/muse-spark-1-3"
+        }
+      },
+      "missing_benchmarks": [
+        "vals_swe_verified",
+        "vals_livecodebench"
+      ]
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "reference_mapping": true,
+      "mapping_note": "Uses the dated Flash 0731 reference. OpenCode Go rolling alias checkpoint has not been runtime-verified.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 78.65168539325839,
+          "raw_value": 0.786516853932584,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "DeepSeek V4 Flash 0731 (Reasoning, Max Effort)",
+          "source_slug": "deepseek-v4-flash",
+          "reasoning_configuration": "DeepSeek V4 Flash 0731 (Reasoning, Max Effort)",
+          "url": "https://artificialanalysis.ai/models/deepseek-v4-flash"
+        },
+        "aa_scicode": {
+          "percent": 50.3472222222222,
+          "raw_value": 0.503472222222222,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "DeepSeek V4 Flash 0731 (Reasoning, Max Effort)",
+          "source_slug": "deepseek-v4-flash",
+          "reasoning_configuration": "DeepSeek V4 Flash 0731 (Reasoning, Max Effort)",
+          "url": "https://artificialanalysis.ai/models/deepseek-v4-flash"
+        },
+        "vals_swe_verified": {
+          "percent": 88.8,
+          "field": "benchmarkView.tasks.overall.deepseek/deepseek-v4-flash-0731.accuracy",
+          "source_model": "deepseek/deepseek-v4-flash-0731",
+          "reasoning_effort": "high",
+          "stderr": 1.412,
+          "max_output_tokens": 256000
+        },
+        "vals_livecodebench": {
+          "percent": 87.264,
+          "field": "benchmarkView.tasks.overall.deepseek/deepseek-v4-flash-0731.accuracy",
+          "source_model": "deepseek/deepseek-v4-flash-0731",
+          "reasoning_effort": "high",
+          "stderr": 0.968,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "deepseek-v4-flash-vision-exp",
+      "reference_mapping": true,
+      "mapping_note": "Uses the public DeepSeek V4 Flash Vision reference. The experimental Go endpoint equivalence has not been runtime-verified.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 74.1573033707865,
+          "raw_value": 0.741573033707865,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "DeepSeek V4 Flash Vision (Reasoning, Max Effort)",
+          "source_slug": "deepseek-v4-flash-vision",
+          "reasoning_configuration": "DeepSeek V4 Flash Vision (Reasoning, Max Effort)",
+          "url": "https://artificialanalysis.ai/models/deepseek-v4-flash-vision"
+        },
+        "aa_scicode": {
+          "percent": 49.6527777777778,
+          "raw_value": 0.496527777777778,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "DeepSeek V4 Flash Vision (Reasoning, Max Effort)",
+          "source_slug": "deepseek-v4-flash-vision",
+          "reasoning_configuration": "DeepSeek V4 Flash Vision (Reasoning, Max Effort)",
+          "url": "https://artificialanalysis.ai/models/deepseek-v4-flash-vision"
+        }
+      },
+      "missing_benchmarks": [
+        "vals_swe_verified",
+        "vals_livecodebench"
+      ]
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "reference_mapping": true,
+      "mapping_note": "Uses the dated Pro 0813 reference. OpenCode Go rolling alias checkpoint has not been runtime-verified.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 78.65168539325839,
+          "raw_value": 0.786516853932584,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "DeepSeek V4 Pro 0813 (Reasoning, Max Effort)",
+          "source_slug": "deepseek-v4-pro",
+          "reasoning_configuration": "DeepSeek V4 Pro 0813 (Reasoning, Max Effort)",
+          "url": "https://artificialanalysis.ai/models/deepseek-v4-pro"
+        },
+        "aa_scicode": {
+          "percent": 51.0416666666667,
+          "raw_value": 0.510416666666667,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "DeepSeek V4 Pro 0813 (Reasoning, Max Effort)",
+          "source_slug": "deepseek-v4-pro",
+          "reasoning_configuration": "DeepSeek V4 Pro 0813 (Reasoning, Max Effort)",
+          "url": "https://artificialanalysis.ai/models/deepseek-v4-pro"
+        },
+        "vals_swe_verified": {
+          "percent": 96.4,
+          "field": "benchmarkView.tasks.overall.deepseek/deepseek-v4-pro-0813.accuracy",
+          "source_model": "deepseek/deepseek-v4-pro-0813",
+          "reasoning_effort": "max",
+          "stderr": 0.834,
+          "max_output_tokens": 384000
+        },
+        "vals_livecodebench": {
+          "percent": 87.525,
+          "field": "benchmarkView.tasks.overall.deepseek/deepseek-v4-pro-0813.accuracy",
+          "source_model": "deepseek/deepseek-v4-pro-0813",
+          "reasoning_effort": "max",
+          "stderr": 0.958,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "glm-5.1",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 61.797752808988804,
+          "raw_value": 0.617977528089888,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "GLM-5.1 (Reasoning)",
+          "source_slug": "glm-5-1",
+          "reasoning_configuration": "GLM-5.1 (Reasoning)",
+          "url": "https://artificialanalysis.ai/models/glm-5-1"
+        },
+        "vals_swe_verified": {
+          "percent": 76.4,
+          "field": "benchmarkView.tasks.overall.zai/glm-5.1.accuracy",
+          "source_model": "zai/glm-5.1",
+          "reasoning_effort": null,
+          "stderr": 1.901,
+          "max_output_tokens": 131072
+        },
+        "vals_livecodebench": {
+          "percent": 81.38,
+          "field": "benchmarkView.tasks.overall.zai/glm-5.1.accuracy",
+          "source_model": "zai/glm-5.1",
+          "reasoning_effort": null,
+          "stderr": 1.061,
+          "max_output_tokens": null
+        }
+      },
+      "missing_benchmarks": [
+        "aa_scicode"
+      ]
+    },
+    {
+      "id": "glm-5.2",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 77.9026217228464,
+          "raw_value": 0.779026217228464,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "GLM-5.2 (max)",
+          "source_slug": "glm-5-2",
+          "reasoning_configuration": "GLM-5.2 (max)",
+          "url": "https://artificialanalysis.ai/models/glm-5-2"
+        },
+        "aa_scicode": {
+          "percent": 51.1574074074074,
+          "raw_value": 0.511574074074074,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "GLM-5.2 (max)",
+          "source_slug": "glm-5-2",
+          "reasoning_configuration": "GLM-5.2 (max)",
+          "url": "https://artificialanalysis.ai/models/glm-5-2"
+        },
+        "vals_swe_verified": {
+          "percent": 82.8,
+          "field": "benchmarkView.tasks.overall.zai/glm-5.2.accuracy",
+          "source_model": "zai/glm-5.2",
+          "reasoning_effort": "max",
+          "stderr": 1.689,
+          "max_output_tokens": 131072
+        },
+        "vals_livecodebench": {
+          "percent": 69.5,
+          "field": "benchmarkView.tasks.overall.zai/glm-5.2.accuracy",
+          "source_model": "zai/glm-5.2",
+          "reasoning_effort": null,
+          "stderr": 1.179,
+          "max_output_tokens": null
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "glm-5.3",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 83.8951310861423,
+          "raw_value": 0.838951310861423,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "GLM-5.3 (max)",
+          "source_slug": "glm-5-3",
+          "reasoning_configuration": "GLM-5.3 (max)",
+          "url": "https://artificialanalysis.ai/models/glm-5-3"
+        },
+        "aa_scicode": {
+          "percent": 59.0277777777778,
+          "raw_value": 0.590277777777778,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "GLM-5.3 (max)",
+          "source_slug": "glm-5-3",
+          "reasoning_configuration": "GLM-5.3 (max)",
+          "url": "https://artificialanalysis.ai/models/glm-5-3"
+        },
+        "vals_swe_verified": {
+          "percent": 95.4,
+          "field": "benchmarkView.tasks.overall.zai/glm-5.3.accuracy",
+          "source_model": "zai/glm-5.3",
+          "reasoning_effort": "max",
+          "stderr": 0.938,
+          "max_output_tokens": 128000
+        },
+        "vals_livecodebench": {
+          "percent": 80.535,
+          "field": "benchmarkView.tasks.overall.zai/glm-5.3.accuracy",
+          "source_model": "zai/glm-5.3",
+          "reasoning_effort": "max",
+          "stderr": 1.065,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "glm-5.3-flash",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 84.2696629213483,
+          "raw_value": 0.842696629213483,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "GLM-5.3-Flash",
+          "source_slug": "glm-5-3-flash",
+          "reasoning_configuration": "GLM-5.3-Flash",
+          "url": "https://artificialanalysis.ai/models/glm-5-3-flash"
+        },
+        "aa_scicode": {
+          "percent": 51.6203703703704,
+          "raw_value": 0.516203703703704,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "GLM-5.3-Flash",
+          "source_slug": "glm-5-3-flash",
+          "reasoning_configuration": "GLM-5.3-Flash",
+          "url": "https://artificialanalysis.ai/models/glm-5-3-flash"
+        },
+        "vals_swe_verified": {
+          "percent": 92,
+          "field": "benchmarkView.tasks.overall.zai/glm-5.3-flash.accuracy",
+          "source_model": "zai/glm-5.3-flash",
+          "reasoning_effort": "max",
+          "stderr": 1.214,
+          "max_output_tokens": 128000
+        },
+        "vals_livecodebench": {
+          "percent": 80.51,
+          "field": "benchmarkView.tasks.overall.zai/glm-5.3-flash.accuracy",
+          "source_model": "zai/glm-5.3-flash",
+          "reasoning_effort": "max",
+          "stderr": 1.051,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "hy3",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 64.4194756554307,
+          "raw_value": 0.644194756554307,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Hy3",
+          "source_slug": "hy3",
+          "reasoning_configuration": "Hy3",
+          "url": "https://artificialanalysis.ai/models/hy3"
+        },
+        "aa_scicode": {
+          "percent": 48.6111111111111,
+          "raw_value": 0.486111111111111,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Hy3",
+          "source_slug": "hy3",
+          "reasoning_configuration": "Hy3",
+          "url": "https://artificialanalysis.ai/models/hy3"
+        }
+      },
+      "missing_benchmarks": [
+        "vals_swe_verified",
+        "vals_livecodebench"
+      ]
+    },
+    {
+      "id": "hy4-preview",
+      "reference_mapping": false,
+      "mapping_note": "No exact AA model name/slug in this snapshot; Hy3-preview is distinct and was not substituted.",
+      "observations": {},
+      "missing_benchmarks": [
+        "aa_terminalbench_2_1",
+        "vals_swe_verified",
+        "vals_livecodebench",
+        "aa_scicode"
+      ]
+    },
+    {
+      "id": "kimi-k2.6",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 65.9176029962547,
+          "raw_value": 0.659176029962547,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Kimi K2.6",
+          "source_slug": "kimi-k2-6",
+          "reasoning_configuration": "Kimi K2.6",
+          "url": "https://artificialanalysis.ai/models/kimi-k2-6"
+        },
+        "vals_swe_verified": {
+          "percent": 76.2,
+          "field": "benchmarkView.tasks.overall.kimi/kimi-k2.6.accuracy",
+          "source_model": "kimi/kimi-k2.6",
+          "reasoning_effort": null,
+          "stderr": 1.906,
+          "max_output_tokens": 128000
+        },
+        "vals_livecodebench": {
+          "percent": 86.771,
+          "field": "benchmarkView.tasks.overall.kimi/kimi-k2.6.accuracy",
+          "source_model": "kimi/kimi-k2.6",
+          "reasoning_effort": null,
+          "stderr": 0.972,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": [
+        "aa_scicode"
+      ]
+    },
+    {
+      "id": "kimi-k2.7-code",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 67.4157303370786,
+          "raw_value": 0.674157303370786,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Kimi K2.7 Code",
+          "source_slug": "kimi-k2-7-code",
+          "reasoning_configuration": "Kimi K2.7 Code",
+          "url": "https://artificialanalysis.ai/models/kimi-k2-7-code"
+        },
+        "aa_scicode": {
+          "percent": 47.8009259259259,
+          "raw_value": 0.478009259259259,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Kimi K2.7 Code",
+          "source_slug": "kimi-k2-7-code",
+          "reasoning_configuration": "Kimi K2.7 Code",
+          "url": "https://artificialanalysis.ai/models/kimi-k2-7-code"
+        },
+        "vals_swe_verified": {
+          "percent": 78.2,
+          "field": "benchmarkView.tasks.overall.kimi/kimi-k2.7-code.accuracy",
+          "source_model": "kimi/kimi-k2.7-code",
+          "reasoning_effort": null,
+          "stderr": 1.848,
+          "max_output_tokens": null
+        },
+        "vals_livecodebench": {
+          "percent": 82.05,
+          "field": "benchmarkView.tasks.overall.kimi/kimi-k2.7-code.accuracy",
+          "source_model": "kimi/kimi-k2.7-code",
+          "reasoning_effort": null,
+          "stderr": 1.071,
+          "max_output_tokens": 32768
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "kimi-k3",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 85.0187265917603,
+          "raw_value": 0.850187265917603,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Kimi K3 (max)",
+          "source_slug": "kimi-k3",
+          "reasoning_configuration": "Kimi K3 (max)",
+          "url": "https://artificialanalysis.ai/models/kimi-k3"
+        },
+        "aa_scicode": {
+          "percent": 59.4907407407407,
+          "raw_value": 0.594907407407407,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Kimi K3 (max)",
+          "source_slug": "kimi-k3",
+          "reasoning_configuration": "Kimi K3 (max)",
+          "url": "https://artificialanalysis.ai/models/kimi-k3"
+        },
+        "vals_swe_verified": {
+          "percent": 93.4,
+          "field": "benchmarkView.tasks.overall.kimi/kimi-k3.accuracy",
+          "source_model": "kimi/kimi-k3",
+          "reasoning_effort": null,
+          "stderr": 1.111,
+          "max_output_tokens": 262144
+        },
+        "vals_livecodebench": {
+          "percent": 87.185,
+          "field": "benchmarkView.tasks.overall.kimi/kimi-k3.accuracy",
+          "source_model": "kimi/kimi-k3",
+          "reasoning_effort": "max",
+          "stderr": 0.971,
+          "max_output_tokens": 262144
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "longcat-2.0",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 50.187265917603,
+          "raw_value": 0.50187265917603,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "LongCat 2.0",
+          "source_slug": "longcat-2-0",
+          "reasoning_configuration": "LongCat 2.0",
+          "url": "https://artificialanalysis.ai/models/longcat-2-0"
+        },
+        "aa_scicode": {
+          "percent": 36.342592592592595,
+          "raw_value": 0.363425925925926,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "LongCat 2.0",
+          "source_slug": "longcat-2-0",
+          "reasoning_configuration": "LongCat 2.0",
+          "url": "https://artificialanalysis.ai/models/longcat-2-0"
+        }
+      },
+      "missing_benchmarks": [
+        "vals_swe_verified",
+        "vals_livecodebench"
+      ]
+    },
+    {
+      "id": "mimo-v2.5",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 63.6704119850187,
+          "raw_value": 0.636704119850187,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "MiMo-V2.5",
+          "source_slug": "mimo-v2-5-0424",
+          "reasoning_configuration": "MiMo-V2.5",
+          "url": "https://artificialanalysis.ai/models/mimo-v2-5-0424"
+        },
+        "aa_scicode": {
+          "percent": 43.8657407407407,
+          "raw_value": 0.438657407407407,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "MiMo-V2.5",
+          "source_slug": "mimo-v2-5-0424",
+          "reasoning_configuration": "MiMo-V2.5",
+          "url": "https://artificialanalysis.ai/models/mimo-v2-5-0424"
+        },
+        "vals_swe_verified": {
+          "percent": 71,
+          "field": "benchmarkView.tasks.overall.xiaomi/mimo-v2.5.accuracy",
+          "source_model": "xiaomi/mimo-v2.5",
+          "reasoning_effort": null,
+          "stderr": 2.031,
+          "max_output_tokens": 128000
+        },
+        "vals_livecodebench": {
+          "percent": 81.512,
+          "field": "benchmarkView.tasks.overall.xiaomi/mimo-v2.5.accuracy",
+          "source_model": "xiaomi/mimo-v2.5",
+          "reasoning_effort": null,
+          "stderr": 1.072,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "mimo-v2.5-pro",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 65.1685393258427,
+          "raw_value": 0.651685393258427,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "MiMo-V2.5-Pro",
+          "source_slug": "mimo-v2-5-pro",
+          "reasoning_configuration": "MiMo-V2.5-Pro",
+          "url": "https://artificialanalysis.ai/models/mimo-v2-5-pro"
+        },
+        "aa_scicode": {
+          "percent": 50.578703703703695,
+          "raw_value": 0.505787037037037,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "MiMo-V2.5-Pro",
+          "source_slug": "mimo-v2-5-pro",
+          "reasoning_configuration": "MiMo-V2.5-Pro",
+          "url": "https://artificialanalysis.ai/models/mimo-v2-5-pro"
+        },
+        "vals_swe_verified": {
+          "percent": 74,
+          "field": "benchmarkView.tasks.overall.xiaomi/mimo-v2.5-pro.accuracy",
+          "source_model": "xiaomi/mimo-v2.5-pro",
+          "reasoning_effort": null,
+          "stderr": 1.964,
+          "max_output_tokens": 128000
+        },
+        "vals_livecodebench": {
+          "percent": 81.354,
+          "field": "benchmarkView.tasks.overall.xiaomi/mimo-v2.5-pro.accuracy",
+          "source_model": "xiaomi/mimo-v2.5-pro",
+          "reasoning_effort": null,
+          "stderr": 1.069,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "minimax-m2.7",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 55.4307116104869,
+          "raw_value": 0.554307116104869,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "MiniMax-M2.7",
+          "source_slug": "minimax-m2-7",
+          "reasoning_configuration": "MiniMax-M2.7",
+          "url": "https://artificialanalysis.ai/models/minimax-m2-7"
+        },
+        "vals_swe_verified": {
+          "percent": 73.8,
+          "field": "benchmarkView.tasks.overall.minimax/MiniMax-M2.7.accuracy",
+          "source_model": "minimax/MiniMax-M2.7",
+          "reasoning_effort": null,
+          "stderr": 1.968,
+          "max_output_tokens": 196608
+        },
+        "vals_livecodebench": {
+          "percent": 79.926,
+          "field": "benchmarkView.tasks.overall.minimax/MiniMax-M2.7.accuracy",
+          "source_model": "minimax/MiniMax-M2.7",
+          "reasoning_effort": null,
+          "stderr": 1.096,
+          "max_output_tokens": 80000
+        }
+      },
+      "missing_benchmarks": [
+        "aa_scicode"
+      ]
+    },
+    {
+      "id": "minimax-m3",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 65.1685393258427,
+          "raw_value": 0.651685393258427,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "MiniMax-M3",
+          "source_slug": "minimax-m3",
+          "reasoning_configuration": "MiniMax-M3",
+          "url": "https://artificialanalysis.ai/models/minimax-m3"
+        },
+        "aa_scicode": {
+          "percent": 47.1064814814815,
+          "raw_value": 0.471064814814815,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "MiniMax-M3",
+          "source_slug": "minimax-m3",
+          "reasoning_configuration": "MiniMax-M3",
+          "url": "https://artificialanalysis.ai/models/minimax-m3"
+        },
+        "vals_swe_verified": {
+          "percent": 75,
+          "field": "benchmarkView.tasks.overall.minimax/MiniMax-M3.accuracy",
+          "source_model": "minimax/MiniMax-M3",
+          "reasoning_effort": null,
+          "stderr": 1.938,
+          "max_output_tokens": 512000
+        },
+        "vals_livecodebench": {
+          "percent": 82.154,
+          "field": "benchmarkView.tasks.overall.minimax/MiniMax-M3.accuracy",
+          "source_model": "minimax/MiniMax-M3",
+          "reasoning_effort": null,
+          "stderr": 1.055,
+          "max_output_tokens": 512000
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "qwen3.6-plus",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 61.4232209737828,
+          "raw_value": 0.614232209737828,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Qwen3.6 Plus",
+          "source_slug": "qwen3-6-plus",
+          "reasoning_configuration": "Qwen3.6 Plus",
+          "url": "https://artificialanalysis.ai/models/qwen3-6-plus"
+        },
+        "vals_swe_verified": {
+          "percent": 73.4,
+          "field": "benchmarkView.tasks.overall.alibaba/qwen3.6-plus.accuracy",
+          "source_model": "alibaba/qwen3.6-plus",
+          "reasoning_effort": null,
+          "stderr": 1.978,
+          "max_output_tokens": 65536
+        },
+        "vals_livecodebench": {
+          "percent": 85.952,
+          "field": "benchmarkView.tasks.overall.alibaba/qwen3.6-plus.accuracy",
+          "source_model": "alibaba/qwen3.6-plus",
+          "reasoning_effort": null,
+          "stderr": 0.977,
+          "max_output_tokens": 65536
+        }
+      },
+      "missing_benchmarks": [
+        "aa_scicode"
+      ]
+    },
+    {
+      "id": "qwen3.7-max",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 74.53183520599251,
+          "raw_value": 0.745318352059925,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Qwen3.7 Max",
+          "source_slug": "qwen3-7-max",
+          "reasoning_configuration": "Qwen3.7 Max",
+          "url": "https://artificialanalysis.ai/models/qwen3-7-max"
+        },
+        "aa_scicode": {
+          "percent": 49.537037037037,
+          "raw_value": 0.49537037037037,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Qwen3.7 Max",
+          "source_slug": "qwen3-7-max",
+          "reasoning_configuration": "Qwen3.7 Max",
+          "url": "https://artificialanalysis.ai/models/qwen3-7-max"
+        },
+        "vals_swe_verified": {
+          "percent": 68.8,
+          "field": "benchmarkView.tasks.overall.alibaba/qwen3.7-max.accuracy",
+          "source_model": "alibaba/qwen3.7-max",
+          "reasoning_effort": null,
+          "stderr": 2.074,
+          "max_output_tokens": 65536
+        },
+        "vals_livecodebench": {
+          "percent": 87.057,
+          "field": "benchmarkView.tasks.overall.alibaba/qwen3.7-max.accuracy",
+          "source_model": "alibaba/qwen3.7-max",
+          "reasoning_effort": null,
+          "stderr": 0.974,
+          "max_output_tokens": 65536
+        }
+      },
+      "missing_benchmarks": []
+    },
+    {
+      "id": "qwen3.7-plus",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 61.0486891385768,
+          "raw_value": 0.610486891385768,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Qwen3.7 Plus",
+          "source_slug": "qwen3-7-plus",
+          "reasoning_configuration": "Qwen3.7 Plus",
+          "url": "https://artificialanalysis.ai/models/qwen3-7-plus"
+        },
+        "aa_scicode": {
+          "percent": 46.064814814814795,
+          "raw_value": 0.460648148148148,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Qwen3.7 Plus",
+          "source_slug": "qwen3-7-plus",
+          "reasoning_configuration": "Qwen3.7 Plus",
+          "url": "https://artificialanalysis.ai/models/qwen3-7-plus"
+        }
+      },
+      "missing_benchmarks": [
+        "vals_swe_verified",
+        "vals_livecodebench"
+      ]
+    },
+    {
+      "id": "qwen3.8-flash",
+      "reference_mapping": false,
+      "mapping_note": "No exact AA model name/slug in this snapshot; Qwen3.8-Flash-Next is distinct and was not substituted.",
+      "observations": {},
+      "missing_benchmarks": [
+        "aa_terminalbench_2_1",
+        "vals_swe_verified",
+        "vals_livecodebench",
+        "aa_scicode"
+      ]
+    },
+    {
+      "id": "qwen3.8-max",
+      "reference_mapping": false,
+      "mapping_note": "Fields read from this HTML/RSC snapshot only.",
+      "observations": {
+        "aa_terminalbench_2_1": {
+          "percent": 81.2734082397004,
+          "raw_value": 0.812734082397004,
+          "raw_unit": "fraction",
+          "field": "terminalbenchV21",
+          "source_model": "Qwen3.8 Max",
+          "source_slug": "qwen3-8-max",
+          "reasoning_configuration": "Qwen3.8 Max",
+          "url": "https://artificialanalysis.ai/models/qwen3-8-max"
+        },
+        "aa_scicode": {
+          "percent": 53.2407407407407,
+          "raw_value": 0.532407407407407,
+          "raw_unit": "fraction",
+          "field": "scicode",
+          "source_model": "Qwen3.8 Max",
+          "source_slug": "qwen3-8-max",
+          "reasoning_configuration": "Qwen3.8 Max",
+          "url": "https://artificialanalysis.ai/models/qwen3-8-max"
+        },
+        "vals_swe_verified": {
+          "percent": 85.6,
+          "field": "benchmarkView.tasks.overall.alibaba/qwen3.8-max.accuracy",
+          "source_model": "alibaba/qwen3.8-max",
+          "reasoning_effort": null,
+          "stderr": 1.572,
+          "max_output_tokens": 128000
+        },
+        "vals_livecodebench": {
+          "percent": 87.852,
+          "field": "benchmarkView.tasks.overall.alibaba/qwen3.8-max.accuracy",
+          "source_model": "alibaba/qwen3.8-max",
+          "reasoning_effort": null,
+          "stderr": 0.951,
+          "max_output_tokens": 128000
+        }
+      },
+      "missing_benchmarks": []
+    }
+  ]
+}

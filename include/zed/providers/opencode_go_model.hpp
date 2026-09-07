@@ -31,6 +31,7 @@ public:
 
 private:
   OpenCodeGoConfig config_;
+  std::string fallback_session_id_;
 };
 
 } // namespace zed::providers

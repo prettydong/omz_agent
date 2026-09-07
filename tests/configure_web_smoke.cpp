@@ -91,6 +91,7 @@ int main() {
   config.context.model.model = "qwen3.8-flash";
   config.context.limits = {700'000, 10'000, 500'000};
   config.context.max_output_tokens = 1'536;
+  config.context.experimental_mode = true;
 
   const zed::app::WorkspacePrompts initial_prompts{"main fixture prompt",
                                                    "explorer fixture prompt",
@@ -108,6 +109,7 @@ int main() {
   assert(loaded.value().subagent_execution.max_concurrency == 3);
   assert(loaded.value().context.limits.max_context_tokens == 700'000);
   assert(loaded.value().context.max_output_tokens == 1'536);
+  assert(loaded.value().context.experimental_mode);
 
   struct stat status{};
   assert(stat(zed::app::workspace_config_path(workspace).c_str(), &status) ==
@@ -128,6 +130,7 @@ int main() {
   assert(runtime.value().context_model.model == "qwen3.8-flash");
   assert(runtime.value().context_limits.max_context_tokens == 700'000);
   assert(runtime.value().context_max_output_tokens == 1'536);
+  assert(runtime.value().experimental_context_management);
   assert(runtime.value().context_system_prompt == "context fixture prompt");
   assert(runtime.value().system_prompt == "main fixture prompt");
   assert(runtime.value().workspace_config_path ==
@@ -186,6 +189,7 @@ int main() {
   const auto payload = Json::parse(current->body);
   assert(payload.at("workspace") == workspace.string());
   assert(payload.at("config").at("agent").at("max_turns") == 41);
+  assert(payload.at("config").at("context").at("experimental_mode"));
   assert(payload.at("prompts").at("agent") == "main fixture prompt");
   assert(payload.at("prompts").at("explorer") == "explorer fixture prompt");
   assert(payload.at("management").at("active_agent") == "default");
@@ -206,6 +210,7 @@ int main() {
   auto posted = payload.at("config");
   posted["subagents"]["max_concurrency"] = 2;
   posted["context"]["max_output_tokens"] = 1'024;
+  posted["context"]["experimental_mode"] = false;
   auto posted_prompts = payload.at("prompts");
   posted_prompts["explorer"] = "updated explorer prompt";
   posted_prompts["context"] = "updated context prompt";
@@ -248,6 +253,9 @@ int main() {
   assert(saved->status == 200);
   assert(zed::app::load_workspace_config(workspace).value().agent.max_turns ==
          17);
+  assert(!zed::app::load_workspace_config(workspace)
+              .value()
+              .context.experimental_mode);
   const auto saved_prompts = zed::app::load_workspace_prompts(workspace);
   assert(saved_prompts);
   assert(saved_prompts.value().agent == "updated main prompt");
@@ -273,6 +281,7 @@ int main() {
   assert(managed_runtime);
   assert(managed_runtime.value().max_turns == 17);
   assert(!managed_runtime.value().context_limits.automatic_compaction);
+  assert(!managed_runtime.value().experimental_context_management);
   assert(managed_runtime.value().context_limits.compaction_trigger_tokens ==
          400'000);
   assert(managed_runtime.value().agent_tools ==

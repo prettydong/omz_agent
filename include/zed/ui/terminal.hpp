@@ -94,6 +94,7 @@ enum class TerminalMessageKind {
   tool,
   command,
   error,
+  notice,
 };
 
 struct TerminalMessage {
@@ -119,6 +120,11 @@ struct TerminalCommandOption {
   std::string value;
   std::string description;
   bool opens_document_view{false};
+  std::string display_name{};
+  std::vector<std::string> details{};
+  std::optional<int> score{};
+  std::vector<TerminalCommandOption> children{};
+  bool accepts_argument{false};
 };
 
 struct TerminalCommandHint {
@@ -132,6 +138,9 @@ struct TerminalCommandSuggestion {
   std::string description;
   std::string completion;
   bool option{false};
+  std::string display_name{};
+  std::vector<std::string> details{};
+  std::optional<int> score{};
 };
 
 [[nodiscard]] std::vector<TerminalCommandSuggestion>
@@ -248,6 +257,7 @@ class TerminalPromptHistory {
 public:
   void remember(std::string prompt);
   void reset_navigation();
+  [[nodiscard]] bool navigating() const { return position_.has_value(); }
 
   [[nodiscard]] std::optional<std::string>
   previous(std::string_view current_input);
@@ -311,17 +321,16 @@ public:
   using SessionLoader =
       std::function<core::Result<std::vector<core::Message>>()>;
   using InitialActivity = std::function<TerminalActivity(std::string_view)>;
+  using CommandHintsState = std::function<std::vector<TerminalCommandHint>()>;
 
-  TerminalApplication(std::string workspace, std::string &model,
-                      std::string version, TerminalStartupTiming startup,
-                      core::TokenCount &max_context_tokens,
-                      core::ReasoningEffort &reasoning_effort,
-                      ThemeKind &theme_kind, QuickBashState quick_bash_enabled,
-                      SessionNameState session_name,
-                      SessionLoader session_loader,
-                      InitialActivity initial_activity,
-                      std::vector<TerminalCommandHint> command_hints,
-                      SubmitHandler submit, CommandHandler command);
+  TerminalApplication(
+      std::string workspace, std::string &model, std::string version,
+      TerminalStartupTiming startup, core::TokenCount &max_context_tokens,
+      core::ReasoningEffort &reasoning_effort, ThemeKind &theme_kind,
+      QuickBashState quick_bash_enabled, SessionNameState session_name,
+      SessionLoader session_loader, InitialActivity initial_activity,
+      std::vector<TerminalCommandHint> command_hints, SubmitHandler submit,
+      CommandHandler command, CommandHintsState command_hints_state = {});
   ~TerminalApplication();
 
   core::Result<void> run();
@@ -354,6 +363,7 @@ private:
   SessionLoader session_loader_;
   InitialActivity initial_activity_;
   std::vector<TerminalCommandHint> command_hints_;
+  CommandHintsState command_hints_state_;
   SubmitHandler submit_;
   CommandHandler command_;
   std::unique_ptr<ftxui::App> app_;

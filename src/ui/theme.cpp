@@ -37,6 +37,18 @@ TerminalTheme make_light_theme() {
       rgb(138, 138, 138), // markdown rule
       rgb(214, 140, 39),  // markdown list
       rgb(26, 26, 26),    // markdown code block
+      rgb(26, 26, 26),    // code text
+      rgb(123, 91, 182),  // code keyword
+      rgb(176, 84, 42),   // code string
+      rgb(49, 135, 149),  // code number
+      rgb(138, 138, 138), // code comment
+      rgb(59, 125, 216),  // code type
+      rgb(138, 138, 138), // code line number
+      rgb(59, 125, 216),  // diff header
+      rgb(38, 123, 65),   // diff added
+      rgb(185, 55, 59),   // diff removed
+      rgb(231, 246, 236), // diff added background
+      rgb(253, 235, 236), // diff removed background
   };
 }
 
@@ -67,6 +79,18 @@ TerminalTheme make_monaka_theme() {
       rgb(117, 113, 94),  // markdown rule
       rgb(102, 217, 239), // markdown list
       rgb(248, 248, 242), // markdown code block
+      rgb(248, 248, 242), // code text
+      rgb(249, 38, 114),  // code keyword
+      rgb(230, 219, 116), // code string
+      rgb(174, 129, 255), // code number
+      rgb(117, 113, 94),  // code comment
+      rgb(102, 217, 239), // code type
+      rgb(117, 113, 94),  // code line number
+      rgb(102, 217, 239), // diff header
+      rgb(166, 226, 46),  // diff added
+      rgb(249, 38, 114),  // diff removed
+      rgb(49, 62, 41),    // diff added background
+      rgb(72, 39, 52),    // diff removed background
   };
 }
 

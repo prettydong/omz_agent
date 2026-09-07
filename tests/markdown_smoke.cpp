@@ -8,6 +8,7 @@
 #include <ftxui/screen/screen.hpp>
 #include <ftxui/screen/terminal.hpp>
 
+#include "../src/app/model_presentation.hpp"
 #include "zed/ui/markdown.hpp"
 #include "zed/ui/terminal.hpp"
 
@@ -148,6 +149,94 @@ int main() {
       zed::ui::parse_terminal_command("  /reasoning\t high\r\n");
   assert(reasoning_command.name == "reasoning");
   assert(reasoning_command.arguments == "high");
+  assert(zed::ui::terminal_command_reloads_session("new", ""));
+  assert(zed::ui::terminal_command_reloads_session("new", "project notes"));
+  assert(!zed::ui::terminal_command_reloads_session("configure", ""));
+
+  const auto catalog = zed::providers::default_opencode_go_models();
+  const auto model_option =
+      zed::app::model_option(catalog.front(), catalog.front().id);
+  const std::vector<zed::ui::TerminalCommandHint> model_hints{
+      {"model",
+       "Choose a model",
+       {model_option,
+        {"unknown",
+         "Unknown model",
+         false,
+         "Custom Model",
+         {"AA: unavailable"}}}}};
+  assert(zed::ui::complete_terminal_command("/model", model_hints) ==
+         "/model " + catalog.front().id);
+  const auto model_panel =
+      render_in_box(zed::ui::render_terminal_command_guide(
+                        "/model", model_hints, 0,
+                        zed::ui::terminal_theme(zed::ui::ThemeKind::light)),
+                    110, 24);
+  assert(model_panel.find("GPT-5.6 Luna") != std::string::npos);
+  assert(model_panel.find("综合 82") != std::string::npos);
+  assert(model_panel.find("3榜") != std::string::npos);
+  assert(model_option.score == 82);
+  assert(model_panel.find("█") != std::string::npos);
+  for (const auto *border : {"╭", "╮", "╰", "╯", "│", "─"})
+    assert(model_panel.find(border) == std::string::npos);
+  assert(model_panel.find("› ") != std::string::npos);
+  assert(model_panel.find("(low)") == std::string::npos);
+  assert(model_panel.find("$0.20 / $1.20 / $0.02") != std::string::npos);
+  assert(model_panel.find("2026-09-07") == std::string::npos);
+  assert(model_panel.find("artificialanalysis.ai") == std::string::npos);
+  for (const auto kind :
+       {zed::ui::ThemeKind::light, zed::ui::ThemeKind::monaka}) {
+    const auto &theme = zed::ui::terminal_theme(kind);
+    for (const int width : {80, 120}) {
+      auto panel = zed::ui::render_terminal_command_guide("/model", model_hints,
+                                                          0, theme);
+      auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(width),
+                                          ftxui::Dimension::Fit(panel));
+      ftxui::Render(screen, panel);
+      // Both strips reach the same right edge, even in a wide terminal.
+      assert(screen.CellAt(width - 1, 0).background_color ==
+             theme.background_element);
+      assert(screen.CellAt(width - 1, 2).background_color ==
+             theme.background_element);
+      assert(screen.CellAt(width - 2, 2).character == "2");
+      assert(screen.CellAt(width - 2, 2).bold);
+    }
+  }
+  const auto custom_panel =
+      render_in_box(zed::ui::render_terminal_command_guide(
+                        "/model", model_hints, 1,
+                        zed::ui::terminal_theme(zed::ui::ThemeKind::monaka)),
+                    80, 20);
+  assert(custom_panel.find("AA: unavailable") != std::string::npos);
+  assert(custom_panel.find("$0.20") == std::string::npos);
+  zed::providers::OpenCodeGoModelInfo unknown;
+  unknown.id = "unknown";
+  unknown.name = "Custom Model";
+  const auto unknown_option = zed::app::model_option(unknown, "");
+  assert(!unknown_option.score);
+  assert(unknown_option.details[0].find("资料不足") != std::string::npos);
+  assert(unknown_option.details[2].find("unavailable") != std::string::npos);
+  std::vector<zed::ui::TerminalCommandOption> all_model_options;
+  for (const auto &entry : catalog)
+    all_model_options.push_back(zed::app::model_option(entry, ""));
+  all_model_options.push_back({"list", "List models"});
+  all_model_options.push_back({"refresh", "Refresh models"});
+  const std::vector<zed::ui::TerminalCommandHint> all_model_hints{
+      {"model", "Choose model", all_model_options}};
+  for (const auto kind :
+       {zed::ui::ThemeKind::light, zed::ui::ThemeKind::monaka}) {
+    for (std::size_t index = 0; index < all_model_options.size(); ++index) {
+      const auto card = zed::ui::render_terminal_command_guide(
+          "/model", all_model_hints, index, zed::ui::terminal_theme(kind));
+      assert(rendered_rows(card) == 6);
+      const auto page = ftxui::vbox({card, ftxui::filler()});
+      assert(rendered_content_rows(page, 80, 24) == 6);
+      assert(rendered_content_rows(page, 120, 40) == 6);
+    }
+    assert(rendered_rows(zed::ui::render_terminal_command_guide(
+               "/model no-such-model", all_model_hints, 0,
+               zed::ui::terminal_theme(kind))) == 1);
+  }
 
   const std::vector<zed::ui::TerminalCommandHint> command_hints{
       {"help", "Show help."},
@@ -214,6 +303,45 @@ int main() {
   assert(zed::ui::is_terminal_command_completion_event(ftxui::Event::Tab));
   assert(!zed::ui::is_terminal_command_completion_event(
       ftxui::Event::Character('x')));
+  zed::ui::TerminalCommandOption nested_model{"model", "Default model"};
+  nested_model.children = {{"test-model", "Test model"},
+                           {"other-model", "Other"}};
+  zed::ui::TerminalCommandOption count_field{"max-turns", "Turn limit"};
+  count_field.accepts_argument = true;
+  zed::ui::TerminalCommandOption set_branch{"set", "Edit agent"};
+  set_branch.children = {nested_model, count_field};
+  zed::ui::TerminalCommandOption agent_branch{"agent", "Agent"};
+  agent_branch.children = {set_branch};
+  const std::vector<zed::ui::TerminalCommandHint> nested_hints{
+      {"configure", "Configure", {agent_branch, nested_model}}};
+  assert(zed::ui::complete_terminal_command("/configure a", nested_hints) ==
+         "/configure agent ");
+  assert(zed::ui::complete_terminal_command("/configure agent", nested_hints) ==
+         "/configure agent set ");
+  assert(zed::ui::complete_terminal_command("/configure agent set m",
+                                            nested_hints) ==
+         "/configure agent set model ");
+  assert(zed::ui::complete_terminal_command("/configure agent set model t",
+                                            nested_hints) ==
+         "/configure agent set model test-model");
+  assert(zed::ui::complete_terminal_command("/configure\tagent  set\tmodel t",
+                                            nested_hints) ==
+         "/configure agent set model test-model");
+  assert(zed::ui::complete_terminal_command("/configure agent set max",
+                                            nested_hints) ==
+         "/configure agent set max-turns ");
+  assert(zed::ui::terminal_command_suggestions(
+             "/configure agent set max-turns 17", nested_hints)
+             .empty());
+  assert(zed::ui::terminal_command_suggestions("/configure missing set ",
+                                               nested_hints)
+             .empty());
+  assert(zed::ui::terminal_command_suggestions(
+             "/configure model test-model extra", nested_hints)
+             .empty());
+  assert(zed::ui::terminal_command_suggestions("/configure agent set model ",
+                                               nested_hints)
+             .size() == 2);
   assert(zed::ui::terminal_command_opens_document_view("deepwiki", "tui",
                                                        command_hints));
   assert(!zed::ui::terminal_command_opens_document_view("deepwiki", "open",
@@ -387,6 +515,9 @@ int main() {
       "- second\n";
 
   const auto output = render(zed::ui::render_markdown(markdown));
+  const auto leading_blank_code =
+      zed::ui::render_markdown("```cpp\n\n\nreturn 42;\n```", light_theme);
+  assert(rendered_rows(leading_blank_code) == 5);
 
   assert(output.find("Report") != std::string::npos);
   assert(output.find("Name") != std::string::npos);
@@ -539,6 +670,41 @@ int main() {
   assert(transcript.activity() == zed::ui::TerminalActivity::idle);
 
   zed::ui::TerminalTranscript activity_transcript;
+  const std::string edit_diff =
+      "replaced 1 occurrence(s)\n--- a/main.cpp\n+++ b/main.cpp\n"
+      "@@ -12,1 +12,1 @@\n-int answer = 1;\n+int answer = 2;\n";
+  zed::ui::TerminalTranscript diff_transcript;
+  diff_transcript.begin_request("edit code");
+  diff_transcript.append_event(
+      {zed::core::AgentEventType::tool_start, "edit", {}, {}});
+  diff_transcript.append_event(
+      {zed::core::AgentEventType::tool_result,
+       edit_diff,
+       {},
+       zed::core::ToolResult{"edit-fixture", edit_diff, false}});
+  assert(diff_transcript.messages().back().expanded);
+  diff_transcript.append_event(
+      {zed::core::AgentEventType::tool_start, "read", {}, {}});
+  diff_transcript.append_event(
+      {zed::core::AgentEventType::tool_result, "plain result", {}, {}});
+  assert(!diff_transcript.messages().back().expanded);
+
+  zed::ui::TerminalTranscript restored_diff;
+  restored_diff.restore({{"saved-diff",
+                          zed::core::Role::tool,
+                          edit_diff,
+                          {},
+                          "edit-fixture",
+                          false}});
+  assert(restored_diff.messages().back().expanded);
+  restored_diff.restore({{"failed-diff",
+                          zed::core::Role::tool,
+                          edit_diff,
+                          {},
+                          "edit-fixture",
+                          true}});
+  assert(!restored_diff.messages().back().expanded);
+
   activity_transcript.begin_request("use a tool");
   activity_transcript.append_event({
       zed::core::AgentEventType::tool_start,
@@ -743,6 +909,16 @@ int main() {
   prompt_history.reset_navigation();
   assert(prompt_history.previous("changed draft") == "second prompt");
   assert(prompt_history.next() == "changed draft");
+  prompt_history.remember("/configure model gpt-5.6-luna");
+  prompt_history.remember("/configure");
+  assert(!prompt_history.navigating());
+  assert(prompt_history.previous("/configure agent set ") == "/configure");
+  assert(prompt_history.navigating());
+  assert(prompt_history.previous("/configure") ==
+         "/configure model gpt-5.6-luna");
+  assert(prompt_history.next() == "/configure");
+  assert(prompt_history.next() == "/configure agent set ");
+  assert(!prompt_history.navigating());
 
   zed::ui::TerminalTranscript usage_transcript;
   usage_transcript.append_event({

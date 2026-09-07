@@ -1,14 +1,18 @@
 #include "zed/providers/opencode_go_model.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdint>
+#include <ctime>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -38,6 +42,26 @@ using Json = nlohmann::json;
 constexpr std::size_t kMaximumSseLineBytes = 1024 * 1024;
 constexpr std::size_t kMaximumStreamBytes = 16 * 1024 * 1024;
 constexpr std::size_t kMaximumToolCalls = 128;
+
+std::string next_fallback_session_id() {
+  static std::atomic_uint64_t sequence{0};
+  const auto nonce = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+  return "omz-agent-" + std::to_string(nonce) + "-" +
+         std::to_string(++sequence);
+}
+
+bool is_valid_header_value(std::string_view value) {
+  if (value.empty())
+    return false;
+  for (const char raw_character : value) {
+    const auto character = static_cast<unsigned char>(raw_character);
+    if (character <= 0x20 || character == 0x7f)
+      return false;
+  }
+  return true;
+}
 
 const Json *field(const Json &object, std::string_view name) {
   if (!object.is_object())
@@ -395,12 +419,36 @@ void parse_usage(const Json &response_value, core::ModelUsage &usage) {
 }
 
 void parse_response_output(const Json &response_value,
-                           AssistantResponse &response) {
+                           AssistantResponse &response,
+                           const core::StreamCallback &on_delta) {
   parse_usage(response_value, response.usage);
+  const bool restore_content = response.content.empty();
   if (const auto *output = field(response_value, "output");
       output != nullptr && output->is_array()) {
-    for (const auto &item : *output)
+    for (const auto &item : *output) {
       parse_output_item(item, response.tool_calls);
+      if (!restore_content || !item.is_object())
+        continue;
+      const auto *item_type = field(item, "type");
+      const auto *content = field(item, "content");
+      if (item_type == nullptr || !item_type->is_string() ||
+          item_type->get<std::string>() != "message" || content == nullptr ||
+          !content->is_array()) {
+        continue;
+      }
+      for (const auto &block : *content) {
+        const auto *block_type = field(block, "type");
+        const auto *text = field(block, "text");
+        if (block_type != nullptr && block_type->is_string() &&
+            block_type->get<std::string>() == "output_text" &&
+            text != nullptr && text->is_string()) {
+          const auto value = text->get<std::string>();
+          response.content += value;
+          if (on_delta)
+            on_delta({value});
+        }
+      }
+    }
   }
 }
 
@@ -500,7 +548,7 @@ core::Result<void> process_responses_sse(std::string_view line,
               status->get<std::string>(),
       });
     }
-    parse_response_output(*response_value, response);
+    parse_response_output(*response_value, response, on_delta);
     response.finish_reason = response.tool_calls.empty()
                                  ? FinishReason::stop
                                  : FinishReason::tool_calls;
@@ -512,7 +560,7 @@ core::Result<void> process_responses_sse(std::string_view line,
           "OpenCode returned an incomplete response without response details",
       });
     }
-    parse_response_output(*response_value, response);
+    parse_response_output(*response_value, response, on_delta);
     response.finish_reason = incomplete_finish_reason(*response_value);
     if (response.finish_reason == FinishReason::unknown) {
       return core::Result<void>::failure({
@@ -1023,6 +1071,16 @@ struct CurlTransferState {
   core::CancellationToken cancellation;
   std::chrono::steady_clock::time_point deadline;
   std::optional<core::Error> callback_error;
+  long response_status{};
+  bool receive_body{false};
+  std::optional<std::chrono::milliseconds> retry_after;
+};
+
+struct HttpAttemptResult {
+  core::Result<void> result;
+  long status{};
+  std::optional<std::chrono::milliseconds> retry_after;
+  bool retryable_response{false};
 };
 
 core::Result<void> initialize_libcurl() {
@@ -1056,6 +1114,8 @@ std::size_t receive_http_body(char *data, std::size_t size, std::size_t count,
     return 0;
   }
   const auto bytes = size * count;
+  if (!state.receive_body)
+    return bytes;
   try {
     const auto processed = state.lines.append(std::string_view(data, bytes));
     if (!processed) {
@@ -1071,6 +1131,94 @@ std::size_t receive_http_body(char *data, std::size_t size, std::size_t count,
   }
 }
 
+bool starts_with_ascii_case_insensitive(std::string_view value,
+                                        std::string_view prefix) {
+  if (value.size() < prefix.size())
+    return false;
+  for (std::size_t index = 0; index < prefix.size(); ++index) {
+    const auto left = static_cast<unsigned char>(value[index]);
+    const auto right = static_cast<unsigned char>(prefix[index]);
+    const auto lower_left =
+        left >= 'A' && left <= 'Z' ? left + ('a' - 'A') : left;
+    const auto lower_right =
+        right >= 'A' && right <= 'Z' ? right + ('a' - 'A') : right;
+    if (lower_left != lower_right)
+      return false;
+  }
+  return true;
+}
+
+std::optional<std::chrono::milliseconds>
+parse_retry_after(std::string_view value) {
+  value = trim_ascii(value);
+  if (value.empty())
+    return std::nullopt;
+  using MillisecondsRep = std::chrono::milliseconds::rep;
+  constexpr auto kMaximumMilliseconds =
+      std::numeric_limits<MillisecondsRep>::max();
+  constexpr MillisecondsRep kMillisecondsPerSecond = 1000;
+  const bool decimal_seconds =
+      std::all_of(value.begin(), value.end(), [](char character) {
+        return character >= '0' && character <= '9';
+      });
+  if (decimal_seconds) {
+    MillisecondsRep seconds{};
+    for (const char character : value) {
+      const auto digit = static_cast<MillisecondsRep>(character - '0');
+      if (seconds > (kMaximumMilliseconds - digit) / 10)
+        return std::chrono::milliseconds::max();
+      seconds = seconds * 10 + digit;
+    }
+    if (seconds > kMaximumMilliseconds / kMillisecondsPerSecond)
+      return std::chrono::milliseconds::max();
+    return std::chrono::milliseconds(seconds * kMillisecondsPerSecond);
+  }
+  const auto retry_time = curl_getdate(std::string(value).c_str(), nullptr);
+  if (retry_time == -1)
+    return std::nullopt;
+  const auto now = std::time(nullptr);
+  if (retry_time <= now)
+    return std::chrono::milliseconds::zero();
+  const auto seconds_until = static_cast<std::uint64_t>(retry_time - now);
+  if (seconds_until > static_cast<std::uint64_t>(
+                          std::chrono::milliseconds::max().count() / 1000))
+    return std::chrono::milliseconds::max();
+  return std::chrono::seconds(seconds_until);
+}
+
+std::size_t receive_http_header(char *data, std::size_t size, std::size_t count,
+                                void *user_data) noexcept {
+  auto &state = *static_cast<CurlTransferState *>(user_data);
+  if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size)
+    return 0;
+  try {
+    const std::string_view header(data, size * count);
+    if (header.starts_with("HTTP/")) {
+      const auto first_space = header.find(' ');
+      if (first_space != std::string_view::npos &&
+          header.size() >= first_space + 4) {
+        const auto code = header.substr(first_space + 1, 3);
+        if (code[0] >= '0' && code[0] <= '9' && code[1] >= '0' &&
+            code[1] <= '9' && code[2] >= '0' && code[2] <= '9') {
+          state.response_status =
+              (code[0] - '0') * 100 + (code[1] - '0') * 10 + (code[2] - '0');
+          state.receive_body =
+              state.response_status >= 200 && state.response_status < 300;
+          state.retry_after.reset();
+        }
+      }
+    } else if (starts_with_ascii_case_insensitive(header, "Retry-After:")) {
+      state.retry_after = parse_retry_after(header.substr(12));
+    }
+    return size * count;
+  } catch (...) {
+    state.callback_error = core::Error{
+        ErrorCode::model_error,
+        "OpenCode response header callback failed with an unknown error"};
+    return 0;
+  }
+}
+
 int inspect_http_progress(void *user_data, curl_off_t, curl_off_t, curl_off_t,
                           curl_off_t) noexcept {
   const auto &state = *static_cast<CurlTransferState *>(user_data);
@@ -1080,18 +1228,26 @@ int inspect_http_progress(void *user_data, curl_off_t, curl_off_t, curl_off_t,
              : 0;
 }
 
-core::Result<void> run_http_request(
+HttpAttemptResult run_http_request(
     const OpenCodeGoConfig &config, std::string_view endpoint,
     const std::vector<std::string> &extra_headers, std::string_view body,
     core::CancellationToken cancellation,
+    std::chrono::steady_clock::time_point deadline,
     const std::function<core::Result<void>(std::string_view)> &on_line) {
   const auto initialized = initialize_libcurl();
   if (!initialized)
-    return initialized;
+    return {initialized, 0, std::nullopt};
   if (body.size() >
       static_cast<std::size_t>(std::numeric_limits<curl_off_t>::max())) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "OpenCode request body is too large"});
+    return {core::Result<void>::failure(
+                {ErrorCode::model_error, "OpenCode request body is too large"}),
+            0, std::nullopt};
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) {
+    return {core::Result<void>::failure(
+                {ErrorCode::timeout, "OpenCode request timed out"}),
+            0, std::nullopt};
   }
 
   HeapPressureRelief heap_pressure_relief;
@@ -1099,8 +1255,10 @@ core::Result<void> run_http_request(
   transfer.easy = curl_easy_init();
   transfer.multi = curl_multi_init();
   if (transfer.easy == nullptr || transfer.multi == nullptr) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot create in-process HTTP request"});
+    return {
+        core::Result<void>::failure(
+            {ErrorCode::model_error, "cannot create in-process HTTP request"}),
+        0, std::nullopt};
   }
   const std::string owned_endpoint(endpoint);
   const std::string authorization = "Authorization: Bearer " + config.api_key;
@@ -1108,25 +1266,30 @@ core::Result<void> run_http_request(
       !append_header(transfer, "Content-Type: application/json") ||
       !append_header(transfer, "Accept: text/event-stream") ||
       !append_header(transfer, "Expect:")) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot configure HTTP request headers"});
+    return {
+        core::Result<void>::failure(
+            {ErrorCode::model_error, "cannot configure HTTP request headers"}),
+        0, std::nullopt};
   }
   for (const auto &header : extra_headers) {
     if (!append_header(transfer, header)) {
-      return core::Result<void>::failure(
-          {ErrorCode::model_error, "cannot configure HTTP request headers"});
+      return {core::Result<void>::failure(
+                  {ErrorCode::model_error,
+                   "cannot configure HTTP request headers"}),
+              0, std::nullopt};
     }
   }
 
-  const auto timeout_value =
-      std::max<std::size_t>(1, config.request_timeout_ms);
+  const auto timeout_value = static_cast<std::size_t>(
+      std::max(
+          std::chrono::milliseconds(1),
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now))
+          .count());
   const auto timeout_ms = static_cast<long>(
       std::min(timeout_value, static_cast<std::size_t>(LONG_MAX)));
   LineBuffer line_buffer(on_line);
   CurlTransferState state{
-      line_buffer,
-      std::move(cancellation),
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms),
+      line_buffer,  std::move(cancellation), deadline, std::nullopt, 0, false,
       std::nullopt,
   };
   const auto configured =
@@ -1142,6 +1305,9 @@ core::Result<void> run_http_request(
       curl_easy_setopt(transfer.easy, CURLOPT_WRITEFUNCTION,
                        receive_http_body) == CURLE_OK &&
       curl_easy_setopt(transfer.easy, CURLOPT_WRITEDATA, &state) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_HEADERFUNCTION,
+                       receive_http_header) == CURLE_OK &&
+      curl_easy_setopt(transfer.easy, CURLOPT_HEADERDATA, &state) == CURLE_OK &&
       curl_easy_setopt(transfer.easy, CURLOPT_XFERINFOFUNCTION,
                        inspect_http_progress) == CURLE_OK &&
       curl_easy_setopt(transfer.easy, CURLOPT_XFERINFODATA, &state) ==
@@ -1153,14 +1319,18 @@ core::Result<void> run_http_request(
       curl_easy_setopt(transfer.easy, CURLOPT_HTTP_VERSION,
                        CURL_HTTP_VERSION_2TLS) == CURLE_OK;
   if (!configured) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot configure in-process HTTP request"});
+    return {core::Result<void>::failure(
+                {ErrorCode::model_error,
+                 "cannot configure in-process HTTP request"}),
+            0, std::nullopt};
   }
 
   const auto added = curl_multi_add_handle(transfer.multi, transfer.easy);
   if (added != CURLM_OK) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot start in-process HTTP request"});
+    return {
+        core::Result<void>::failure(
+            {ErrorCode::model_error, "cannot start in-process HTTP request"}),
+        0, std::nullopt};
   }
   transfer.added = true;
 
@@ -1190,18 +1360,22 @@ core::Result<void> run_http_request(
   }
 
   if (state.callback_error.has_value())
-    return core::Result<void>::failure(*state.callback_error);
+    return {core::Result<void>::failure(*state.callback_error),
+            state.response_status, state.retry_after};
   if (state.cancellation.is_cancelled()) {
-    return core::Result<void>::failure(
-        {ErrorCode::cancelled, "model request cancelled"});
+    return {core::Result<void>::failure(
+                {ErrorCode::cancelled, "model request cancelled"}),
+            state.response_status, state.retry_after};
   }
   if (std::chrono::steady_clock::now() >= state.deadline) {
-    return core::Result<void>::failure(
-        {ErrorCode::timeout, "OpenCode request timed out"});
+    return {core::Result<void>::failure(
+                {ErrorCode::timeout, "OpenCode request timed out"}),
+            state.response_status, state.retry_after};
   }
   if (multi_result != CURLM_OK) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "in-process HTTP polling failed"});
+    return {core::Result<void>::failure(
+                {ErrorCode::model_error, "in-process HTTP polling failed"}),
+            state.response_status, state.retry_after};
   }
 
   CURLcode transfer_result = CURLE_FAILED_INIT;
@@ -1216,39 +1390,87 @@ core::Result<void> run_http_request(
     }
   }
   if (!transfer_finished) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error,
-         "in-process HTTP request ended without a completion status"});
+    return {core::Result<void>::failure(
+                {ErrorCode::model_error,
+                 "in-process HTTP request ended without a completion status"}),
+            state.response_status, state.retry_after};
   }
   if (transfer_result == CURLE_OPERATION_TIMEDOUT) {
-    return core::Result<void>::failure(
-        {ErrorCode::timeout, "OpenCode request timed out"});
+    return {core::Result<void>::failure(
+                {ErrorCode::timeout, "OpenCode request timed out"}),
+            state.response_status, state.retry_after};
   }
   if (transfer_result != CURLE_OK) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error,
-         "OpenCode HTTP request failed: " +
-             std::string(curl_easy_strerror(transfer_result))});
+    return {core::Result<void>::failure(
+                {ErrorCode::model_error,
+                 "OpenCode HTTP request failed: " +
+                     std::string(curl_easy_strerror(transfer_result))}),
+            state.response_status, state.retry_after};
   }
 
   long status = 0;
   if (curl_easy_getinfo(transfer.easy, CURLINFO_RESPONSE_CODE, &status) !=
       CURLE_OK) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error, "cannot read OpenCode HTTP status"});
+    return {core::Result<void>::failure(
+                {ErrorCode::model_error, "cannot read OpenCode HTTP status"}),
+            state.response_status, state.retry_after};
   }
   if (status < 200 || status >= 300) {
-    return core::Result<void>::failure(
-        {ErrorCode::model_error,
-         "OpenCode HTTP request failed with status " + std::to_string(status)});
+    return {core::Result<void>::failure(
+                {ErrorCode::model_error,
+                 "OpenCode HTTP request failed with status " +
+                     std::to_string(status)}),
+            status, state.retry_after,
+            status == 429 || status == 500 || status == 502 || status == 503 ||
+                status == 504};
   }
-  return line_buffer.flush();
+  return {line_buffer.flush(), status, state.retry_after};
+}
+
+core::Result<void>
+wait_for_retry(std::chrono::milliseconds delay,
+               std::chrono::steady_clock::time_point deadline,
+               const core::CancellationToken &cancellation) {
+  if (cancellation.is_cancelled()) {
+    return core::Result<void>::failure(
+        {ErrorCode::cancelled, "model request cancelled"});
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline ||
+      delay >= std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                     now)) {
+    return core::Result<void>::failure(
+        {ErrorCode::timeout, "OpenCode request timed out"});
+  }
+  const auto wake_at = now + delay;
+  while (std::chrono::steady_clock::now() < wake_at) {
+    if (cancellation.is_cancelled()) {
+      return core::Result<void>::failure(
+          {ErrorCode::cancelled, "model request cancelled"});
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return core::Result<void>::failure(
+          {ErrorCode::timeout, "OpenCode request timed out"});
+    }
+    const auto remaining = wake_at - std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::min(
+        std::chrono::milliseconds(25),
+        std::chrono::duration_cast<std::chrono::milliseconds>(remaining)));
+  }
+  return core::Result<void>::success();
+}
+
+core::Error retry_error(core::Error error, long status, int attempts) {
+  error.message += " (HTTP " + std::to_string(status) + "; attempted " +
+                   std::to_string(attempts) + " times)";
+  return error;
 }
 
 } // namespace
 
 OpenCodeGoModel::OpenCodeGoModel(OpenCodeGoConfig config)
-    : config_(std::move(config)) {
+    : config_(std::move(config)),
+      fallback_session_id_(next_fallback_session_id()) {
   if (config_.models.empty())
     config_.models = default_opencode_go_models();
 }
@@ -1279,6 +1501,17 @@ OpenCodeGoModel::complete(const ModelRequest &request,
     return core::Result<AssistantResponse>::failure(
         {ErrorCode::invalid_argument, "model id is empty"});
 
+  const std::string &session_id =
+      request.session_id.empty() ? fallback_session_id_ : request.session_id;
+  if (!is_valid_header_value(session_id)) {
+    return core::Result<AssistantResponse>::failure(
+        {ErrorCode::invalid_argument, "OpenCode session id is invalid"});
+  }
+  const std::vector<std::string> request_headers = {
+      "User-Agent: omz-agent/0.2",
+      "x-opencode-session: " + session_id,
+  };
+
   const auto *model_info =
       find_opencode_go_model(config_.models, request.model.model);
   const auto protocol = model_info == nullptr
@@ -1286,42 +1519,105 @@ OpenCodeGoModel::complete(const ModelRequest &request,
                             : model_info->protocol;
   const std::string endpoint = endpoint_for(config_, protocol);
 
-  AssistantResponse response;
-  core::Result<void> result = core::Result<void>::success();
+  std::string body;
+  auto headers = request_headers;
   if (protocol == OpenCodeProtocol::responses) {
-    result = run_http_request(
-        config_, endpoint, {}, responses_request_json(request, model_info),
-        cancellation, [&](std::string_view line) {
-          return process_responses_sse(line, response, on_delta);
-        });
+    body = responses_request_json(request, model_info);
   } else if (protocol == OpenCodeProtocol::chat_completions) {
-    ChatStreamState state;
-    result = run_http_request(config_, endpoint, {},
-                              chat_request_json(request, model_info),
-                              cancellation, [&](std::string_view line) {
-                                return process_chat_sse(line, state, on_delta);
-                              });
-    state.response.tool_calls = std::move(state.indexed_calls);
-    response = std::move(state.response);
+    body = chat_request_json(request, model_info);
   } else {
-    MessagesStreamState state;
-    result = run_http_request(
-        config_, endpoint,
-        {"x-api-key: " + config_.api_key, "anthropic-version: 2023-06-01"},
-        messages_request_json(request, model_info), cancellation,
-        [&](std::string_view line) {
-          return process_messages_sse(line, state, on_delta);
-        });
-    response = std::move(state.response);
-    if (result && !state.message_stopped) {
-      result = core::Result<void>::failure({
-          ErrorCode::model_error,
-          "OpenCode Messages stream ended without message_stop",
-      });
-    }
+    body = messages_request_json(request, model_info);
+    headers.push_back("x-api-key: " + config_.api_key);
+    headers.push_back("anthropic-version: 2023-06-01");
   }
-  if (!result)
-    return core::Result<AssistantResponse>::failure(result.error());
+
+  using MillisecondsRep = std::chrono::milliseconds::rep;
+  const auto started_at = std::chrono::steady_clock::now();
+  const auto maximum_timeout = static_cast<std::size_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::time_point::max() - started_at)
+          .count());
+  const auto timeout_value = std::max<std::size_t>(
+      1, std::min(config_.request_timeout_ms, maximum_timeout));
+  const auto deadline =
+      started_at +
+      std::chrono::milliseconds(static_cast<MillisecondsRep>(timeout_value));
+  AssistantResponse response;
+  for (int retry = 0; retry <= 2; ++retry) {
+    if (cancellation.is_cancelled()) {
+      return core::Result<AssistantResponse>::failure(
+          {ErrorCode::cancelled, "model request cancelled"});
+    }
+    AssistantResponse attempt_response;
+    HttpAttemptResult attempt{core::Result<void>::success(), 0, std::nullopt};
+    if (protocol == OpenCodeProtocol::responses) {
+      attempt = run_http_request(config_, endpoint, headers, body, cancellation,
+                                 deadline, [&](std::string_view line) {
+                                   return process_responses_sse(
+                                       line, attempt_response, on_delta);
+                                 });
+    } else if (protocol == OpenCodeProtocol::chat_completions) {
+      ChatStreamState state;
+      attempt =
+          run_http_request(config_, endpoint, headers, body, cancellation,
+                           deadline, [&](std::string_view line) {
+                             return process_chat_sse(line, state, on_delta);
+                           });
+      state.response.tool_calls = std::move(state.indexed_calls);
+      attempt_response = std::move(state.response);
+    } else {
+      MessagesStreamState state;
+      attempt =
+          run_http_request(config_, endpoint, headers, body, cancellation,
+                           deadline, [&](std::string_view line) {
+                             return process_messages_sse(line, state, on_delta);
+                           });
+      attempt_response = std::move(state.response);
+      if (attempt.result && !state.message_stopped) {
+        attempt.result = core::Result<void>::failure({
+            ErrorCode::model_error,
+            "OpenCode Messages stream ended without message_stop",
+        });
+      }
+    }
+    if (attempt.result) {
+      response = std::move(attempt_response);
+      break;
+    }
+    if (cancellation.is_cancelled()) {
+      return core::Result<AssistantResponse>::failure(
+          {ErrorCode::cancelled, "model request cancelled"});
+    }
+    if (!attempt.retryable_response || retry == 2) {
+      const auto error =
+          retry == 2 && attempt.retryable_response
+              ? retry_error(attempt.result.error(), attempt.status, retry + 1)
+              : attempt.result.error();
+      return core::Result<AssistantResponse>::failure(error);
+    }
+    const auto delay = attempt.retry_after.value_or(
+        std::chrono::milliseconds(retry == 0 ? 250 : 500));
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline ||
+        delay >= std::chrono::duration_cast<std::chrono::milliseconds>(
+                     deadline - now)) {
+      return core::Result<AssistantResponse>::failure(
+          retry_error(attempt.result.error(), attempt.status, retry + 1));
+    }
+    if (on_delta) {
+      on_delta({"HTTP " + std::to_string(attempt.status) + "; retrying (" +
+                    std::to_string(retry + 1) + "/2) in " +
+                    std::to_string(delay.count()) + " ms",
+                core::ModelDeltaKind::retry});
+    }
+    if (cancellation.is_cancelled()) {
+      return core::Result<AssistantResponse>::failure(
+          {ErrorCode::cancelled, "model request cancelled"});
+    }
+    const auto waited = wait_for_retry(delay, deadline, cancellation);
+    if (!waited)
+      return core::Result<AssistantResponse>::failure(waited.error());
+  }
   if (response.finish_reason == FinishReason::unknown) {
     return core::Result<AssistantResponse>::failure({
         ErrorCode::model_error,

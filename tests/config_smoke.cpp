@@ -141,6 +141,7 @@ int main() {
   assert(valid.value().context_limits.compaction_trigger_tokens == 1500);
   assert(valid.value().reasoning_effort == zed::core::ReasoningEffort::low);
   assert(valid.value().quick_bash_enabled);
+  assert(valid.value().experimental_context_management);
   assert(valid.value().terminal_theme == "light");
   assert(valid.value().session_path.parent_path() ==
          valid.value().workspace / ".zed" / "sessions");
@@ -166,6 +167,44 @@ int main() {
          std::string::npos);
   assert(valid.value().context_system_prompt.find("selected_ids") !=
          std::string::npos);
+
+  auto workspace_config = zed::app::default_workspace_config();
+  assert(workspace_config.context.experimental_mode);
+  const auto encoded_workspace =
+      zed::app::serialize_workspace_config(workspace_config);
+  const auto decoded_workspace =
+      zed::app::parse_workspace_config(encoded_workspace);
+  assert(decoded_workspace);
+  assert(decoded_workspace.value().context.experimental_mode);
+  auto true_workspace_json = nlohmann::json::parse(encoded_workspace);
+  true_workspace_json["context"]["experimental_mode"] = true;
+  const auto true_workspace =
+      zed::app::parse_workspace_config(true_workspace_json.dump());
+  assert(true_workspace);
+  assert(true_workspace.value().context.experimental_mode);
+  true_workspace_json["context"]["experimental_mode"] = false;
+  const auto false_workspace =
+      zed::app::parse_workspace_config(true_workspace_json.dump());
+  assert(false_workspace);
+  assert(!false_workspace.value().context.experimental_mode);
+  true_workspace_json["context"]["experimental_mode"] = "true";
+  assert(!zed::app::parse_workspace_config(true_workspace_json.dump()));
+  true_workspace_json["context"].erase("experimental_mode");
+  const auto legacy_workspace =
+      zed::app::parse_workspace_config(true_workspace_json.dump());
+  assert(legacy_workspace);
+  assert(legacy_workspace.value().context.experimental_mode);
+
+  workspace_config.context.experimental_mode = true;
+  assert(zed::app::save_workspace_config(config_workspace, workspace_config));
+  const auto experimental_runtime = zed::app::load_runtime_config();
+  assert(experimental_runtime);
+  assert(experimental_runtime.value().experimental_context_management);
+  workspace_config.context.experimental_mode = false;
+  assert(zed::app::save_workspace_config(config_workspace, workspace_config));
+  const auto disabled_runtime = zed::app::load_runtime_config();
+  assert(disabled_runtime);
+  assert(!disabled_runtime.value().experimental_context_management);
 
   const auto system_prompt_path =
       config_workspace / ".zed" / "zed_system_propmt.md";

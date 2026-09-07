@@ -33,6 +33,7 @@ int main() {
   const auto path = root / "primary.jsonl";
   zed::session::JsonlSessionStore session(path);
   assert(session.initialize(metadata_for(path, root)));
+  assert(session.session_id() == "primary");
   zed::session::JsonlSessionStore competing_writer(path);
   const auto rejected_writer =
       competing_writer.initialize(metadata_for(path, root));
@@ -108,11 +109,14 @@ int main() {
   assert(forked_info.value().metadata.parent_id ==
          completed.value().metadata.id);
   assert(forked_info.value().metadata.title == "fork title");
+  assert(forked.session_id() == "fork");
   const auto forked_history = forked.load();
   const auto source_history = session.load();
   assert(forked_history);
   assert(source_history);
   assert(forked_history.value().size() == source_history.value().size());
+  assert(session.switch_to(fork_path));
+  assert(session.session_id() == "fork");
 
   const auto old_path = root / "old.jsonl";
   {

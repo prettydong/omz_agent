@@ -1,11 +1,13 @@
 #pragma once
 
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "zed/core/cancellation.hpp"
 #include "zed/core/message.hpp"
+#include "zed/core/model.hpp"
 #include "zed/core/result.hpp"
 #include "zed/core/types.hpp"
 
@@ -28,10 +30,17 @@ struct ContextUsage {
   TokenCount reserved_output_tokens{};
 };
 
+struct ContextTransition {
+  std::string previous_window_id;
+  std::string window_id;
+  std::vector<MessageId> archived_ids;
+};
+
 struct ContextWindow {
   std::vector<Message> messages;
   ContextUsage usage;
   bool was_compacted{false};
+  std::optional<ContextTransition> transition{};
 };
 
 struct ContextCandidate {
@@ -84,6 +93,16 @@ public:
   virtual Result<ContextWindow> build(std::span<const Message> messages,
                                       const ContextLimits &limits,
                                       CancellationToken cancellation) = 0;
+
+  // Existing managers keep their original budget and selection behavior.
+  // Managers which budget the complete request may also account for schemas.
+  virtual Result<ContextWindow>
+  build_request(std::span<const Message> messages,
+                std::span<const ToolDefinition> tools,
+                const ContextLimits &limits, CancellationToken cancellation) {
+    static_cast<void>(tools);
+    return build(messages, limits, cancellation);
+  }
 };
 
 class BasicContextManager final : public ContextManager {

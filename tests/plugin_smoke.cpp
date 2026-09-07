@@ -46,8 +46,10 @@ public:
       last_qa_had_evidence = request.messages.back().content.find(
                                  "src/foo.cpp") != std::string::npos;
       response = "回答来自源码。[src/foo.cpp:1]";
-      if (on_delta)
+      if (on_delta) {
+        on_delta({"fixture-transport-retry", zed::core::ModelDeltaKind::retry});
         on_delta({response});
+      }
     } else {
       response = "# "
                  "测试页面\n\n[数值提供器](deepwiki-term:foo)基于真实源码。["
@@ -240,6 +242,7 @@ int main() {
                     R"({"question":"foo 是什么？"})", "application/json");
     assert(answered && answered->status == 200);
     assert(answered->body.find("event: done") != std::string::npos);
+    assert(answered->body.find("fixture-transport-retry") == std::string::npos);
     assert(model.last_qa_had_evidence);
   }
 

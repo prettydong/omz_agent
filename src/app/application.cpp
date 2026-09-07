@@ -11,9 +11,13 @@
 #include <vector>
 
 #include "builtin_commands.hpp"
+#include "command_completion.hpp"
+#include "model_presentation.hpp"
 #include "zed/app/application.hpp"
 #include "zed/app/config.hpp"
 #include "zed/app/configure_web.hpp"
+#include "zed/context/context_archive.hpp"
+#include "zed/context/experimental_context.hpp"
 #include "zed/core/agent_loop.hpp"
 #include "zed/core/model_context_controller.hpp"
 #include "zed/extensions/extension_registry.hpp"
@@ -27,6 +31,7 @@
 #include "zed/subagents/subagent_runner.hpp"
 #include "zed/tools/basic_tools.hpp"
 #include "zed/tools/clangd_tool.hpp"
+#include "zed/tools/context_tools.hpp"
 #include "zed/tools/multi_bash_tool.hpp"
 #include "zed/tools/subagent_tool.hpp"
 #include "zed/ui/terminal.hpp"
@@ -102,14 +107,15 @@ int run_user_interface(
     zed::ui::TerminalApplication::InitialActivity initial_activity,
     std::vector<zed::ui::TerminalCommandHint> command_hints,
     zed::ui::TerminalApplication::SubmitHandler submit,
-    zed::ui::TerminalApplication::CommandHandler command) {
+    zed::ui::TerminalApplication::CommandHandler command,
+    zed::ui::TerminalApplication::CommandHintsState command_hints_state) {
   if (isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0) {
     zed::ui::TerminalApplication application(
         std::move(workspace), model, std::move(version), startup,
         max_context_tokens, reasoning_effort, theme, std::move(quick_bash),
         std::move(session_name), std::move(session_loader),
         std::move(initial_activity), std::move(command_hints),
-        std::move(submit), std::move(command));
+        std::move(submit), std::move(command), std::move(command_hints_state));
     const auto result = application.run();
     if (!result) {
       std::cerr << result.error().message << '\n';
@@ -193,7 +199,6 @@ int run_application(std::string_view executable, std::string_view version) {
       model, runtime_config.context_model, runtime_config.context_system_prompt,
       runtime_config.context_max_output_tokens);
   zed::core::ApproximateTokenEstimator estimator;
-  zed::core::BasicContextManager context(estimator, &context_controller);
   zed::session::JsonlSessionStore session(runtime_config.session_path);
   const auto session_directory = runtime_config.workspace / ".zed" / "sessions";
   const auto session_metadata = [&](const std::filesystem::path &path,
@@ -224,6 +229,20 @@ int run_application(std::string_view executable, std::string_view version) {
   }
   const auto session_ready_at = std::chrono::steady_clock::now();
 
+  std::unique_ptr<zed::context::ContextArchive> context_archive;
+  std::unique_ptr<zed::core::ContextManager> context;
+  if (runtime_config.experimental_context_management) {
+    context_archive =
+        std::make_unique<zed::context::ContextArchive>(session, [&session] {
+          return std::filesystem::path(session.path().string() + ".context");
+        });
+    context = std::make_unique<zed::context::ExperimentalContextManager>(
+        estimator, *context_archive);
+  } else {
+    context = std::make_unique<zed::core::BasicContextManager>(
+        estimator, &context_controller);
+  }
+
   zed::core::ToolRegistry tools(runtime_config.agent_tools);
   const auto registered_tools = register_builtin_tools(
       tools, runtime_config, clangd, subagent_runner, built_in_agents);
@@ -233,6 +252,16 @@ int run_application(std::string_view executable, std::string_view version) {
     return 3;
   }
   auto *subagent_tool_handle = registered_tools.value();
+
+  if (context_archive) {
+    const auto registered =
+        zed::tools::register_context_tools(tools, *context_archive);
+    if (!registered) {
+      std::cerr << "context tool registration failed: "
+                << registered.error().message << '\n';
+      return 3;
+    }
+  }
 
   zed::extensions::QuickBashInput quick_bash(tools,
                                              runtime_config.quick_bash_enabled);
@@ -274,7 +303,7 @@ int run_application(std::string_view executable, std::string_view version) {
   loop_config.max_turns = runtime_config.max_turns;
   loop_config.system_prompt = runtime_config.system_prompt;
 
-  zed::core::AgentLoop loop(model, tools, session, context, loop_config);
+  zed::core::AgentLoop loop(model, tools, session, *context, loop_config);
   zed::extensions::ExtensionRegistry extensions;
   zed::plugins::PluginManager plugins(
       {runtime_config.workspace, zed::plugins::default_plugin_search_paths(),
@@ -286,7 +315,7 @@ int run_application(std::string_view executable, std::string_view version) {
       subagent_tool_handle, tools, configure_web, skills, active_skill,
       active_model, active_reasoning_effort, active_context_limits,
       active_theme, loop, model, quick_bash, session_directory, session,
-      session_metadata, plugins);
+      session_metadata, plugins, context_archive.get());
   if (!command_registrar.register_commands())
     return 3;
   const auto plugins_started_at = std::chrono::steady_clock::now();
@@ -347,20 +376,35 @@ int run_application(std::string_view executable, std::string_view version) {
       return zed::ui::TerminalActivity::action;
     return zed::ui::TerminalActivity::thinking;
   };
-  std::vector<zed::ui::TerminalCommandHint> command_hints;
-  const auto command_snapshot = extensions.commands_snapshot();
-  command_hints.reserve(command_snapshot.size() + 1);
-  for (const auto &command : command_snapshot) {
-    std::vector<zed::ui::TerminalCommandOption> options;
-    options.reserve(command.options.size());
-    for (const auto &option : command.options) {
-      options.push_back(
-          {option.value, option.description, option.opens_document_view});
+  const auto command_hints_state = [&] {
+    std::vector<zed::ui::TerminalCommandHint> command_hints;
+    const auto command_snapshot = extensions.commands_snapshot();
+    command_hints.reserve(command_snapshot.size() + 1);
+    for (const auto &command : command_snapshot) {
+      std::vector<zed::ui::TerminalCommandOption> options;
+      options.reserve(command.options.size());
+      for (const auto &option : command.options) {
+        options.push_back(
+            {option.value, option.description, option.opens_document_view});
+      }
+      if (command.name == "model") {
+        options.clear();
+        for (const auto &entry : model_catalog)
+          options.push_back(model_option(entry, active_model.model));
+        options.push_back({"list", "List available OpenCode Go models."});
+        options.push_back({"refresh", "Refresh models from local OpenCode."});
+      } else if (command.name == "configure") {
+        options = configure_completion_options(runtime_config.workspace,
+                                               model_catalog);
+      } else if (command.name == "session") {
+        options = session_completion_options(session_directory);
+      }
+      command_hints.push_back(
+          {command.name, command.description, std::move(options)});
     }
-    command_hints.push_back(
-        {command.name, command.description, std::move(options)});
-  }
-  command_hints.push_back({"exit", "Quit zeda.", {}});
+    command_hints.push_back({"exit", "Quit zeda.", {}});
+    return command_hints;
+  };
   const auto active_session_label = [&] {
     const auto info = session.inspect();
     if (!info)
@@ -386,8 +430,8 @@ int run_application(std::string_view executable, std::string_view version) {
       std::string(version), startup, active_context_limits.max_context_tokens,
       active_reasoning_effort, active_theme,
       [&] { return quick_bash.enabled(); }, active_session_label,
-      [&] { return session.load(); }, initial_activity,
-      std::move(command_hints), submit_handler, command_handler);
+      [&] { return session.load(); }, initial_activity, command_hints_state(),
+      submit_handler, command_handler, command_hints_state);
   const auto plugin_shutdown = plugins.shutdown();
   if (!plugin_shutdown) {
     std::cerr << plugin_shutdown.error().message << '\n';

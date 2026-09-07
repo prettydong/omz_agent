@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -8,6 +9,8 @@
 #include "zed/core/result.hpp"
 
 namespace zed::core {
+
+[[nodiscard]] std::string new_conversation_id();
 
 enum class SessionTurnOutcome {
   completed,
@@ -23,6 +26,10 @@ public:
   virtual Result<void> append(const Message &message) = 0;
   virtual Result<std::vector<Message>> load() const = 0;
 
+  virtual Result<std::string> conversation_id() const {
+    return Result<std::string>::success(conversation_id_);
+  }
+
   virtual Result<void> begin_turn(std::string_view turn_id,
                                   const Message &user_message) {
     static_cast<void>(turn_id);
@@ -37,6 +44,9 @@ public:
     static_cast<void>(detail);
     return Result<void>::success();
   }
+
+private:
+  std::string conversation_id_{new_conversation_id()};
 };
 
 class InMemorySessionStore final : public SessionStore {

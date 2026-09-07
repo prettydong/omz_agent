@@ -5,6 +5,7 @@
 
 #include "zed/core/context.hpp"
 #include "zed/core/model.hpp"
+#include "zed/core/session_store.hpp"
 
 namespace zed::core {
 
@@ -22,6 +23,7 @@ private:
   ModelRef model_ref_;
   std::string system_prompt_;
   std::size_t max_output_tokens_;
+  std::string session_id_{new_conversation_id()};
 };
 
 [[nodiscard]] std::string_view default_context_system_prompt();

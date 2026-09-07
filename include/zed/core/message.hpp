@@ -28,6 +28,8 @@ struct Message {
   std::vector<ToolCall> tool_calls;
   std::optional<ToolCallId> tool_call_id;
   bool is_error{false};
+  // Opaque provider continuation data. Persisted, never interpreted by core.
+  std::string model_state{};
 };
 
 } // namespace zed::core

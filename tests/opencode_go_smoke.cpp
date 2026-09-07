@@ -323,7 +323,7 @@ opencode-go/responses-model
         assert(body.at("model") == "messages-model");
         assert(body.at("thinking").at("type") == "adaptive");
         assert(!body.contains("temperature"));
-        assert(body.at("system") == "Be concise.");
+        assert(body.at("system").at(0).at("text") == "Be concise.");
         assert(body.at("tools").at(0).at("input_schema").is_object());
       });
   zed::providers::OpenCodeGoModel messages_model({
@@ -344,7 +344,7 @@ opencode-go/responses-model
   assert(messages_response);
   assert(messages_response.value().content == "done");
   assert(messages_response.value().finish_reason == FinishReason::stop);
-  assert(messages_response.value().usage.input_tokens == 9);
+  assert(messages_response.value().usage.input_tokens == 14);
   assert(messages_response.value().usage.output_tokens == 3);
   assert(messages_response.value().usage.cached_input_tokens == 5);
   assert(messages_reasoning == "分析上下文");

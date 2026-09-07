@@ -2,9 +2,11 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 
 #include "zed/core/agent_event.hpp"
 #include "zed/core/context.hpp"
+#include "zed/core/hook_registry.hpp"
 #include "zed/core/model.hpp"
 #include "zed/core/result.hpp"
 #include "zed/core/session_store.hpp"
@@ -22,7 +24,8 @@ struct AgentLoopConfig {
 class AgentLoop {
 public:
   AgentLoop(Model &model, ToolRegistry &tools, SessionStore &session,
-            ContextManager &context, AgentLoopConfig config);
+            ContextManager &context, AgentLoopConfig config,
+            HookRegistry *hooks = nullptr);
 
   Result<std::string> run(std::string user_input,
                           CancellationToken cancellation = {},
@@ -38,7 +41,8 @@ public:
 
 private:
   Result<std::string>
-  run_active_turn(CancellationToken cancellation, AgentEventCallback on_event,
+  run_active_turn(std::string_view turn_id, CancellationToken cancellation,
+                  AgentEventCallback on_event,
                   const std::string &additional_system_prompt);
   void emit(const AgentEvent &event, const AgentEventCallback &callback) const;
 
@@ -47,6 +51,7 @@ private:
   SessionStore &session_;
   ContextManager &context_;
   AgentLoopConfig config_;
+  HookRegistry *hooks_{};
 };
 
 } // namespace zed::core

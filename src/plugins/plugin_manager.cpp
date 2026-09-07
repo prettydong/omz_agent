@@ -298,6 +298,37 @@ struct StagedTool {
   decltype(ZedaToolV1::execute) execute{};
 };
 
+struct StagedHook {
+  std::string name;
+  std::uint32_t kind{};
+  std::int32_t priority{};
+  void *context{};
+  decltype(ZedaHookV2::execute) execute{};
+};
+
+std::optional<core::HookPoint> core_hook_point(std::uint32_t kind) {
+  switch (kind) {
+  case ZEDA_HOOK_USER_MESSAGE_SUBMIT:
+    return core::HookPoint::user_message_submit;
+  case ZEDA_HOOK_BEFORE_MODEL_REQUEST:
+    return core::HookPoint::before_model_request;
+  case ZEDA_HOOK_AFTER_MODEL_RESPONSE:
+    return core::HookPoint::after_model_response;
+  case ZEDA_HOOK_BEFORE_TOOL_CALL:
+    return core::HookPoint::before_tool_call;
+  case ZEDA_HOOK_AFTER_TOOL_RESULT:
+    return core::HookPoint::after_tool_result;
+  case ZEDA_HOOK_SESSION_WRITE:
+    return core::HookPoint::session_write;
+  case ZEDA_HOOK_AGENT_TURN_START:
+    return core::HookPoint::agent_turn_start;
+  case ZEDA_HOOK_AGENT_TURN_END:
+    return core::HookPoint::agent_turn_end;
+  default:
+    return std::nullopt;
+  }
+}
+
 class PluginTool final : public core::Tool {
 public:
   PluginTool(StagedTool tool, std::shared_ptr<InvocationGate> gate,
@@ -450,6 +481,36 @@ core::Result<Manifest> read_builtin(const BuiltinPlugin &builtin) {
       throw std::runtime_error("descriptor is null");
     if (builtin.descriptor->abi_version != ZEDA_PLUGIN_ABI_VERSION)
       throw std::runtime_error("plugin ABI mismatch");
+
+    Manifest manifest;
+    manifest.id = copy_string(builtin.descriptor->id);
+    manifest.name = copy_string(builtin.descriptor->name);
+    manifest.version = copy_string(builtin.descriptor->version);
+    manifest.abi_version = builtin.descriptor->abi_version;
+    manifest.manifest_path =
+        std::filesystem::path("<builtin:" + manifest.id + ">");
+    manifest.resource_path =
+        std::filesystem::weakly_canonical(builtin.resource_path);
+    if (!valid_plugin_id(manifest.id))
+      throw std::runtime_error("id contains unsupported characters");
+    if (manifest.name.empty() || manifest.version.empty())
+      throw std::runtime_error("name and version must be non-empty");
+    return core::Result<Manifest>::success(std::move(manifest));
+  } catch (const std::exception &exception) {
+    return core::Result<Manifest>::failure(
+        {ErrorCode::invalid_argument,
+         "invalid built-in plugin: " + std::string(exception.what())});
+  }
+}
+
+core::Result<Manifest> read_builtin(const BuiltinPluginV2 &builtin) {
+  try {
+    if (builtin.descriptor == nullptr)
+      throw std::runtime_error("descriptor is null");
+    if (builtin.descriptor->abi_version != ZEDA_PLUGIN_ABI_VERSION_V2 ||
+        builtin.descriptor->struct_size < sizeof(ZedaPluginDescriptorV2)) {
+      throw std::runtime_error("plugin ABI mismatch");
+    }
 
     Manifest manifest;
     manifest.id = copy_string(builtin.descriptor->id);
@@ -664,11 +725,72 @@ core::Result<std::string> execute_plugin_command(
   }
 }
 
+core::Result<core::HookCallbackResult>
+execute_plugin_hook(const StagedHook &callback, std::string_view payload_json,
+                    core::CancellationToken cancellation,
+                    const std::shared_ptr<InvocationGate> &gate,
+                    std::size_t max_output_bytes) {
+  auto lease = gate->enter();
+  if (!lease.has_value()) {
+    return core::Result<core::HookCallbackResult>::failure(
+        {ErrorCode::cancelled, "plugin is unloading: " + callback.name});
+  }
+  BoundedText replacement(max_output_bytes);
+  BoundedText error(max_output_bytes);
+  PluginCancellationContext combined{cancellation, gate};
+  try {
+    const int action = callback.execute(
+        callback.context, callback.kind, string_view(payload_json),
+        cancellation_view(combined), text_sink(replacement), text_sink(error));
+    if (combined.caller.is_cancelled() || gate->is_stopping()) {
+      return core::Result<core::HookCallbackResult>::failure(
+          {ErrorCode::cancelled, "plugin hook cancelled: " + callback.name});
+    }
+    if (action == ZEDA_HOOK_CONTINUE) {
+      return core::Result<core::HookCallbackResult>::success(
+          {core::HookAction::continue_execution, {}, {}});
+    }
+    if (action == ZEDA_HOOK_REPLACE) {
+      auto payload = replacement.take();
+      if (payload.empty()) {
+        return core::Result<core::HookCallbackResult>::failure(
+            {ErrorCode::hook_error,
+             "plugin hook returned REPLACE without JSON: " + callback.name});
+      }
+      return core::Result<core::HookCallbackResult>::success(
+          {core::HookAction::replace_payload, std::move(payload), {}});
+    }
+    if (action == ZEDA_HOOK_REJECT) {
+      return core::Result<core::HookCallbackResult>::success(
+          {core::HookAction::reject, {}, error.take()});
+    }
+    auto detail = error.take();
+    return core::Result<core::HookCallbackResult>::failure(
+        {ErrorCode::hook_error,
+         detail.empty()
+             ? "plugin hook returned an invalid action: " + callback.name
+             : std::move(detail)});
+  } catch (const std::exception &exception) {
+    return core::Result<core::HookCallbackResult>::failure(
+        {combined.caller.is_cancelled() || gate->is_stopping()
+             ? ErrorCode::cancelled
+             : ErrorCode::hook_error,
+         "plugin hook threw an exception: " + callback.name + ": " +
+             exception.what()});
+  } catch (...) {
+    return core::Result<core::HookCallbackResult>::failure(
+        {combined.caller.is_cancelled() || gate->is_stopping()
+             ? ErrorCode::cancelled
+             : ErrorCode::hook_error,
+         "plugin hook threw an unknown exception: " + callback.name});
+  }
+}
+
 class PluginContributionScope {
 public:
   PluginContributionScope(extensions::ExtensionRegistry &extensions,
-                          core::ToolRegistry &tools)
-      : extensions_(extensions), tools_(tools) {}
+                          core::ToolRegistry &tools, core::HookRegistry *hooks)
+      : extensions_(extensions), tools_(tools), hooks_(hooks) {}
 
   ~PluginContributionScope() { release(); }
 
@@ -677,7 +799,7 @@ public:
 
   core::Result<void> track_command(const std::string &name) {
     try {
-      effects_.push_back({Kind::command, name});
+      effects_.push_back({Kind::command, name, 0});
       return core::Result<void>::success();
     } catch (const std::exception &exception) {
       static_cast<void>(extensions_.unregister_command(name));
@@ -689,7 +811,7 @@ public:
 
   core::Result<void> track_tool(const std::string &name) {
     try {
-      effects_.push_back({Kind::tool, name});
+      effects_.push_back({Kind::tool, name, 0});
       return core::Result<void>::success();
     } catch (const std::exception &exception) {
       static_cast<void>(tools_.unregister_tool(name));
@@ -699,11 +821,29 @@ public:
     }
   }
 
+  core::Result<void> track_hook(core::HookSubscriptionId id, std::string name) {
+    if (hooks_ == nullptr) {
+      return core::Result<void>::failure(
+          {ErrorCode::internal, "hook registry is unavailable"});
+    }
+    try {
+      effects_.push_back({Kind::hook, std::move(name), id});
+      return core::Result<void>::success();
+    } catch (const std::exception &exception) {
+      static_cast<void>(hooks_->unregister_hook(id));
+      return core::Result<void>::failure(
+          {ErrorCode::internal, "cannot track plugin hook registration: " +
+                                    std::string(exception.what())});
+    }
+  }
+
   void release() noexcept {
     for (auto iterator = effects_.rbegin(); iterator != effects_.rend();
          ++iterator) {
       try {
-        if (iterator->kind == Kind::tool)
+        if (iterator->kind == Kind::hook && hooks_ != nullptr)
+          static_cast<void>(hooks_->unregister_hook(iterator->hook_id));
+        else if (iterator->kind == Kind::tool)
           static_cast<void>(tools_.unregister_tool(iterator->name));
         else
           static_cast<void>(extensions_.unregister_command(iterator->name));
@@ -714,14 +854,16 @@ public:
   }
 
 private:
-  enum class Kind { command, tool };
+  enum class Kind { command, tool, hook };
   struct Effect {
     Kind kind;
     std::string name;
+    core::HookSubscriptionId hook_id{};
   };
 
   extensions::ExtensionRegistry &extensions_;
   core::ToolRegistry &tools_;
+  core::HookRegistry *hooks_{};
   std::vector<Effect> effects_;
 };
 
@@ -774,16 +916,19 @@ public:
     bool accepting_registrations{true};
     std::vector<StagedCommand> commands;
     std::vector<StagedTool> tools;
+    std::vector<StagedHook> hooks;
   };
 
   struct LoadedPlugin {
     Manifest manifest;
     support::UniqueLibrary library;
-    const ZedaPluginDescriptorV1 *descriptor{};
+    const ZedaPluginDescriptorV1 *descriptor_v1{};
+    const ZedaPluginDescriptorV2 *descriptor_v2{};
     void *instance{};
     std::shared_ptr<InvocationGate> gate{std::make_shared<InvocationGate>()};
     HostContext host_context;
-    ZedaHostApiV1 host_api{};
+    ZedaHostApiV1 host_api_v1{};
+    ZedaHostApiV2 host_api_v2{};
     std::unique_ptr<PluginContributionScope> contributions;
     std::size_t status_index{};
     bool initialize_entered{false};
@@ -793,13 +938,15 @@ public:
     Manifest manifest;
     std::size_t status_index{};
     bool processed{false};
-    const ZedaPluginDescriptorV1 *builtin_descriptor{};
+    const ZedaPluginDescriptorV1 *builtin_descriptor_v1{};
+    const ZedaPluginDescriptorV2 *builtin_descriptor_v2{};
   };
 
   Impl(PluginManagerConfig config, extensions::ExtensionRegistry &extensions,
-       core::ToolRegistry &tools, core::Model &model, lsp::ClangdClient &clangd)
+       core::ToolRegistry &tools, core::Model &model, lsp::ClangdClient &clangd,
+       core::HookRegistry *hooks)
       : config_(std::move(config)), extensions_(extensions), tools_(tools),
-        model_(model), clangd_(clangd) {}
+        model_(model), clangd_(clangd), hooks_(hooks) {}
 
   ~Impl() noexcept {
     try {
@@ -854,7 +1001,34 @@ public:
       statuses_.push_back(std::move(status));
       winners.emplace(manifest.value().id, candidates.size());
       candidates.push_back({std::move(manifest.value()), status_index, false,
-                            builtin.descriptor});
+                            builtin.descriptor, nullptr});
+    }
+    for (const auto &builtin : config_.builtin_plugins_v2) {
+      PluginStatus status;
+      auto manifest = read_builtin(builtin);
+      if (!manifest) {
+        status.state = PluginState::failed;
+        status.detail = manifest.error().message;
+        statuses_.push_back(std::move(status));
+        continue;
+      }
+
+      status.id = manifest.value().id;
+      status.name = manifest.value().name;
+      status.version = manifest.value().version;
+      status.manifest_path = manifest.value().manifest_path;
+      if (winners.contains(manifest.value().id)) {
+        status.state = PluginState::failed;
+        status.detail = "duplicate built-in plugin id: " + manifest.value().id;
+        statuses_.push_back(std::move(status));
+        continue;
+      }
+
+      const auto status_index = statuses_.size();
+      statuses_.push_back(std::move(status));
+      winners.emplace(manifest.value().id, candidates.size());
+      candidates.push_back({std::move(manifest.value()), status_index, false,
+                            nullptr, builtin.descriptor});
     }
     for (const auto &path : files.value()) {
       PluginStatus status;
@@ -884,7 +1058,8 @@ public:
       const auto status_index = statuses_.size();
       statuses_.push_back(std::move(status));
       winners.emplace(manifest.value().id, candidates.size());
-      candidates.push_back({manifest.value(), status_index, false, nullptr});
+      candidates.push_back(
+          {manifest.value(), status_index, false, nullptr, nullptr});
     }
 
     bool made_progress = true;
@@ -907,7 +1082,7 @@ public:
           continue;
         candidate.processed = true;
         load(candidate.manifest, candidate.status_index,
-             candidate.builtin_descriptor);
+             candidate.builtin_descriptor_v1, candidate.builtin_descriptor_v2);
         made_progress = true;
       }
     }
@@ -1070,7 +1245,8 @@ public:
   }
 
   void load(const Manifest &manifest, std::size_t status_index,
-            const ZedaPluginDescriptorV1 *builtin_descriptor) {
+            const ZedaPluginDescriptorV1 *builtin_descriptor_v1,
+            const ZedaPluginDescriptorV2 *builtin_descriptor_v2) {
     auto &status = statuses_[status_index];
     status.state = PluginState::loading;
     status.detail = "loading";
@@ -1079,7 +1255,8 @@ public:
       status.detail = std::move(detail);
     };
 
-    if (manifest.abi_version != ZEDA_PLUGIN_ABI_VERSION) {
+    if (manifest.abi_version != ZEDA_PLUGIN_ABI_VERSION_V1 &&
+        manifest.abi_version != ZEDA_PLUGIN_ABI_VERSION_V2) {
       fail("plugin ABI mismatch");
       return;
     }
@@ -1087,8 +1264,9 @@ public:
     auto plugin = std::make_unique<LoadedPlugin>();
     plugin->manifest = manifest;
     plugin->status_index = status_index;
-    plugin->descriptor = builtin_descriptor;
-    if (plugin->descriptor == nullptr) {
+    plugin->descriptor_v1 = builtin_descriptor_v1;
+    plugin->descriptor_v2 = builtin_descriptor_v2;
+    if (plugin->descriptor_v1 == nullptr && plugin->descriptor_v2 == nullptr) {
       plugin->library.reset(
           dlopen(plugin->manifest.library_path.c_str(), RTLD_NOW | RTLD_LOCAL));
       if (!plugin->library) {
@@ -1097,25 +1275,53 @@ public:
              std::string(load_error == nullptr ? "unknown error" : load_error));
         return;
       }
-      const auto entry = reinterpret_cast<ZedaPluginEntryV1>(
-          dlsym(plugin->library.get(), ZEDA_PLUGIN_ENTRY_SYMBOL));
-      if (entry == nullptr) {
-        fail("plugin entry symbol is missing");
-        return;
-      }
-      try {
-        plugin->descriptor = entry();
-      } catch (...) {
-        plugin->descriptor = nullptr;
+      if (manifest.abi_version == ZEDA_PLUGIN_ABI_VERSION_V1) {
+        const auto entry = reinterpret_cast<ZedaPluginEntryV1>(
+            dlsym(plugin->library.get(), ZEDA_PLUGIN_ENTRY_SYMBOL_V1));
+        if (entry == nullptr) {
+          fail("plugin entry symbol is missing: " +
+               std::string(ZEDA_PLUGIN_ENTRY_SYMBOL_V1));
+          return;
+        }
+        try {
+          plugin->descriptor_v1 = entry();
+        } catch (...) {
+          plugin->descriptor_v1 = nullptr;
+        }
+      } else {
+        const auto entry = reinterpret_cast<ZedaPluginEntryV2>(
+            dlsym(plugin->library.get(), ZEDA_PLUGIN_ENTRY_SYMBOL_V2));
+        if (entry == nullptr) {
+          fail("plugin entry symbol is missing: " +
+               std::string(ZEDA_PLUGIN_ENTRY_SYMBOL_V2));
+          return;
+        }
+        try {
+          plugin->descriptor_v2 = entry();
+        } catch (...) {
+          plugin->descriptor_v2 = nullptr;
+        }
       }
     }
     bool descriptor_matches = false;
     try {
-      descriptor_matches =
-          plugin->descriptor != nullptr &&
-          plugin->descriptor->abi_version == ZEDA_PLUGIN_ABI_VERSION &&
-          copy_string(plugin->descriptor->id) == plugin->manifest.id &&
-          copy_string(plugin->descriptor->version) == plugin->manifest.version;
+      if (manifest.abi_version == ZEDA_PLUGIN_ABI_VERSION_V1) {
+        descriptor_matches =
+            plugin->descriptor_v1 != nullptr &&
+            plugin->descriptor_v1->abi_version == ZEDA_PLUGIN_ABI_VERSION_V1 &&
+            copy_string(plugin->descriptor_v1->id) == plugin->manifest.id &&
+            copy_string(plugin->descriptor_v1->version) ==
+                plugin->manifest.version;
+      } else {
+        descriptor_matches =
+            plugin->descriptor_v2 != nullptr &&
+            plugin->descriptor_v2->abi_version == ZEDA_PLUGIN_ABI_VERSION_V2 &&
+            plugin->descriptor_v2->struct_size >=
+                sizeof(ZedaPluginDescriptorV2) &&
+            copy_string(plugin->descriptor_v2->id) == plugin->manifest.id &&
+            copy_string(plugin->descriptor_v2->version) ==
+                plugin->manifest.version;
+      }
     } catch (...) {
       descriptor_matches = false;
     }
@@ -1123,9 +1329,15 @@ public:
       fail("plugin descriptor does not match manifest");
       return;
     }
-    if (plugin->descriptor->create == nullptr ||
-        plugin->descriptor->initialize == nullptr ||
-        plugin->descriptor->destroy == nullptr) {
+    const bool lifecycle_complete =
+        manifest.abi_version == ZEDA_PLUGIN_ABI_VERSION_V1
+            ? plugin->descriptor_v1->create != nullptr &&
+                  plugin->descriptor_v1->initialize != nullptr &&
+                  plugin->descriptor_v1->destroy != nullptr
+            : plugin->descriptor_v2->create != nullptr &&
+                  plugin->descriptor_v2->initialize != nullptr &&
+                  plugin->descriptor_v2->destroy != nullptr;
+    if (!lifecycle_complete) {
       fail("plugin lifecycle is incomplete");
       return;
     }
@@ -1136,8 +1348,8 @@ public:
     plugin->host_context.workspace_text = config_.workspace_root.string();
     plugin->host_context.resource_text =
         plugin->manifest.resource_path.string();
-    plugin->host_api = {
-        ZEDA_PLUGIN_ABI_VERSION,
+    plugin->host_api_v1 = {
+        ZEDA_PLUGIN_ABI_VERSION_V1,
         &plugin->host_context,
         string_view(plugin->host_context.workspace_text),
         string_view(plugin->host_context.resource_text),
@@ -1146,15 +1358,34 @@ public:
         complete,
         clangd_query,
     };
+    plugin->host_api_v2 = {
+        ZEDA_PLUGIN_ABI_VERSION_V2,
+        sizeof(ZedaHostApiV2),
+        &plugin->host_context,
+        string_view(plugin->host_context.workspace_text),
+        string_view(plugin->host_context.resource_text),
+        register_command,
+        register_tool,
+        register_hook,
+        complete,
+        clangd_query,
+    };
 
     BoundedText initialization_error(config_.max_output_bytes);
     try {
-      plugin->instance = plugin->descriptor->create();
+      plugin->instance = manifest.abi_version == ZEDA_PLUGIN_ABI_VERSION_V1
+                             ? plugin->descriptor_v1->create()
+                             : plugin->descriptor_v2->create();
       if (plugin->instance == nullptr)
         throw std::runtime_error("plugin create returned null");
       plugin->initialize_entered = true;
-      const int initialized = plugin->descriptor->initialize(
-          plugin->instance, &plugin->host_api, text_sink(initialization_error));
+      const int initialized = manifest.abi_version == ZEDA_PLUGIN_ABI_VERSION_V1
+                                  ? plugin->descriptor_v1->initialize(
+                                        plugin->instance, &plugin->host_api_v1,
+                                        text_sink(initialization_error))
+                                  : plugin->descriptor_v2->initialize(
+                                        plugin->instance, &plugin->host_api_v2,
+                                        text_sink(initialization_error));
       close_registration_phase(*plugin);
       if (initialized != 0) {
         auto detail = initialization_error.take();
@@ -1191,8 +1422,8 @@ public:
 
     try {
       loaded_.reserve(loaded_.size() + 1);
-      plugin->contributions =
-          std::make_unique<PluginContributionScope>(extensions_, tools_);
+      plugin->contributions = std::make_unique<PluginContributionScope>(
+          extensions_, tools_, hooks_);
       for (const auto &command : plugin->host_context.commands) {
         std::vector<extensions::CommandOption> options;
         if (!command.options_json.empty()) {
@@ -1247,6 +1478,35 @@ public:
           return;
         }
       }
+      for (const auto &hook : plugin->host_context.hooks) {
+        const auto point = core_hook_point(hook.kind);
+        if (!point.has_value()) {
+          fail_loaded_plugin(*plugin, status, "plugin hook kind is invalid");
+          return;
+        }
+        const auto callback = hook;
+        const auto gate = plugin->gate;
+        const auto max_output_bytes = config_.max_output_bytes;
+        const auto qualified_name = plugin->manifest.id + ":" + callback.name;
+        const auto registered = hooks_->register_hook(
+            {qualified_name, *point, callback.priority,
+             [callback, gate,
+              max_output_bytes](std::string_view payload,
+                                core::CancellationToken cancellation) {
+               return execute_plugin_hook(callback, payload, cancellation, gate,
+                                          max_output_bytes);
+             }});
+        if (!registered) {
+          fail_loaded_plugin(*plugin, status, registered.error().message);
+          return;
+        }
+        const auto tracked = plugin->contributions->track_hook(
+            registered.value(), qualified_name);
+        if (!tracked) {
+          fail_loaded_plugin(*plugin, status, tracked.error().message);
+          return;
+        }
+      }
 
       status.state = PluginState::active;
       status.loaded = true;
@@ -1285,10 +1545,16 @@ public:
     if (plugin.instance == nullptr)
       return {};
     std::string errors;
-    if (call_shutdown && plugin.initialize_entered &&
-        plugin.descriptor->shutdown != nullptr) {
+    const bool is_v1 =
+        plugin.manifest.abi_version == ZEDA_PLUGIN_ABI_VERSION_V1;
+    const bool has_shutdown = is_v1 ? plugin.descriptor_v1->shutdown != nullptr
+                                    : plugin.descriptor_v2->shutdown != nullptr;
+    if (call_shutdown && plugin.initialize_entered && has_shutdown) {
       try {
-        plugin.descriptor->shutdown(plugin.instance);
+        if (is_v1)
+          plugin.descriptor_v1->shutdown(plugin.instance);
+        else
+          plugin.descriptor_v2->shutdown(plugin.instance);
       } catch (const std::exception &exception) {
         append_cleanup_error(errors, "shutdown threw: ", exception.what());
       } catch (...) {
@@ -1296,7 +1562,10 @@ public:
       }
     }
     try {
-      plugin.descriptor->destroy(plugin.instance);
+      if (is_v1)
+        plugin.descriptor_v1->destroy(plugin.instance);
+      else
+        plugin.descriptor_v2->destroy(plugin.instance);
     } catch (const std::exception &exception) {
       append_cleanup_error(errors, "destroy threw: ", exception.what());
     } catch (...) {
@@ -1416,6 +1685,23 @@ public:
       if (!exact_validation)
         return exact_validation;
     }
+    if (!host.hooks.empty() && hooks_ == nullptr) {
+      return core::Result<void>::failure(
+          {ErrorCode::invalid_argument, "plugin registered hooks but the host "
+                                        "hook registry is unavailable"});
+    }
+    std::set<std::string> hook_names;
+    for (const auto &hook : host.hooks) {
+      if (hook.name.empty() || hook.execute == nullptr ||
+          !core_hook_point(hook.kind).has_value()) {
+        return core::Result<void>::failure(
+            {ErrorCode::invalid_argument, "plugin hook is incomplete"});
+      }
+      if (!hook_names.insert(hook.name).second) {
+        return core::Result<void>::failure(
+            {ErrorCode::conflict, "plugin hook conflict: " + hook.name});
+      }
+    }
     return core::Result<void>::success();
   }
 
@@ -1470,6 +1756,38 @@ public:
       return 1;
     } catch (...) {
       write_sink(error, "cannot stage plugin tool: unknown error");
+      return 1;
+    }
+  }
+
+  static int register_hook(void *context, const ZedaHookV2 *hook,
+                           ZedaTextSinkV1 error) {
+    auto *host = static_cast<HostContext *>(context);
+    if (host == nullptr || host->manager == nullptr || hook == nullptr ||
+        hook->struct_size < sizeof(ZedaHookV2) || hook->execute == nullptr ||
+        !core_hook_point(hook->kind).has_value()) {
+      write_sink(error, "invalid plugin hook");
+      return 1;
+    }
+    if (host->manager->hooks_ == nullptr) {
+      write_sink(error, "host hook registry is unavailable");
+      return 1;
+    }
+    try {
+      std::scoped_lock lock(host->registration_mutex);
+      if (!host->accepting_registrations) {
+        write_sink(error, "plugin registration phase has ended");
+        return 1;
+      }
+      host->hooks.push_back({copy_string(hook->name), hook->kind,
+                             hook->priority, hook->context, hook->execute});
+      return 0;
+    } catch (const std::exception &exception) {
+      write_sink(error,
+                 std::string("cannot stage plugin hook: ") + exception.what());
+      return 1;
+    } catch (...) {
+      write_sink(error, "cannot stage plugin hook: unknown error");
       return 1;
     }
   }
@@ -1647,6 +1965,7 @@ public:
   core::ToolRegistry &tools_;
   core::Model &model_;
   lsp::ClangdClient &clangd_;
+  core::HookRegistry *hooks_{};
   std::vector<std::unique_ptr<LoadedPlugin>> loaded_;
   std::vector<PluginStatus> statuses_;
   bool discovered_{false};
@@ -1656,9 +1975,10 @@ public:
 PluginManager::PluginManager(PluginManagerConfig config,
                              extensions::ExtensionRegistry &extensions,
                              core::ToolRegistry &tools, core::Model &model,
-                             lsp::ClangdClient &clangd)
+                             lsp::ClangdClient &clangd,
+                             core::HookRegistry *hooks)
     : impl_(std::make_unique<Impl>(std::move(config), extensions, tools, model,
-                                   clangd)) {}
+                                   clangd, hooks)) {}
 
 PluginManager::~PluginManager() = default;
 

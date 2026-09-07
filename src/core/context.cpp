@@ -119,7 +119,8 @@ Result<TokenCount>
 ApproximateTokenEstimator::estimate(std::span<const Message> messages) const {
   TokenCount total = 0;
   for (const auto &message : messages) {
-    std::size_t bytes = message.content.size() + message.id.size() + 8;
+    std::size_t bytes = message.content.size() + message.model_state.size() +
+                        message.id.size() + 8;
     for (const auto &call : message.tool_calls) {
       bytes += call.id.size() + call.name.size() + call.arguments_json.size();
     }

@@ -1,5 +1,6 @@
 #include "zed/core/agent_loop.hpp"
 
+#include "zed/core/agent_hooks.hpp"
 #include "zed/core/default_system_prompt.hpp"
 #include "zed/core/tool_registry.hpp"
 
@@ -164,9 +165,10 @@ terminal_response_error(const AssistantResponse &response) {
 } // namespace
 
 AgentLoop::AgentLoop(Model &model, ToolRegistry &tools, SessionStore &session,
-                     ContextManager &context, AgentLoopConfig config)
+                     ContextManager &context, AgentLoopConfig config,
+                     HookRegistry *hooks)
     : model_(model), tools_(tools), session_(session), context_(context),
-      config_(std::move(config)) {
+      config_(std::move(config)), hooks_(hooks) {
   if (config_.system_prompt.empty())
     config_.system_prompt = kDefaultSystemPrompt;
 }
@@ -219,9 +221,36 @@ Result<std::string> AgentLoop::run(std::string user_input,
   emit({AgentEventType::agent_start, {}, std::nullopt, std::nullopt}, on_event);
 
   const auto turn_id = next_id("turn");
+  AgentHooks hooks(hooks_);
+  auto turn_start =
+      hooks.agent_turn_start(turn_id, std::move(user_input), cancellation);
+  if (!turn_start) {
+    emit({AgentEventType::error, turn_start.error().message, std::nullopt,
+          std::nullopt},
+         on_event);
+    return Result<std::string>::failure(turn_start.error());
+  }
   Message user_message{
-      next_id("user"), Role::user, std::move(user_input), {}, std::nullopt,
+      next_id("user"), Role::user, std::move(turn_start.value()), {},
+      std::nullopt,
   };
+  auto submitted =
+      hooks.user_message_submit(turn_id, std::move(user_message), cancellation);
+  if (!submitted) {
+    emit({AgentEventType::error, submitted.error().message, std::nullopt,
+          std::nullopt},
+         on_event);
+    return Result<std::string>::failure(submitted.error());
+  }
+  auto session_message = hooks.session_write_message(
+      "begin_turn", turn_id, std::move(submitted.value()), cancellation);
+  if (!session_message) {
+    emit({AgentEventType::error, session_message.error().message, std::nullopt,
+          std::nullopt},
+         on_event);
+    return Result<std::string>::failure(session_message.error());
+  }
+  user_message = std::move(session_message.value());
   const auto begin_turn = session_.begin_turn(turn_id, user_message);
   if (!begin_turn) {
     emit({AgentEventType::error, begin_turn.error().message, std::nullopt,
@@ -233,14 +262,99 @@ Result<std::string> AgentLoop::run(std::string user_input,
         std::nullopt},
        on_event);
 
-  auto result =
-      run_active_turn(cancellation, on_event, additional_system_prompt);
-  const auto outcome = result ? SessionTurnOutcome::completed
-                       : result.error().code == ErrorCode::cancelled
-                           ? SessionTurnOutcome::cancelled
-                           : SessionTurnOutcome::failed;
-  const auto detail =
-      result ? std::string_view{} : std::string_view(result.error().message);
+  auto result = run_active_turn(turn_id, cancellation, on_event,
+                                additional_system_prompt);
+  auto outcome = result ? SessionTurnOutcome::completed
+                 : result.error().code == ErrorCode::cancelled
+                     ? SessionTurnOutcome::cancelled
+                     : SessionTurnOutcome::failed;
+  std::string detail = result ? std::string{} : result.error().message;
+
+  auto turn_end = hooks.agent_turn_end(turn_id, outcome, detail, {});
+  if (!turn_end) {
+    emit({AgentEventType::error, turn_end.error().message, std::nullopt,
+          std::nullopt},
+         on_event);
+    result = Result<std::string>::failure(turn_end.error());
+    outcome = turn_end.error().code == ErrorCode::cancelled
+                  ? SessionTurnOutcome::cancelled
+                  : SessionTurnOutcome::failed;
+    detail = turn_end.error().message;
+  } else {
+    outcome = turn_end.value().outcome;
+    detail = std::move(turn_end.value().detail);
+    if (result && outcome != SessionTurnOutcome::completed) {
+      const Error error{
+          ErrorCode::hook_error,
+          detail.empty()
+              ? "agent_turn_end hook changed a successful turn to " +
+                    std::string(outcome == SessionTurnOutcome::cancelled
+                                    ? "cancelled"
+                                    : "failed")
+              : detail,
+      };
+      emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+           on_event);
+      result = Result<std::string>::failure(error);
+      detail = error.message;
+    } else if (!result && outcome == SessionTurnOutcome::completed) {
+      const Error error{ErrorCode::hook_error,
+                        "agent_turn_end hook cannot complete a failed turn"};
+      emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+           on_event);
+      result = Result<std::string>::failure(error);
+      outcome = SessionTurnOutcome::failed;
+      detail = error.message;
+    }
+  }
+
+  auto session_finish =
+      hooks.session_write_finish(turn_id, outcome, detail, {});
+  if (!session_finish) {
+    const auto recovery_outcome =
+        session_finish.error().code == ErrorCode::cancelled
+            ? SessionTurnOutcome::cancelled
+            : SessionTurnOutcome::failed;
+    const auto recovery = session_.finish_turn(turn_id, recovery_outcome,
+                                               session_finish.error().message);
+    if (!recovery) {
+      const Error error{
+          ErrorCode::session_error,
+          session_finish.error().message +
+              "; cannot close rejected session write: " +
+              recovery.error().message,
+      };
+      emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(error);
+    }
+    emit({AgentEventType::error, session_finish.error().message, std::nullopt,
+          std::nullopt},
+         on_event);
+    return Result<std::string>::failure(session_finish.error());
+  }
+  outcome = session_finish.value().outcome;
+  detail = std::move(session_finish.value().detail);
+  if (result && outcome != SessionTurnOutcome::completed) {
+    const Error error{
+        ErrorCode::hook_error,
+        detail.empty() ? "session_write hook changed a successful turn outcome"
+                       : detail,
+    };
+    emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+         on_event);
+    result = Result<std::string>::failure(error);
+    detail = error.message;
+  } else if (!result && outcome == SessionTurnOutcome::completed) {
+    const Error error{ErrorCode::hook_error,
+                      "session_write hook cannot complete a failed turn"};
+    emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+         on_event);
+    result = Result<std::string>::failure(error);
+    outcome = SessionTurnOutcome::failed;
+    detail = error.message;
+  }
+
   const auto finish_turn = session_.finish_turn(turn_id, outcome, detail);
   if (!finish_turn) {
     emit({AgentEventType::error, finish_turn.error().message, std::nullopt,
@@ -257,10 +371,10 @@ Result<std::string> AgentLoop::run(std::string user_input,
   return result;
 }
 
-Result<std::string>
-AgentLoop::run_active_turn(CancellationToken cancellation,
-                           AgentEventCallback on_event,
-                           const std::string &additional_system_prompt) {
+Result<std::string> AgentLoop::run_active_turn(
+    std::string_view turn_id, CancellationToken cancellation,
+    AgentEventCallback on_event, const std::string &additional_system_prompt) {
+  AgentHooks hooks(hooks_);
   for (std::size_t turn = 0; turn < config_.max_turns; ++turn) {
     if (cancellation.is_cancelled()) {
       const auto error = cancelled_error();
@@ -302,11 +416,28 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
     }
 
     ModelRequest request = config_.model_request;
+    const auto conversation = session_.conversation_id();
+    if (!conversation) {
+      emit({AgentEventType::error, conversation.error().message, std::nullopt,
+            std::nullopt},
+           on_event);
+      return Result<std::string>::failure(conversation.error());
+    }
+    request.session_id = conversation.value();
     request.messages = window.value().messages;
     request.tools = tools_.definitions();
+    auto intercepted_request = hooks.before_model_request(
+        turn_id, turn, std::move(request), cancellation);
+    if (!intercepted_request) {
+      emit({AgentEventType::error, intercepted_request.error().message,
+            std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(intercepted_request.error());
+    }
+    request = std::move(intercepted_request.value());
 
     const auto model_started_at = std::chrono::steady_clock::now();
-    auto response = model_.complete(
+    auto completion = model_.complete(
         request,
         [&](const ModelDelta &delta) {
           const auto event_type = delta.kind == ModelDeltaKind::reasoning
@@ -319,19 +450,19 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       model_started_at)
             .count();
-    if (!response) {
-      emit({AgentEventType::error, response.error().message, std::nullopt,
+    if (!completion) {
+      emit({AgentEventType::error, completion.error().message, std::nullopt,
             std::nullopt},
            on_event);
-      return Result<std::string>::failure(response.error());
+      return Result<std::string>::failure(completion.error());
     }
-    if (response.value().usage.output_tokens > 0 && model_elapsed > 0.0) {
-      response.value().usage.output_tokens_per_second =
-          static_cast<double>(response.value().usage.output_tokens) /
-          model_elapsed;
+    auto response = std::move(completion.value());
+    if (response.usage.output_tokens > 0 && model_elapsed > 0.0) {
+      response.usage.output_tokens_per_second =
+          static_cast<double>(response.usage.output_tokens) / model_elapsed;
     }
-    response.value().usage.context_breakdown =
-        context_breakdown_for(request, response.value().usage.input_tokens);
+    response.usage.context_breakdown =
+        context_breakdown_for(request, response.usage.input_tokens);
 
     if (cancellation.is_cancelled()) {
       const auto error = cancelled_error();
@@ -339,17 +470,25 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
            on_event);
       return Result<std::string>::failure(error);
     }
-    if (const auto error = terminal_response_error(response.value());
+    auto intercepted_response = hooks.after_model_response(
+        turn_id, turn, std::move(response), cancellation);
+    if (!intercepted_response) {
+      emit({AgentEventType::error, intercepted_response.error().message,
+            std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(intercepted_response.error());
+    }
+    response = std::move(intercepted_response.value());
+    if (const auto error = terminal_response_error(response);
         error.has_value()) {
-      emit({AgentEventType::assistant_message, response.value().content,
-            std::nullopt, std::nullopt, response.value().usage},
+      emit({AgentEventType::assistant_message, response.content, std::nullopt,
+            std::nullopt, response.usage},
            on_event);
       emit({AgentEventType::error, error->message, std::nullopt, std::nullopt},
            on_event);
       return Result<std::string>::failure(*error);
     }
-    const auto valid_tool_calls =
-        validate_tool_calls(response.value().tool_calls);
+    const auto valid_tool_calls = validate_tool_calls(response.tool_calls);
     if (!valid_tool_calls) {
       emit({AgentEventType::error, valid_tool_calls.error().message,
             std::nullopt, std::nullopt},
@@ -357,10 +496,62 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
       return Result<std::string>::failure(valid_tool_calls.error());
     }
 
+    for (std::size_t call_index = 0; call_index < response.tool_calls.size();
+         ++call_index) {
+      const auto original_call = response.tool_calls[call_index];
+      auto intercepted_call = hooks.before_tool_call(
+          turn_id, turn, call_index, std::move(response.tool_calls[call_index]),
+          cancellation);
+      if (!intercepted_call) {
+        emit({AgentEventType::error, intercepted_call.error().message,
+              std::nullopt, std::nullopt},
+             on_event);
+        return Result<std::string>::failure(intercepted_call.error());
+      }
+      if (!response.model_state.empty() &&
+          (intercepted_call.value().name != original_call.name ||
+           intercepted_call.value().arguments_json !=
+               original_call.arguments_json)) {
+        const Error error{
+            ErrorCode::hook_error,
+            "tool call linked to provider continuation cannot be modified"};
+        emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
+             on_event);
+        return Result<std::string>::failure(error);
+      }
+      response.tool_calls[call_index] = std::move(intercepted_call.value());
+    }
+    const auto intercepted_calls_valid =
+        validate_tool_calls(response.tool_calls);
+    if (!intercepted_calls_valid) {
+      emit({AgentEventType::error, intercepted_calls_valid.error().message,
+            std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(intercepted_calls_valid.error());
+    }
+
     Message assistant_message{
-        next_id("assistant"),        Role::assistant, response.value().content,
-        response.value().tool_calls, std::nullopt,
+        next_id("assistant"), Role::assistant, response.content,
+        response.tool_calls,  std::nullopt,
     };
+    assistant_message.model_state = response.model_state;
+    auto intercepted_assistant = hooks.session_write_message(
+        "append_message", turn_id, std::move(assistant_message), cancellation);
+    if (!intercepted_assistant) {
+      emit({AgentEventType::error, intercepted_assistant.error().message,
+            std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(intercepted_assistant.error());
+    }
+    assistant_message = std::move(intercepted_assistant.value());
+    const auto persisted_calls_valid =
+        validate_tool_calls(assistant_message.tool_calls);
+    if (!persisted_calls_valid) {
+      emit({AgentEventType::error, persisted_calls_valid.error().message,
+            std::nullopt, std::nullopt},
+           on_event);
+      return Result<std::string>::failure(persisted_calls_valid.error());
+    }
     const auto append_assistant = session_.append(assistant_message);
     if (!append_assistant) {
       emit({AgentEventType::error, append_assistant.error().message,
@@ -369,14 +560,16 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
       return Result<std::string>::failure(append_assistant.error());
     }
     emit({AgentEventType::assistant_message, assistant_message.content,
-          std::nullopt, std::nullopt, response.value().usage},
+          std::nullopt, std::nullopt, response.usage},
          on_event);
 
-    if (response.value().tool_calls.empty()) {
-      return Result<std::string>::success(response.value().content);
+    if (assistant_message.tool_calls.empty()) {
+      return Result<std::string>::success(assistant_message.content);
     }
 
-    for (const auto &call : response.value().tool_calls) {
+    for (std::size_t call_index = 0;
+         call_index < assistant_message.tool_calls.size(); ++call_index) {
+      const auto &call = assistant_message.tool_calls[call_index];
       if (cancellation.is_cancelled()) {
         const auto error = cancelled_error();
         emit({AgentEventType::error, error.message, std::nullopt, std::nullopt},
@@ -409,11 +602,33 @@ AgentLoop::run_active_turn(CancellationToken cancellation,
         };
       }
 
+      auto intercepted_result =
+          hooks.after_tool_result(turn_id, turn, call_index, call.name,
+                                  std::move(tool_result), cancellation);
+      if (!intercepted_result) {
+        emit({AgentEventType::error, intercepted_result.error().message,
+              std::nullopt, std::nullopt},
+             on_event);
+        return Result<std::string>::failure(intercepted_result.error());
+      }
+      tool_result = std::move(intercepted_result.value());
+
       Message tool_message{
           next_id("tool"),          Role::tool,
           tool_result.content,      {},
           tool_result.tool_call_id, tool_result.is_error,
       };
+      auto intercepted_tool_message = hooks.session_write_message(
+          "append_message", turn_id, std::move(tool_message), cancellation);
+      if (!intercepted_tool_message) {
+        emit({AgentEventType::error, intercepted_tool_message.error().message,
+              std::nullopt, std::nullopt},
+             on_event);
+        return Result<std::string>::failure(intercepted_tool_message.error());
+      }
+      tool_message = std::move(intercepted_tool_message.value());
+      tool_result.content = tool_message.content;
+      tool_result.is_error = tool_message.is_error;
       tool_message.content = bound_tool_output(std::move(tool_message.content));
       tool_result.content = tool_message.content;
       const auto append_tool = session_.append(tool_message);

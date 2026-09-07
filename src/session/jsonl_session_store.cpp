@@ -191,6 +191,8 @@ Json message_json(const Message &message, std::string_view turn_id) {
   record["role"] = role_name(message.role);
   record["content"] = message.content;
   record["is_error"] = message.is_error;
+  if (!message.model_state.empty())
+    record["model_state"] = message.model_state;
   record["tool_calls"] = Json::array();
   for (const auto &call : message.tool_calls) {
     record["tool_calls"].push_back({
@@ -224,6 +226,12 @@ core::Result<Message> parse_message(const Json &record) {
         {ErrorCode::session_error, "message is_error must be a boolean"});
   }
   message.is_error = is_error->get<bool>();
+  if (const auto *state = field(record, "model_state"); state != nullptr) {
+    if (!state->is_string() || message.role != Role::assistant)
+      return core::Result<Message>::failure(
+          {ErrorCode::session_error, "invalid persisted model_state"});
+    message.model_state = state->get<std::string>();
+  }
   const auto *calls = field(record, "tool_calls");
   if (calls == nullptr || !calls->is_array()) {
     return core::Result<Message>::failure(
@@ -1162,6 +1170,30 @@ JsonlSessionStore::switch_to(std::filesystem::path path) {
   lock_fd_ = std::move(candidate.lock_fd_);
   cache_ = std::move(candidate.cache_);
   return recovered;
+}
+
+core::Result<std::string> JsonlSessionStore::conversation_id() const {
+  const auto inspection = inspect();
+  if (!inspection)
+    return core::Result<std::string>::failure(inspection.error());
+  const auto &metadata = inspection.value().metadata;
+  // Stable, non-secret fingerprint; avoids sending workspace paths in headers.
+  const auto identity = Json::array({metadata.workspace, metadata.id,
+                                     metadata.created_at_unix_ms})
+                            .dump();
+  std::string id = "zeda-";
+  constexpr char digits[] = "0123456789abcdef";
+  for (const std::uint64_t seed :
+       {14695981039346656037ULL, 7809847782465536322ULL}) {
+    std::uint64_t hash = seed;
+    for (const char byte : identity) {
+      hash ^= static_cast<unsigned char>(byte);
+      hash *= 1099511628211ULL;
+    }
+    for (unsigned shift = 0; shift < 64; shift += 4)
+      id.push_back(digits[(hash >> shift) & 15U]);
+  }
+  return core::Result<std::string>::success(std::move(id));
 }
 
 } // namespace zed::session

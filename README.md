@@ -51,7 +51,11 @@ sudo cmake --install build --prefix /usr/local
 ## 运行
 
 当前 CLI 使用 OpenCode Go，并按模型元数据自动选择 Responses、Chat Completions
-或 Anthropic Messages 协议：
+或 Anthropic Messages 协议。请求携带客户端和稳定会话标识；三种协议保留多轮 reasoning
+状态，区分缓存读取与写入。支持范围、缓存策略及验证方法见
+[OpenCode Go provider 契约](docs/opencode_go.md)。
+
+运行：
 
 ```bash
 opencode auth login
@@ -310,7 +314,7 @@ zeda 只集成本机 `clangd`，不下载或启动其他语言服务器。C/C++ 
 
 ## 外部插件与 DeepWiki
 
-zeda 启动时从安装前缀的 `lib/zeda/plugins/` 发现版本化 C ABI 插件。开发时也会
+zeda 启动时从安装前缀的 `lib/zeda/plugins/` 发现版本化 C ABI 外部插件。开发时也会
 检查可执行文件旁的 `plugins/`，并可用冒号分隔的 `ZED_PLUGIN_PATH` 追加目录。
 搜索根保留声明顺序；同一插件 ID 由更早的根获胜，后续副本显示为 `shadowed`。
 `/plugins` 会显示 `active`、`pending`、`shadowed` 和 `failed` 等状态；ABI 不匹配、
@@ -318,18 +322,24 @@ manifest 错误、缺失依赖以及命令或工具冲突都不会静默丢失�
 `"requires":["plugin-id"]` 声明必需插件，宿主先解析完整依赖图，再按拓扑顺序加载；
 缺失、失败或成环的依赖保持可诊断的 `pending`。
 
-插件注册的命令和工具归属于插件生命周期。退出时宿主先停止接收新调用并发出取消，
-反向注销全部贡献，等待在途调用退出，再执行 `shutdown`、`destroy` 和 `dlclose`。
-插件输出受 Agent 的命令输出字节预算限制，截断时带有明确标记。插件仍是受信任的本机
-动态库，不提供进程隔离或运行时热重载；同进程依赖声明不是权限或 sandbox 边界。完整
-manifest、状态机和卸载契约见 [插件运行时设计](docs/plugin_system.md)。
+插件注册的命令、工具和 Hook 归属于插件生命周期。退出时宿主先停止接收新调用并发出取消，
+反向注销全部贡献，等待在途调用退出，再执行 `shutdown` 和 `destroy`；动态插件随后
+`dlclose`。插件输出受 Agent 的命令输出字节预算限制，截断时带有明确标记。插件仍是
+受信任的本机代码，不提供进程隔离或运行时热重载；同进程依赖声明不是权限或 sandbox
+边界。完整 manifest、状态机和卸载契约见 [插件运行时设计](docs/plugin_system.md)。
+
+ABI v2 插件还可以注册八类类型化 Agent Hook：用户消息提交、模型请求前/响应后、工具
+调用前/结果后、Agent 对话事务写入以及 turn 开始/结束。Hook 按优先级稳定串行执行，
+支持继续、替换完整 JSON 负载或拒绝操作；替换内容会重新验证，失败不会静默跳过。
+ABI v1 插件继续使用 `zeda_plugin_entry_v1`，需要 Hook 的插件声明 `abi_version: 2` 并导出
+`zeda_plugin_entry_v2`。负载字段、可修改范围和失败语义见插件运行时设计文档。
 
 命令的 `options_json` 项可以用 `"view":"document"` 声明交互式文档选项；该选项的
 执行结果必须是 `schema_version: 1` 的 JSON，包含标题和非空页面数组。宿主会在工作
 线程中解析并限制快照为 16 MiB、单页为 2 MiB、最多 128 页，普通非 TTY 输出不会
 泄露该内部协议。
 
-构建默认包含首个外部插件 DeepWiki。它只分析本地 C/C++ 仓库，使用 SQLite FTS5、
+构建默认静态链接内置 DeepWiki，避免启动时加载新动态库。它只分析本地 C/C++ 仓库，使用 SQLite FTS5、
 本机 clangd 和当前 OpenCode 模型生成中文 Wiki，不使用 embedding 服务。索引同时记录
 clangd 符号、`#include` 关系和 CMake target/link 关系。首次使用：
 
@@ -367,9 +377,11 @@ Markdown、Mermaid 图、源码引用预览和流式问答；进程退出时服�
 cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```
 
-可以用 `-DZEDA_BUILD_DEEPWIKI_PLUGIN=OFF` 关闭插件构建。DeepWiki 插件额外链接系统
-SQLite3，并固定使用 cpp-httplib 0.51.0；网页内置固定版本的 Marked、DOMPurify 和
-Mermaid，不在运行时从 CDN 加载。
+可以用 `-DZEDA_BUILD_DEEPWIKI_PLUGIN=OFF` 关闭插件构建。需要把 DeepWiki 作为可独立
+部署的动态插件时，配置 `-DZEDA_DEEPWIKI_LINKAGE=SHARED`；默认值为 `STATIC`。两种模式
+都复用相同的 C ABI 注册、回滚和生命周期逻辑，静态内置版本优先于搜索路径中同 ID 的
+旧动态副本。DeepWiki 额外链接系统 SQLite3，并固定使用 cpp-httplib 0.51.0；网页内置
+固定版本的 Marked、DOMPurify 和 Mermaid，不在运行时从 CDN 加载。
 
 ## 模块
 

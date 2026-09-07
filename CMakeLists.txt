@@ -110,7 +110,9 @@ add_library(zed_core
     src/app/config.cpp
     src/app/configure_web.cpp
     src/core/agent_loop.cpp
+    src/core/agent_hooks.cpp
     src/core/context.cpp
+    src/core/hook_registry.cpp
     src/core/model_context_controller.cpp
     src/core/session_store.cpp
     src/core/tool_registry.cpp
@@ -143,6 +145,7 @@ target_include_directories(zed_core
 )
 
 target_compile_definitions(zed_core PRIVATE
+    ZEDA_VERSION="${PROJECT_VERSION}"
     ZEDA_INSTALL_LIBDIR="${CMAKE_INSTALL_LIBDIR}"
 )
 
@@ -314,6 +317,10 @@ if (BUILD_TESTING)
     target_link_libraries(zed_core_smoke PRIVATE zed_core)
     add_test(NAME zed_core_smoke COMMAND zed_core_smoke)
 
+    add_executable(zed_hook_smoke tests/hook_smoke.cpp)
+    target_link_libraries(zed_hook_smoke PRIVATE zed_core)
+    add_test(NAME zed_hook_smoke COMMAND zed_hook_smoke)
+
     add_executable(zed_modules_smoke tests/modules_smoke.cpp)
     target_link_libraries(zed_modules_smoke PRIVATE zed_ui)
     add_test(NAME zed_modules_smoke COMMAND zed_modules_smoke)
@@ -341,6 +348,14 @@ if (BUILD_TESTING)
     target_link_libraries(zed_session_smoke PRIVATE zed_core)
     add_test(NAME zed_session_smoke COMMAND zed_session_smoke)
 
+    find_program(ZEDA_CURL_EXECUTABLE NAMES curl REQUIRED)
+    add_executable(zed_opencode_go_contract tests/opencode_go_contract.cpp)
+    target_link_libraries(zed_opencode_go_contract PRIVATE zed_core httplib::httplib)
+    foreach(case headers responses chat messages errors lifecycle session loop framing)
+        add_test(NAME zed_opencode_go_${case}
+            COMMAND zed_opencode_go_contract ${case})
+        set_tests_properties(zed_opencode_go_${case} PROPERTIES TIMEOUT 20)
+    endforeach()
     add_executable(zed_opencode_go_smoke tests/opencode_go_smoke.cpp)
     target_link_libraries(zed_opencode_go_smoke PRIVATE zed_core)
     add_test(NAME zed_opencode_go_smoke COMMAND zed_opencode_go_smoke)
@@ -366,11 +381,14 @@ if (BUILD_TESTING)
         tests/runtime_plugin_fixture.cpp)
     add_library(zed_runtime_consumer_plugin SHARED
         tests/runtime_plugin_fixture.cpp)
+    add_library(zed_runtime_hook_plugin SHARED
+        tests/runtime_hook_plugin.cpp)
     target_compile_definitions(zed_runtime_consumer_plugin PRIVATE
         ZEDA_RUNTIME_FIXTURE_CONSUMER=1)
     foreach(runtime_plugin_target IN ITEMS
             zed_runtime_provider_plugin
-            zed_runtime_consumer_plugin)
+            zed_runtime_consumer_plugin
+            zed_runtime_hook_plugin)
         target_include_directories(${runtime_plugin_target} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include)
         target_link_libraries(${runtime_plugin_target} PRIVATE
@@ -388,10 +406,12 @@ if (BUILD_TESTING)
     target_compile_definitions(zed_plugin_runtime_smoke PRIVATE
         ZED_TEST_RUNTIME_PROVIDER_PATH="$<TARGET_FILE:zed_runtime_provider_plugin>"
         ZED_TEST_RUNTIME_CONSUMER_PATH="$<TARGET_FILE:zed_runtime_consumer_plugin>"
+        ZED_TEST_RUNTIME_HOOK_PATH="$<TARGET_FILE:zed_runtime_hook_plugin>"
     )
     add_dependencies(zed_plugin_runtime_smoke
         zed_runtime_provider_plugin
-        zed_runtime_consumer_plugin)
+        zed_runtime_consumer_plugin
+        zed_runtime_hook_plugin)
     add_test(NAME zed_plugin_runtime_smoke COMMAND zed_plugin_runtime_smoke)
     set_tests_properties(zed_plugin_runtime_smoke PROPERTIES TIMEOUT 30)
 
@@ -456,7 +476,9 @@ if (BUILD_TESTING)
     endif()
 
     set(ZED_ASSERTING_TEST_TARGETS
+        zed_opencode_go_contract
         zed_core_smoke
+        zed_hook_smoke
         zed_modules_smoke
         zed_config_smoke
         zed_configure_web_smoke

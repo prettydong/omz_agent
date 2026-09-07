@@ -127,6 +127,9 @@ void parse_usage(const Json &value, core::ModelUsage &usage) {
       iterator != value.end() && iterator->is_number_unsigned()) {
     usage.cached_input_tokens = iterator->get<core::TokenCount>();
   }
+  if (const auto iterator = value.find("cache_write_input_tokens");
+      iterator != value.end() && iterator->is_number_unsigned())
+    usage.cache_write_input_tokens = iterator->get<core::TokenCount>();
   if (const auto iterator = value.find("output_tokens");
       iterator != value.end() && iterator->is_number_unsigned()) {
     usage.output_tokens = iterator->get<core::TokenCount>();
@@ -235,9 +238,11 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
           {ErrorCode::invalid_argument,
            "completed event is missing an object usage field"});
     }
-    const auto usage_fields = require_exact_fields(
-        *usage, {"input_tokens", "cached_input_tokens", "output_tokens"},
-        "worker usage");
+    const auto usage_fields =
+        require_exact_fields(*usage,
+                             {"input_tokens", "cached_input_tokens",
+                              "output_tokens", "cache_write_input_tokens"},
+                             "worker usage");
     if (!usage_fields)
       return core::Result<WorkerEvent>::failure(usage_fields.error());
     for (const auto *name :
@@ -250,6 +255,11 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
                  std::string(name)});
       }
     }
+    if (usage->contains("cache_write_input_tokens") &&
+        !usage->at("cache_write_input_tokens").is_number_unsigned())
+      return core::Result<WorkerEvent>::failure(
+          {ErrorCode::invalid_argument,
+           "worker cache_write_input_tokens must be an unsigned integer"});
     parse_usage(*usage, event.usage);
     break;
   }
@@ -268,9 +278,11 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
           {ErrorCode::invalid_argument,
            "failed event is missing an object usage field"});
     }
-    const auto usage_fields = require_exact_fields(
-        *usage, {"input_tokens", "cached_input_tokens", "output_tokens"},
-        "worker usage");
+    const auto usage_fields =
+        require_exact_fields(*usage,
+                             {"input_tokens", "cached_input_tokens",
+                              "output_tokens", "cache_write_input_tokens"},
+                             "worker usage");
     if (!usage_fields)
       return core::Result<WorkerEvent>::failure(usage_fields.error());
     for (const auto *name :
@@ -283,6 +295,11 @@ core::Result<WorkerEvent> parse_worker_event(std::string_view json_line) {
                  std::string(name)});
       }
     }
+    if (usage->contains("cache_write_input_tokens") &&
+        !usage->at("cache_write_input_tokens").is_number_unsigned())
+      return core::Result<WorkerEvent>::failure(
+          {ErrorCode::invalid_argument,
+           "worker cache_write_input_tokens must be an unsigned integer"});
     parse_usage(*usage, event.usage);
     break;
   }
@@ -312,6 +329,7 @@ std::string serialize_worker_event(const WorkerEvent &event) {
     value["usage"] = {
         {"input_tokens", event.usage.input_tokens},
         {"cached_input_tokens", event.usage.cached_input_tokens},
+        {"cache_write_input_tokens", event.usage.cache_write_input_tokens},
         {"output_tokens", event.usage.output_tokens},
     };
     break;
@@ -320,6 +338,7 @@ std::string serialize_worker_event(const WorkerEvent &event) {
     value["usage"] = {
         {"input_tokens", event.usage.input_tokens},
         {"cached_input_tokens", event.usage.cached_input_tokens},
+        {"cache_write_input_tokens", event.usage.cache_write_input_tokens},
         {"output_tokens", event.usage.output_tokens},
     };
     break;

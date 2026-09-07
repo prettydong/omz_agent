@@ -96,6 +96,7 @@ struct ModelRequest {
   std::optional<std::size_t> max_output_tokens;
   double temperature{0.0};
   ReasoningEffort reasoning_effort{ReasoningEffort::low};
+  std::string session_id{};
 };
 
 struct ModelCapabilities {
@@ -126,6 +127,7 @@ struct ModelUsage {
   TokenCount output_tokens{};
   double output_tokens_per_second{};
   std::optional<ContextTokenBreakdown> context_breakdown;
+  TokenCount cache_write_input_tokens{};
 };
 
 enum class ModelDeltaKind {
@@ -143,6 +145,7 @@ struct AssistantResponse {
   std::vector<ToolCall> tool_calls;
   FinishReason finish_reason{FinishReason::unknown};
   ModelUsage usage;
+  std::string model_state{};
 };
 
 using StreamCallback = std::function<void(const ModelDelta &)>;

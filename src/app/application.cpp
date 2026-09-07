@@ -291,7 +291,9 @@ int run_application(std::string_view executable, std::string_view version) {
   loop_config.max_turns = runtime_config.max_turns;
   loop_config.system_prompt = runtime_config.system_prompt;
 
-  zed::core::AgentLoop loop(model, tools, session, context, loop_config);
+  zed::core::HookRegistry hooks;
+  zed::core::AgentLoop loop(model, tools, session, context, loop_config,
+                            &hooks);
   zed::extensions::ExtensionRegistry extensions;
   auto plugin_search_paths = zed::plugins::default_plugin_search_paths();
   zed::plugins::PluginManagerConfig plugin_config{
@@ -300,6 +302,7 @@ int run_application(std::string_view executable, std::string_view version) {
       active_model,
       active_reasoning_effort,
       runtime_config.tool_limits.max_command_output_bytes,
+      {},
       {}};
 #if defined(ZEDA_STATIC_DEEPWIKI)
   plugin_config.builtin_plugins.push_back(
@@ -307,7 +310,7 @@ int run_application(std::string_view executable, std::string_view version) {
        bundled_deepwiki_resources(plugin_search_paths)});
 #endif
   zed::plugins::PluginManager plugins(std::move(plugin_config), extensions,
-                                      tools, model, clangd);
+                                      tools, model, clangd, &hooks);
   BuiltinCommandRegistrar command_registrar(
       extensions, runtime_config, model_catalog, built_in_agents,
       subagent_tool_handle, tools, configure_web, skills, active_skill,

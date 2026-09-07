@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "zed/core/hook_registry.hpp"
 #include "zed/core/model.hpp"
 #include "zed/core/result.hpp"
 #include "zed/core/tool_registry.hpp"
@@ -45,6 +46,11 @@ struct BuiltinPlugin {
   std::filesystem::path resource_path;
 };
 
+struct BuiltinPluginV2 {
+  const ZedaPluginDescriptorV2 *descriptor{};
+  std::filesystem::path resource_path;
+};
+
 struct PluginManagerConfig {
   std::filesystem::path workspace_root;
   std::vector<std::filesystem::path> search_paths;
@@ -52,6 +58,7 @@ struct PluginManagerConfig {
   core::ReasoningEffort reasoning_effort{core::ReasoningEffort::low};
   std::size_t max_output_bytes{256 * 1024};
   std::vector<BuiltinPlugin> builtin_plugins;
+  std::vector<BuiltinPluginV2> builtin_plugins_v2;
 };
 
 [[nodiscard]] std::vector<std::filesystem::path> default_plugin_search_paths();
@@ -61,7 +68,7 @@ public:
   PluginManager(PluginManagerConfig config,
                 extensions::ExtensionRegistry &extensions,
                 core::ToolRegistry &tools, core::Model &model,
-                lsp::ClangdClient &clangd);
+                lsp::ClangdClient &clangd, core::HookRegistry *hooks = nullptr);
   ~PluginManager();
 
   PluginManager(const PluginManager &) = delete;

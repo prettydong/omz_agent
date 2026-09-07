@@ -261,6 +261,8 @@ int run_explorer_worker(std::istream &input, std::ostream &output,
               event.model_usage.has_value()) {
             usage.input_tokens += event.model_usage->input_tokens;
             usage.cached_input_tokens += event.model_usage->cached_input_tokens;
+            usage.cache_write_input_tokens +=
+                event.model_usage->cache_write_input_tokens;
             usage.output_tokens += event.model_usage->output_tokens;
           } else if (event.type == core::AgentEventType::tool_start) {
             write_event(output,

@@ -231,6 +231,7 @@ remaining_time(std::chrono::steady_clock::time_point deadline) {
 void add_usage(core::ModelUsage &total, const core::ModelUsage &usage) {
   total.input_tokens += usage.input_tokens;
   total.cached_input_tokens += usage.cached_input_tokens;
+  total.cache_write_input_tokens += usage.cache_write_input_tokens;
   total.output_tokens += usage.output_tokens;
 }
 

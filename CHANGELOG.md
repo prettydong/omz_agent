@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- 新增带 `struct_size` 的插件 ABI v2，以及用户消息、模型请求/响应、工具调用/结果、Agent Session 写入和 turn 生命周期八类可拦截 Hook；支持稳定优先级、链式替换、拒绝、取消和卸载撤销，同时保持 ABI v1 插件兼容。
+
+### Changed
+
+- OpenCode Go 请求携带版本化 User-Agent 和稳定会话标识，Responses 增加会话缓存 key，Messages 增加显式缓存断点；三种协议保留多轮 reasoning/工具回传状态，Session v2 增加可选 model_state 字段。
+- 修正 Messages 缓存读写和总输入统计；完善原生工具流关联、SSE 事件组装、HTTP 错误诊断和取消清理，并增加离线协议、官方 SDK 对照及显式真实 API 探针。
+
+- DeepWiki 默认静态链接进 `zeda`，避免启动时 `dlopen` 的首次安全检查停顿；可用 `ZEDA_DEEPWIKI_LINKAGE=SHARED` 保留动态插件部署方式。
+
 ## [0.2] - 2026-08-30
 
 ### Added

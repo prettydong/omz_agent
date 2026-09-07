@@ -46,6 +46,7 @@ public:
 
   core::Result<void> append(const core::Message &message) override;
   core::Result<std::vector<core::Message>> load() const override;
+  core::Result<std::string> conversation_id() const override;
   core::Result<void> begin_turn(std::string_view turn_id,
                                 const core::Message &user_message) override;
   core::Result<void> finish_turn(std::string_view turn_id,

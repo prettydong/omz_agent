@@ -77,6 +77,7 @@ ModelBackedContextController::decide(const ContextRequest &request,
       std::nullopt,
   };
   ModelRequest model_request;
+  model_request.session_id = session_id_;
   model_request.model = model_ref_;
   model_request.messages = {Message{
                                 "context-controller-system",

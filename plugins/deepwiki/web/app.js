@@ -17,6 +17,9 @@
   const viewTitle = document.querySelector("#view-title");
   const viewTag = document.querySelector("#view-tag");
 
+  document.querySelector("#filter-shortcut").textContent =
+    /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘ K" : "Ctrl K";
+
   let currentPageMarkdown = "";
   let terms = [];
   const termByProgram = new Map();
@@ -24,18 +27,233 @@
 
   const emptyIcon = '<svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>';
 
-  function toast(message) {
+  function toast(message, kind = "error") {
+    toastEl.dataset.kind = kind;
     toastEl.textContent = message;
     toastEl.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { toastEl.hidden = true; }, 4200);
   }
 
+  const main = document.querySelector("main");
+  const readingMenu = document.querySelector("#reading-menu");
+  let loadedPage = null;
+  let pageRequest = 0;
+  let sections = [];
+  let scrollFrame = 0;
+  let menuPayload = null;
+  let menuFocus = null;
+  let lastCopied = "";
+
+  function collapsePages() {
+    for (const button of toc.querySelectorAll(".page-button")) {
+      button.classList.remove("active");
+      button.removeAttribute("aria-current");
+      button.setAttribute("aria-expanded", "false");
+      button.nextElementSibling.hidden = true;
+    }
+  }
+
+  function updateReadingSection() {
+    if (!sections.length || !loadedPage) return;
+    const toolbar = document.querySelector(".editor-head");
+    const boundary = Math.max(0, toolbar.getBoundingClientRect().bottom) + 20;
+    let active = sections[0];
+    for (const section of sections) {
+      if (section.heading.getBoundingClientRect().top <= boundary) active = section;
+    }
+    if (main.scrollHeight > main.clientHeight &&
+        main.scrollTop + main.clientHeight >= main.scrollHeight - 2) active = sections.at(-1);
+    for (const section of sections) {
+      if (section === active) section.link.setAttribute("aria-current", "location");
+      else section.link.removeAttribute("aria-current");
+    }
+    viewTitle.textContent = `${loadedPage.title} / ${active.link.textContent}`;
+    viewTitle.title = viewTitle.textContent;
+  }
+
+  function scheduleReadingUpdate() {
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      updateReadingSection();
+    });
+  }
+  main.addEventListener("scroll", scheduleReadingUpdate, { passive: true });
+  window.addEventListener("scroll", scheduleReadingUpdate, { passive: true });
+  window.addEventListener("resize", scheduleReadingUpdate);
+
+  function buildSections(button) {
+    const list = button.nextElementSibling;
+    list.replaceChildren();
+    sections = [...page.querySelectorAll("h1, h2, h3")].map((heading, index) => {
+      heading.id = `wiki-section-${index}`;
+      const link = document.createElement("a");
+      link.href = `#${heading.id}`;
+      link.className = `level-${heading.tagName.slice(1)}`;
+      link.textContent = heading.tagName === "H1" ? "概览" : heading.textContent;
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        heading.scrollIntoView({ block: "start", behavior: "smooth" });
+      });
+      list.append(link);
+      return { heading, link };
+    });
+    if (!sections.length) {
+      const empty = document.createElement("div");
+      empty.className = "toc-section-empty";
+      empty.textContent = "此页没有章节标题";
+      list.append(empty);
+    }
+    list.hidden = false;
+    button.setAttribute("aria-expanded", "true");
+    scheduleReadingUpdate();
+  }
+
+  function selectionPayload() {
+    const selected = window.getSelection();
+    if (!selected || selected.isCollapsed || !selected.toString().trim()) return null;
+    const element = (node) => node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    const start = element(selected.anchorNode)?.closest("#page, #answer, #source-content");
+    const end = element(selected.focusNode)?.closest("#page, #answer, #source-content");
+    if (!start || start !== end) return null;
+    return { text: selected.toString().trim(), source: contentSource(start), selected: true };
+  }
+
+  function contentSource(element) {
+    if (element.closest("#source-content")) return document.querySelector("#source-title").textContent;
+    if (element.closest("#answer")) return "Wiki 问答";
+    return viewTitle.textContent;
+  }
+
+  async function copyText(value, automatic = false) {
+    try {
+      await navigator.clipboard.writeText(value);
+      lastCopied = value;
+      toast(automatic ? "已复制选中内容" : "已复制", "success");
+    } catch (error) {
+      toast("无法自动写入剪贴板，请使用 Ctrl/Cmd+C 复制。");
+    }
+  }
+
+  function autoCopySelection() {
+    if (readingMenu.matches(":popover-open")) return;
+    const payload = selectionPayload();
+    if (!payload) { lastCopied = ""; return; }
+    if (payload.text !== lastCopied) void copyText(payload.text, true);
+  }
+  document.addEventListener("pointerup", (event) => {
+    if (event.button === 0 && event.target.closest("#page, #answer, #source-content")) autoCopySelection();
+  });
+  document.addEventListener("keyup", (event) => {
+    if (event.target.closest("input, textarea, [contenteditable='true']")) return;
+    if (event.key === "Shift" || (event.shiftKey && event.key.startsWith("Arrow")) ||
+        ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a")) autoCopySelection();
+  });
+
+  function closeReadingMenu(restoreFocus = false) {
+    if (!readingMenu.matches(":popover-open")) return;
+    readingMenu.hidePopover();
+    if (restoreFocus && menuFocus?.isConnected) menuFocus.focus({ preventScroll: true });
+  }
+
+  document.addEventListener("contextmenu", (event) => {
+    if (event.target.closest("input, textarea, [contenteditable='true']")) return;
+    const surface = event.target.closest("#page, #answer, #source-content");
+    if (!surface) return;
+    event.preventDefault();
+    const block = event.target.closest("p, pre, li, h1, h2, h3, td, th, .line");
+    menuPayload = selectionPayload() || {
+      text: (block || surface).textContent.trim(), source: contentSource(surface), selected: false,
+    };
+    menuFocus = document.activeElement;
+    document.querySelector("#menu-caption").textContent = menuPayload.selected ? "选中内容" : "当前段落";
+    readingMenu.querySelector('[data-action="copy"]').disabled = !menuPayload.text;
+    readingMenu.querySelector('[data-action="chat"]').disabled = !menuPayload.text || question.disabled;
+    closeReadingMenu();
+    (dialog.open ? dialog : document.body).append(readingMenu);
+    readingMenu.showPopover();
+    const rect = readingMenu.getBoundingClientRect();
+    readingMenu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - rect.width - 8))}px`;
+    readingMenu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - rect.height - 8))}px`;
+    readingMenu.querySelector("button:not(:disabled)")?.focus({ preventScroll: true });
+  });
+
+  readingMenu.addEventListener("click", (event) => {
+    const action = event.target.closest("button")?.dataset.action;
+    if (!action || !menuPayload) return;
+    const payload = menuPayload;
+    closeReadingMenu();
+    if (action === "copy") {
+      void copyText(payload.text);
+    } else if (action === "chat" && !question.disabled) {
+      const quoted = `来自 ${payload.source}\n${payload.text.split("\n").map(line => `> ${line}`).join("\n")}`;
+      question.value += `${question.value.trim() ? "\n\n" : ""}${quoted}\n\n`;
+      resizeQuestion();
+      if (dialog.open) dialog.close();
+      question.focus();
+      question.setSelectionRange(question.value.length, question.value.length);
+      question.scrollTop = question.scrollHeight;
+      toast("已添加到提问框，补充问题后发送", "success");
+    }
+  });
+  readingMenu.addEventListener("keydown", (event) => {
+    const items = [...readingMenu.querySelectorAll("button:not(:disabled)")];
+    const index = items.indexOf(document.activeElement);
+    if (event.key === "Escape" || event.key === "Tab") {
+      if (event.key === "Escape") event.preventDefault();
+      closeReadingMenu(true);
+    } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 :
+        (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+      items[next]?.focus();
+    }
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest("#reading-menu")) closeReadingMenu();
+  });
+  document.addEventListener("wheel", () => closeReadingMenu(), { passive: true });
+  document.addEventListener("touchmove", () => closeReadingMenu(), { passive: true });
+  window.addEventListener("resize", () => closeReadingMenu());
+  dialog.addEventListener("close", () => closeReadingMenu());
+
+  function resizeQuestion() {
+    question.style.height = "58px";
+    question.style.height = `${Math.min(180, question.scrollHeight + 2)}px`;
+  }
+  question.addEventListener("input", resizeQuestion);
+  new ResizeObserver(() => {
+    main.style.paddingBottom = `${document.querySelector(".ask").getBoundingClientRect().height + 24}px`;
+  }).observe(document.querySelector(".ask"));
+
+  question.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      if (!askButton.disabled) askForm.requestSubmit();
+    }
+  });
+
   function configureMermaid() {
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: "strict",
-      theme: "default",
+      theme: "base",
+      themeVariables: {
+        primaryColor: "#f8f8f4",
+        primaryTextColor: "#1b1b1b",
+        primaryBorderColor: "#55554f",
+        secondaryColor: "#e6e6df",
+        secondaryTextColor: "#1b1b1b",
+        secondaryBorderColor: "#55554f",
+        tertiaryColor: "#f1f1ed",
+        tertiaryTextColor: "#1b1b1b",
+        tertiaryBorderColor: "#96968d",
+        lineColor: "#44443e",
+        textColor: "#1b1b1b",
+        edgeLabelBackground: "#f1f1ed",
+      },
+      flowchart: { curve: "step" },
       fontFamily: "Inter, PingFang SC, system-ui, sans-serif",
     });
   }
@@ -233,24 +451,43 @@
   }
 
   async function loadPage(id, button) {
+    if (loadedPage?.id === id && !termsToggle.classList.contains("active")) {
+      const expanded = button.getAttribute("aria-expanded") !== "true";
+      button.setAttribute("aria-expanded", String(expanded));
+      button.nextElementSibling.hidden = !expanded;
+      return;
+    }
+    const request = ++pageRequest;
+    loadedPage = null;
+    sections = [];
+    collapsePages();
+    button.classList.add("active");
+    button.setAttribute("aria-current", "page");
     termsToggle.classList.remove("active");
-    viewTitle.textContent = "DOCUMENT";
-    viewTag.textContent = "MARKDOWN";
+    const title = button.querySelector("strong").textContent;
+    viewTitle.textContent = title;
+    viewTag.textContent = "LOADING";
     page.innerHTML = DOMPurify.sanitize(
-      '<div class="skeleton" aria-hidden="true"><div class="sk sk-title"></div><div class="sk sk-line w92"></div><div class="sk sk-line w78"></div><div class="sk sk-line w85"></div><div class="sk sk-line w60"></div><div class="sk sk-line w92"></div><div class="sk sk-line w70"></div></div>',
+      '<div class="skeleton" aria-hidden="true"><div class="sk sk-title"></div><div class="sk sk-line w92"></div><div class="sk sk-line w78"></div></div>',
     );
     try {
       const response = await fetch(withToken(`/api/page?id=${encodeURIComponent(id)}`));
       if (!response.ok) throw new Error(`页面读取失败 (${response.status})`);
-      currentPageMarkdown = await response.text();
+      const markdown = await response.text();
+      if (request !== pageRequest) return;
+      currentPageMarkdown = markdown;
       await renderMarkdown(page, currentPageMarkdown);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      if (request !== pageRequest) return;
+      loadedPage = { id, title };
+      viewTag.textContent = "MARKDOWN";
+      main.scrollTop = 0;
+      buildSections(button);
     } catch (error) {
+      if (request !== pageRequest) return;
       currentPageMarkdown = "";
+      viewTag.textContent = "ERROR";
       showError(error.message);
     }
-    toc.querySelectorAll("button").forEach((item) => item.classList.remove("active"));
-    button?.classList.add("active");
   }
 
   function updateTocCount(visible, total) {
@@ -272,18 +509,28 @@
     }
     toc.replaceChildren();
     entries.forEach((entry, index) => {
+      const entryElement = document.createElement("div");
+      entryElement.className = "toc-entry";
       const button = document.createElement("button");
+      button.className = "page-button";
       button.type = "button";
+      button.setAttribute("aria-expanded", "false");
+      const children = document.createElement("div");
+      children.id = `toc-sections-${index}`;
+      children.className = "toc-sections";
+      children.hidden = true;
+      button.setAttribute("aria-controls", children.id);
       button.dataset.search = `${entry.title} ${entry.description || ""}`.toLowerCase();
-      button.innerHTML = '<span class="idx"></span><span class="txt"><strong></strong><small></small></span>';
+      button.innerHTML = '<span class="idx"></span><span class="txt"><strong></strong></span>';
       button.querySelector(".idx").textContent = String(index + 1).padStart(2, "0");
       button.querySelector("strong").textContent = entry.title;
-      button.querySelector("small").textContent = entry.description || "";
+      button.title = entry.description || entry.title;
       button.addEventListener("click", () => loadPage(entry.id, button));
-      toc.append(button);
+      entryElement.append(button, children);
+      toc.append(entryElement);
     });
     updateTocCount(entries.length, entries.length);
-    loadPage(entries[0].id, toc.firstElementChild);
+    await loadPage(entries[0].id, toc.querySelector(".page-button"));
   }
 
   async function loadTerms() {
@@ -307,6 +554,10 @@
   }
 
   function showTerms() {
+    ++pageRequest;
+    loadedPage = null;
+    sections = [];
+    collapsePages();
     termsToggle.classList.add("active");
     viewTitle.textContent = "GLOSSARY";
     viewTag.textContent = `${terms.length} TERMS`;
@@ -372,9 +623,9 @@
   tocFilter.addEventListener("input", () => {
     const needle = tocFilter.value.trim().toLowerCase();
     let visible = 0;
-    for (const button of toc.querySelectorAll("button")) {
+    for (const button of toc.querySelectorAll(".page-button")) {
       const show = !needle || button.dataset.search.includes(needle);
-      button.hidden = !show;
+      button.parentElement.hidden = !show;
       if (show) visible += 1;
     }
     updateTocCount(visible, toc.querySelectorAll("button").length);

@@ -19,7 +19,8 @@
         <div class="group-head">PAGES <span id="toc-count" class="toc-count"></span></div>
 
         <label class="toc-search">
-          <input id="toc-filter" type="search" placeholder="过滤页面  ⌘K" autocomplete="off" spellcheck="false">
+          <input id="toc-filter" aria-label="过滤页面" type="search" placeholder="过滤页面" autocomplete="off" spellcheck="false">
+          <kbd id="filter-shortcut" aria-hidden="true">⌘ K</kbd>
         </label>
 
         <nav id="toc" class="toc" aria-label="Wiki 目录"></nav>
@@ -58,14 +59,14 @@
           </div>
 
           <form id="ask-form" class="ask-form">
-            <input id="question" autocomplete="off" spellcheck="false" placeholder="向 AI 询问这个仓库的任何问题，按 / 快速聚焦">
+            <textarea aria-label="向仓库提问" id="question" rows="2" spellcheck="false" placeholder="向仓库提问 · Enter 发送，Shift+Enter 换行"></textarea>
             <button id="ask-btn" type="submit">提问</button>
           </form>
         </section>
       </main>
     </div>
 
-    <dialog id="source-dialog">
+    <dialog id="source-dialog" aria-labelledby="source-title">
       <header class="dialog-head">
         <div class="dialog-title">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
@@ -77,6 +78,12 @@
         <div id="source-content" class="code-view"></div>
       </div>
     </dialog>
+
+    <div id="reading-menu" class="reading-menu" role="menu" aria-label="阅读操作" popover="manual">
+      <div class="menu-caption" id="menu-caption"></div>
+      <button type="button" role="menuitem" data-action="copy">复制</button>
+      <button type="button" role="menuitem" data-action="chat">添加到提问框</button>
+    </div>
 
     <div id="toast" class="toast" role="status" hidden></div>
 
